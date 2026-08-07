@@ -36,6 +36,8 @@ enum CtlAction {
     Dismiss,
     /// Показать состояние.
     Status,
+    /// Перечитать конфиг и применить на лету.
+    Reload,
     /// Остановить демон.
     Quit,
 }
@@ -64,6 +66,7 @@ fn main() -> Result<()> {
                 CtlAction::Summon => driftling_ipc::Request::Summon,
                 CtlAction::Dismiss => driftling_ipc::Request::Dismiss,
                 CtlAction::Status => driftling_ipc::Request::Status,
+                CtlAction::Reload => driftling_ipc::Request::Reload,
                 CtlAction::Quit => driftling_ipc::Request::Quit,
             };
             match driftling_ipc::call(&req)? {

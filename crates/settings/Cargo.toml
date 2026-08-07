@@ -16,3 +16,4 @@ driftling-ipc = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+eframe = "0.36"
