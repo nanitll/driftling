@@ -15,12 +15,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use driftling_core::sprite::{placeholder, SpriteSet};
-use driftling_core::{BehaviorConfig, Direction, Pet, PointerEvent, Rect, Vec2, World};
+use driftling_core::{Config, Direction, Pet, PointerEvent, Rect, Vec2, World};
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Scene, SpriteInstance};
 
-/// Размер плейсхолдер-спрайта M0, px (квадрат).
-const SPRITE_SIZE: u32 = 96;
 /// Сколько IPC-поток ждёт ответа от цикла приложения, прежде чем сдаться.
 const IPC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -52,7 +50,13 @@ pub fn run() -> Result<()> {
         }
     });
 
-    let app = DaemonApp::new(placeholder(SPRITE_SIZE), rx);
+    // Кривой конфиг не мешает старту: работаем с дефолтом, ошибку — в лог.
+    let config = Config::load().unwrap_or_else(|e| {
+        log::warn!("config.toml не прочитан ({e}), используем дефолт");
+        Config::default()
+    });
+    let mut app = DaemonApp::new(placeholder(config.sprite_size()), rx);
+    app.config = config;
     driftling_platform::wayland::run(app)
 }
 
@@ -60,6 +64,8 @@ pub fn run() -> Result<()> {
 /// кадры из него, поэтому tick возвращает Scene<'_> с временем жизни self.
 struct DaemonApp {
     sprites: SpriteSet,
+    /// Текущий конфиг; обновляется по IPC Reload.
+    config: Config,
     /// None = питомец убран (dismiss).
     pet: Option<Pet>,
     /// Появляется с первым Event::OutputGeometry; до него сцена пустая.
@@ -77,6 +83,7 @@ impl DaemonApp {
     fn new(sprites: SpriteSet, rx: Receiver<IpcMessage>) -> Self {
         Self {
             sprites,
+            config: Config::default(),
             pet: None,
             world: None,
             exit: false,
@@ -96,7 +103,7 @@ impl DaemonApp {
             self.pet = Some(Pet::new(
                 pos,
                 self.sprites.size as f32,
-                BehaviorConfig::default(),
+                self.config.behavior_config(),
                 // Сид из битов монотонного времени: дёшево и достаточно.
                 now.to_bits(),
             ));
@@ -123,11 +130,30 @@ impl DaemonApp {
                 },
                 uptime_secs: self.started.elapsed().as_secs(),
             },
+            Request::Reload => self.reload(),
             Request::Quit => {
                 log::info!("quit: завершаем демон по IPC");
                 self.exit = true;
                 Response::Ok
             }
+        }
+    }
+
+    /// Перечитать config.toml и применить к живому питомцу без перезапуска.
+    fn reload(&mut self) -> Response {
+        match Config::load() {
+            Ok(cfg) => {
+                if cfg.sprite_size() != self.sprites.size {
+                    self.sprites = placeholder(cfg.sprite_size());
+                }
+                if let Some(pet) = &mut self.pet {
+                    pet.apply_config(cfg.behavior_config(), cfg.sprite_size() as f32);
+                }
+                self.config = cfg;
+                log::info!("reload: конфиг применён");
+                Response::Ok
+            }
+            Err(e) => Response::Error(format!("config.toml не прочитан: {e}")),
         }
     }
 

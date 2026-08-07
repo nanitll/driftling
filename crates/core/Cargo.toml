@@ -13,3 +13,4 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 fastrand = { workspace = true }
+toml = { workspace = true }

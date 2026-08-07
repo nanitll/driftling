@@ -13,6 +13,8 @@ pub enum Request {
     Summon,
     Dismiss,
     Status,
+    /// Перечитать config.toml и применить к живому питомцу.
+    Reload,
     Quit,
 }
 

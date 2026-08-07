@@ -1,0 +1,18 @@
+[package]
+name = "driftling-settings"
+description = "Settings GUI for Driftling (eframe/egui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "driftling-settings"
+path = "src/main.rs"
+
+[dependencies]
+driftling-core = { workspace = true }
+driftling-ipc = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

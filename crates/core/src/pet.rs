@@ -93,6 +93,13 @@ impl Pet {
         &self.cfg
     }
 
+    /// Применить новые настройки к живому питомцу: поведение и размер
+    /// меняются, состояние (позиция, текущее занятие) сохраняется.
+    pub fn apply_config(&mut self, cfg: BehaviorConfig, size: f32) {
+        self.cfg = cfg;
+        self.size = size;
+    }
+
     /// Прямоугольник спрайта (для рендера и input region).
     pub fn bounds(&self) -> Rect {
         Rect::new(
