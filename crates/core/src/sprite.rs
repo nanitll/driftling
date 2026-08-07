@@ -104,7 +104,14 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
         _ => (0.0, 0.0),
     };
     for (fx, lift) in [(cx - rx * 0.45, lift_l), (cx + rx * 0.45, lift_r)] {
-        fill_circle(&mut argb, size, fx, s - foot_h / 2.0 - lift, foot_h * 0.9, BODY_DARK);
+        fill_circle(
+            &mut argb,
+            size,
+            fx,
+            s - foot_h / 2.0 - lift,
+            foot_h * 0.9,
+            BODY_DARK,
+        );
     }
 
     // Глаза.
@@ -112,7 +119,14 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
     for ex in [cx - rx * 0.38, cx + rx * 0.38] {
         if eyes_open {
             fill_circle(&mut argb, size, ex, ey, s * 0.045, EYE);
-            fill_circle(&mut argb, size, ex + s * 0.012, ey - s * 0.012, s * 0.015, EYE_SHINE);
+            fill_circle(
+                &mut argb,
+                size,
+                ex + s * 0.012,
+                ey - s * 0.012,
+                s * 0.015,
+                EYE_SHINE,
+            );
         } else {
             // Закрытый глаз — короткая дуга.
             for dx in -3i32..=3 {
@@ -134,7 +148,11 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
         draw_z(&mut argb, size, zx + 7, zy - 8, 3, EYE);
     }
 
-    Frame { w: size, h: size, argb }
+    Frame {
+        w: size,
+        h: size,
+        argb,
+    }
 }
 
 fn put(argb: &mut [u32], size: u32, x: i32, y: i32, c: u32) {
@@ -173,11 +191,21 @@ mod tests {
     #[test]
     fn frames_have_pixels() {
         let set = placeholder(96);
-        for frames in [&set.idle, &set.walk, &set.sleep, &set.falling, &set.dragged, &set.landing] {
+        for frames in [
+            &set.idle,
+            &set.walk,
+            &set.sleep,
+            &set.falling,
+            &set.dragged,
+            &set.landing,
+        ] {
             assert!(!frames.is_empty());
             for f in frames.iter() {
                 assert_eq!((f.w, f.h), (96, 96));
-                assert!(f.argb.iter().any(|&p| p >> 24 != 0), "кадр не должен быть пустым");
+                assert!(
+                    f.argb.iter().any(|&p| p >> 24 != 0),
+                    "кадр не должен быть пустым"
+                );
             }
         }
     }

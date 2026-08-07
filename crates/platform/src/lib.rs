@@ -34,7 +34,10 @@ pub struct SpriteInstance<'a> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Event {
     /// Размер/появление выхода: логическая ширина и высота.
-    OutputGeometry { width: f32, height: f32 },
+    OutputGeometry {
+        width: f32,
+        height: f32,
+    },
     PointerPress(Vec2),
     PointerMotion(Vec2),
     PointerRelease(Vec2),
@@ -44,7 +47,13 @@ pub enum Event {
 
 pub trait App {
     /// Шаг симуляции; `now` — монотонные секунды от старта бэкенда.
+    /// Здесь же приложение разбирает свои внешние очереди (IPC-канал).
     fn tick(&mut self, now: f64) -> Scene<'_>;
     /// Событие от платформы. Возвращает false, если приложение хочет выйти.
     fn event(&mut self, ev: Event, now: f64) -> bool;
+    /// Бэкенд проверяет это каждый кадр и завершает цикл при true
+    /// (например, после IPC Quit, принятого внутри tick).
+    fn wants_exit(&self) -> bool {
+        false
+    }
 }

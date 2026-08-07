@@ -170,10 +170,7 @@ impl Pet {
                 self.drag_history[3] = (now, p);
                 self.pos = p + self.drag_offset;
                 // Не даём утащить за экран.
-                self.pos.x = self
-                    .pos
-                    .x
-                    .clamp(world.screen.x, world.screen.right());
+                self.pos.x = self.pos.x.clamp(world.screen.x, world.screen.right());
                 self.pos.y = self.pos.y.clamp(world.screen.y, world.ground_y());
                 true
             }
@@ -181,9 +178,16 @@ impl Pet {
                 if self.state != PetState::Dragged {
                     return false;
                 }
-                // Скорость броска — по истории перетаскивания.
-                let (t0, p0) = self.drag_history[0];
+                // Скорость броска — по финальному «флику»: берём самую раннюю
+                // точку истории не старше ~120 мс, чтобы медленное таскание
+                // до рывка не гасило скорость.
                 let (t1, p1) = self.drag_history[3];
+                let (t0, p0) = self
+                    .drag_history
+                    .iter()
+                    .copied()
+                    .find(|(t, _)| t1 - t <= 0.12)
+                    .unwrap_or(self.drag_history[2]);
                 let span = (t1 - t0).max(1e-3);
                 self.vel = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
                 self.enter(PetState::Falling);
@@ -211,10 +215,10 @@ impl Pet {
     }
 
     fn clamp_horizontal(&mut self, world: &World) {
-        self.pos.x = self
-            .pos
-            .x
-            .clamp(world.screen.x + self.size / 2.0, world.screen.right() - self.size / 2.0);
+        self.pos.x = self.pos.x.clamp(
+            world.screen.x + self.size / 2.0,
+            world.screen.right() - self.size / 2.0,
+        );
     }
 }
 
@@ -229,12 +233,7 @@ mod tests {
     }
 
     fn pet() -> Pet {
-        Pet::new(
-            Vec2::new(960.0, 100.0),
-            96.0,
-            BehaviorConfig::default(),
-            42,
-        )
+        Pet::new(Vec2::new(960.0, 100.0), 96.0, BehaviorConfig::default(), 42)
     }
 
     #[test]
@@ -246,7 +245,10 @@ mod tests {
             p.tick(&w, 1.0 / 60.0);
         }
         assert_eq!(p.pos.y, w.ground_y());
-        assert!(matches!(p.state, PetState::Idle | PetState::Walk | PetState::Sleep));
+        assert!(matches!(
+            p.state,
+            PetState::Idle | PetState::Walk | PetState::Sleep
+        ));
     }
 
     #[test]

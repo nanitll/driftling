@@ -7,7 +7,11 @@ use clap::{Parser, Subcommand};
 mod daemon;
 
 #[derive(Parser)]
-#[command(name = "driftling", version, about = "Desktop tamagotchi that drifts between your devices")]
+#[command(
+    name = "driftling",
+    version,
+    about = "Desktop tamagotchi that drifts between your devices"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -48,7 +52,11 @@ fn main() -> Result<()> {
             };
             match driftling_ipc::call(&req)? {
                 driftling_ipc::Response::Ok => println!("ok"),
-                driftling_ipc::Response::Status { pets, state, uptime_secs } => {
+                driftling_ipc::Response::Status {
+                    pets,
+                    state,
+                    uptime_secs,
+                } => {
                     println!("питомцев: {pets}, состояние: {state}, аптайм: {uptime_secs}s");
                 }
                 driftling_ipc::Response::Error(e) => anyhow::bail!(e),
