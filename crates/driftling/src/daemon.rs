@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use driftling_core::sprite::{placeholder, SpriteSet};
-use driftling_core::{Config, Direction, Pet, PointerEvent, Rect, Vec2, World};
+use driftling_core::{
+    Config, Direction, Pet, PetAttributes, PetRecord, PointerEvent, Rect, Vec2, World,
+};
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Scene, SpriteInstance};
 
@@ -50,22 +52,45 @@ pub fn run() -> Result<()> {
         }
     });
 
-    // Кривой конфиг не мешает старту: работаем с дефолтом, ошибку — в лог.
-    let config = Config::load().unwrap_or_else(|e| {
-        log::warn!("config.toml не прочитан ({e}), используем дефолт");
-        Config::default()
-    });
-    let mut app = DaemonApp::new(placeholder(config.sprite_size()), rx);
-    app.config = config;
+    let record = load_pet_record();
+    let size = record.attributes.clamped().size;
+    let mut app = DaemonApp::new(placeholder(size), rx);
+    app.record = record;
     driftling_platform::wayland::run(app)
+}
+
+/// Загрузить запись питомца. Нет файла — мигрируем характеристики из
+/// legacy-секций config.toml (до переезда в pet.json) либо создаём дефолт;
+/// в обоих случаях сразу сохраняем.
+fn load_pet_record() -> PetRecord {
+    match PetRecord::load() {
+        Ok(Some(rec)) => rec,
+        Ok(None) => {
+            let mut rec = PetRecord::default();
+            if let Some(attrs) = driftling_core::config::raw_text()
+                .and_then(|t| driftling_core::config::legacy_attributes(&t))
+            {
+                log::info!("миграция характеристик из legacy config.toml");
+                rec.attributes = attrs;
+            }
+            if let Err(e) = rec.save() {
+                log::warn!("pet.json не сохранён: {e}");
+            }
+            rec
+        }
+        Err(e) => {
+            log::warn!("pet.json не прочитан ({e}), используем дефолт");
+            PetRecord::default()
+        }
+    }
 }
 
 /// Состояние демона между кадрами. Владеет SpriteSet: Scene заимствует
 /// кадры из него, поэтому tick возвращает Scene<'_> с временем жизни self.
 struct DaemonApp {
     sprites: SpriteSet,
-    /// Текущий конфиг; обновляется по IPC Reload.
-    config: Config,
+    /// Персистентная запись питомца: имя + характеристики (pet.json).
+    record: PetRecord,
     /// None = питомец убран (dismiss).
     pet: Option<Pet>,
     /// Появляется с первым Event::OutputGeometry; до него сцена пустая.
@@ -83,7 +108,7 @@ impl DaemonApp {
     fn new(sprites: SpriteSet, rx: Receiver<IpcMessage>) -> Self {
         Self {
             sprites,
-            config: Config::default(),
+            record: PetRecord::default(),
             pet: None,
             world: None,
             exit: false,
@@ -103,7 +128,7 @@ impl DaemonApp {
             self.pet = Some(Pet::new(
                 pos,
                 self.sprites.size as f32,
-                self.config.behavior_config(),
+                self.record.attributes.behavior_config(),
                 // Сид из битов монотонного времени: дёшево и достаточно.
                 now.to_bits(),
             ));
@@ -130,6 +155,13 @@ impl DaemonApp {
                 },
                 uptime_secs: self.started.elapsed().as_secs(),
             },
+            Request::PetInfo => Response::PetInfo {
+                name: self.record.name.clone(),
+                state: self.pet.as_ref().map(|p| format!("{:?}", p.state)),
+                attributes: self.record.attributes,
+                uptime_secs: self.started.elapsed().as_secs(),
+            },
+            Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
             Request::Quit => {
                 log::info!("quit: завершаем демон по IPC");
@@ -139,18 +171,30 @@ impl DaemonApp {
         }
     }
 
-    /// Перечитать config.toml и применить к живому питомцу без перезапуска.
+    /// Дебаг-панель: задать характеристики напрямую. Клампим, применяем к
+    /// живому питомцу, персистим в pet.json.
+    fn set_attributes(&mut self, attrs: PetAttributes) -> Response {
+        let a = attrs.clamped();
+        if a.size != self.sprites.size {
+            self.sprites = placeholder(a.size);
+        }
+        if let Some(pet) = &mut self.pet {
+            pet.apply_config(a.behavior_config(), a.size as f32);
+        }
+        self.record.attributes = a;
+        log::info!("set_attributes: применены {a:?}");
+        if let Err(e) = self.record.save() {
+            return Response::Error(format!("применено, но pet.json не сохранён: {e}"));
+        }
+        Response::Ok
+    }
+
+    /// Перечитать config.toml (настройки приложения). Характеристики питомца
+    /// сюда больше не входят — они меняются только через SetAttributes.
     fn reload(&mut self) -> Response {
         match Config::load() {
-            Ok(cfg) => {
-                if cfg.sprite_size() != self.sprites.size {
-                    self.sprites = placeholder(cfg.sprite_size());
-                }
-                if let Some(pet) = &mut self.pet {
-                    pet.apply_config(cfg.behavior_config(), cfg.sprite_size() as f32);
-                }
-                self.config = cfg;
-                log::info!("reload: конфиг применён");
+            Ok(_cfg) => {
+                log::info!("reload: настройки приложения перечитаны");
                 Response::Ok
             }
             Err(e) => Response::Error(format!("config.toml не прочитан: {e}")),
@@ -326,6 +370,47 @@ mod tests {
             }
             other => panic!("неожиданный ответ: {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_attributes_applies_and_petinfo_reports() {
+        // Изолируем pet.json от реального: save() внутри set_attributes.
+        let dir = std::env::temp_dir().join(format!("driftling-attrs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &dir);
+
+        let (mut app, tx) = app();
+        geometry(&mut app);
+
+        let attrs = PetAttributes {
+            size: 128,
+            walk_speed: 200.0,
+            ..PetAttributes::default()
+        };
+        let reply = send(&tx, Request::SetAttributes(attrs));
+        app.tick(0.0);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert_eq!(app.sprites.size, 128);
+        assert_eq!(app.pet.as_ref().unwrap().config().walk_speed, 200.0);
+
+        let reply = send(&tx, Request::PetInfo);
+        app.tick(0.1);
+        match reply.recv().unwrap() {
+            Response::PetInfo {
+                name,
+                state,
+                attributes,
+                ..
+            } => {
+                assert_eq!(name, "Дрифтлинг");
+                assert!(state.is_some());
+                assert_eq!(attributes.size, 128);
+                assert_eq!(attributes.walk_speed, 200.0);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

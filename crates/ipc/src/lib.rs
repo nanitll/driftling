@@ -3,6 +3,7 @@
 //! в `$XDG_RUNTIME_DIR/driftling.sock`.
 
 use anyhow::{Context, Result};
+use driftling_core::PetAttributes;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -13,7 +14,12 @@ pub enum Request {
     Summon,
     Dismiss,
     Status,
-    /// Перечитать config.toml и применить к живому питомцу.
+    /// Полная карточка питомца для настроек: имя, характеристики, состояние.
+    PetInfo,
+    /// ТОЛЬКО дебаг-панель (ТЗ §3.3): напрямую задать характеристики.
+    /// Демон клампит значения, применяет к живому питомцу и персистит.
+    SetAttributes(PetAttributes),
+    /// Перечитать config.toml (настройки приложения).
     Reload,
     Quit,
 }
@@ -24,6 +30,13 @@ pub enum Response {
     Status {
         pets: u32,
         state: String,
+        uptime_secs: u64,
+    },
+    PetInfo {
+        name: String,
+        /// None = питомец сейчас убран с экрана (dismiss).
+        state: Option<String>,
+        attributes: PetAttributes,
         uptime_secs: u64,
     },
     Error(String),

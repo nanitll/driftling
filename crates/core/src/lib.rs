@@ -5,6 +5,7 @@
 //! - время не берётся из ОС — оно приходит параметром `dt`/`now`;
 //! - никакого рендеринга и никаких протоколов — только чистая логика.
 
+pub mod attributes;
 pub mod behavior;
 pub mod config;
 pub mod geometry;
@@ -13,6 +14,7 @@ pub mod pet;
 pub mod physics;
 pub mod sprite;
 
+pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, PetState};
 pub use config::Config;
 pub use geometry::{Rect, Vec2};

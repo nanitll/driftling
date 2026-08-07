@@ -1,83 +1,62 @@
-//! Пользовательский конфиг (`~/.config/driftling/config.toml`).
+//! Настройки ПРИЛОЖЕНИЯ (`~/.config/driftling/config.toml`).
 //!
-//! Структура и (де)сериализация — платформонезависимы; файловые операции
-//! отключены под wasm32. Настройки-UI и демон работают с одним и тем же
-//! файлом: UI сохраняет, демон перечитывает по IPC `Reload`.
+//! Здесь живёт только то, что относится к приложению, а не к питомцу:
+//! характеристики питомца — в [`crate::attributes`] (ТЗ §3.3). Сейчас
+//! секций мало; файл переживает добавление/удаление полей (serde default,
+//! незнакомые ключи игнорируются).
 
 use serde::{Deserialize, Serialize};
-
-use crate::behavior::BehaviorConfig;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    pub pet: PetConfig,
-    pub behavior: BehaviorTuning,
+    // Зарезервировано под настройки приложения (мониторы, синк — M3,
+    // выбор пака — M4). Автозапуск управляется .desktop-файлом напрямую.
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PetConfig {
-    /// Размер спрайта, px (квадрат).
-    pub size: u32,
-}
+/// Достать из legacy-конфига (до переезда характеристик в pet.json)
+/// значения старых секций `[pet]`/`[behavior]` — чтобы питомец, настроенный
+/// в ранних версиях, пережил обновление. Вернёт None, если legacy-ключей нет.
+pub fn legacy_attributes(toml_text: &str) -> Option<crate::attributes::PetAttributes> {
+    let value: toml::Value = toml_text.parse().ok()?;
+    let mut attrs = crate::attributes::PetAttributes::default();
+    let mut found = false;
 
-impl Default for PetConfig {
-    fn default() -> Self {
-        Self { size: 96 }
+    if let Some(size) = value
+        .get("pet")
+        .and_then(|p| p.get("size"))
+        .and_then(|v| v.as_integer())
+    {
+        attrs.size = size.clamp(0, u32::MAX as i64) as u32;
+        found = true;
     }
-}
-
-/// Подмножество BehaviorConfig, вынесенное пользователю. Остальные поля
-/// берутся из BehaviorConfig::default().
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BehaviorTuning {
-    /// Скорость ходьбы, px/s.
-    pub walk_speed: f32,
-    /// Вес перехода Idle -> Walk (из 100): насколько питомец непоседлив.
-    pub w_idle_to_walk: u32,
-    /// Вес перехода Idle -> Sleep (из 100): насколько питомец соня.
-    pub w_idle_to_sleep: u32,
-    /// Диапазон длительности сна, сек.
-    pub sleep_min: f32,
-    pub sleep_max: f32,
-}
-
-impl Default for BehaviorTuning {
-    fn default() -> Self {
-        let d = BehaviorConfig::default();
-        Self {
-            walk_speed: d.walk_speed,
-            w_idle_to_walk: d.w_idle_to_walk,
-            w_idle_to_sleep: d.w_idle_to_sleep,
-            sleep_min: d.sleep_range.0,
-            sleep_max: d.sleep_range.1,
+    if let Some(b) = value.get("behavior") {
+        let num = |key: &str| -> Option<f64> {
+            b.get(key)
+                .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+        };
+        if let Some(v) = num("walk_speed") {
+            attrs.walk_speed = v as f32;
+            found = true;
+        }
+        if let Some(v) = num("w_idle_to_walk") {
+            attrs.curiosity = v as u32;
+            found = true;
+        }
+        if let Some(v) = num("w_idle_to_sleep") {
+            attrs.sleepiness = v as u32;
+            found = true;
+        }
+        if let Some(v) = num("sleep_min") {
+            attrs.sleep_min = v as f32;
+            found = true;
+        }
+        if let Some(v) = num("sleep_max") {
+            attrs.sleep_max = v as f32;
+            found = true;
         }
     }
-}
-
-impl Config {
-    /// Собрать полный BehaviorConfig: пользовательские поля поверх дефолтов.
-    /// Значения приводятся к безопасным диапазонам — кривой конфиг не должен
-    /// ломать симуляцию.
-    pub fn behavior_config(&self) -> BehaviorConfig {
-        let t = &self.behavior;
-        let w_walk = t.w_idle_to_walk.min(100);
-        let sleep_min = t.sleep_min.clamp(1.0, 3600.0);
-        BehaviorConfig {
-            walk_speed: t.walk_speed.clamp(5.0, 400.0),
-            w_idle_to_walk: w_walk,
-            w_idle_to_sleep: t.w_idle_to_sleep.min(100 - w_walk),
-            sleep_range: (sleep_min, t.sleep_max.clamp(sleep_min, 7200.0)),
-            ..BehaviorConfig::default()
-        }
-    }
-
-    /// Размер спрайта с ограничением разумного диапазона.
-    pub fn sprite_size(&self) -> u32 {
-        self.pet.size.clamp(32, 256)
-    }
+    found.then(|| attrs.clamped())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -94,9 +73,13 @@ mod fs {
         base.join("driftling").join("config.toml")
     }
 
+    /// Сырой текст конфига — для миграции legacy-ключей.
+    pub fn raw_text() -> Option<String> {
+        std::fs::read_to_string(path()).ok()
+    }
+
     impl Config {
-        /// Прочитать конфиг; нет файла или файл битый — дефолт (ошибку парсинга
-        /// возвращаем, чтобы UI мог её показать).
+        /// Прочитать конфиг; нет файла — дефолт, битый файл — ошибка текстом.
         pub fn load() -> Result<Config, String> {
             match std::fs::read_to_string(path()) {
                 Ok(text) => toml::from_str(&text).map_err(|e| e.to_string()),
@@ -119,48 +102,31 @@ mod fs {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use fs::path;
+pub use fs::{path, raw_text};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn default_matches_behavior_default() {
-        let cfg = Config::default();
-        let b = cfg.behavior_config();
-        let d = BehaviorConfig::default();
-        assert_eq!(b.walk_speed, d.walk_speed);
-        assert_eq!(b.w_idle_to_walk, d.w_idle_to_walk);
-        assert_eq!(b.sleep_range, d.sleep_range);
+    fn unknown_and_legacy_keys_do_not_break_load() {
+        let cfg: Config = toml::from_str("[pet]\nsize = 90\n[behavior]\nwalk_speed = 400.0\n")
+            .unwrap_or_default();
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]
-    fn toml_roundtrip_and_partial_files() {
-        let cfg = Config {
-            pet: PetConfig { size: 128 },
-            ..Config::default()
-        };
-        let text = toml::to_string_pretty(&cfg).unwrap();
-        let back: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg, back);
-
-        // Частичный файл: незнакомые поля игнорируются, пропущенные — дефолт.
-        let partial: Config = toml::from_str("[behavior]\nwalk_speed = 99.0\n").unwrap();
-        assert_eq!(partial.behavior.walk_speed, 99.0);
-        assert_eq!(partial.pet.size, 96);
-    }
-
-    #[test]
-    fn hostile_values_are_clamped() {
-        let cfg: Config = toml::from_str(
-            "[pet]\nsize = 9000\n[behavior]\nwalk_speed = -5.0\nw_idle_to_walk = 100\nw_idle_to_sleep = 100\nsleep_min = 100.0\nsleep_max = 1.0\n",
+    fn legacy_attributes_migrate_and_clamp() {
+        let attrs = legacy_attributes(
+            "[pet]\nsize = 90\n[behavior]\nwalk_speed = 400.0\nw_idle_to_walk = 100\nw_idle_to_sleep = 0\n",
         )
-        .unwrap();
-        assert_eq!(cfg.sprite_size(), 256);
-        let b = cfg.behavior_config();
-        assert_eq!(b.walk_speed, 5.0);
-        assert_eq!(b.w_idle_to_walk + b.w_idle_to_sleep, 100);
-        assert!(b.sleep_range.0 <= b.sleep_range.1);
+        .expect("legacy-ключи должны найтись");
+        assert_eq!(attrs.size, 90);
+        assert_eq!(attrs.walk_speed, 400.0);
+        assert_eq!(attrs.curiosity, 100);
+        assert_eq!(attrs.sleepiness, 0);
+
+        assert!(legacy_attributes("").is_none());
+        assert!(legacy_attributes("[app]\nx = 1\n").is_none());
     }
 }

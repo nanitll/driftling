@@ -930,6 +930,7 @@ version = "0.1.0"
 dependencies = [
  "fastrand",
  "serde",
+ "serde_json",
  "toml",
 ]
 
@@ -938,6 +939,7 @@ name = "driftling-ipc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "driftling-core",
  "serde",
  "serde_json",
 ]
@@ -962,6 +964,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "log",
+ "serde_json",
 ]
 
 [[package]]

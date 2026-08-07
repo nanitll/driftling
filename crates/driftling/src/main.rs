@@ -78,6 +78,15 @@ fn main() -> Result<()> {
                 } => {
                     println!("питомцев: {pets}, состояние: {state}, аптайм: {uptime_secs}s");
                 }
+                driftling_ipc::Response::PetInfo {
+                    name,
+                    state,
+                    attributes,
+                    uptime_secs,
+                } => {
+                    let state = state.unwrap_or_else(|| "убран с экрана".into());
+                    println!("{name}: {state}, аптайм {uptime_secs}s, {attributes:?}");
+                }
                 driftling_ipc::Response::Error(e) => anyhow::bail!(e),
             }
             Ok(())
