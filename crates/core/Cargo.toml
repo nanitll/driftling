@@ -1,0 +1,15 @@
+[package]
+name = "driftling-core"
+description = "Platform-independent simulation core: pet state, behavior, physics, journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# ВАЖНО (ТЗ §3.7): этот crate обязан собираться под wasm32-unknown-unknown.
+# Никаких платформозависимостей, никакого std::time::SystemTime в горячем пути —
+# время приходит снаружи параметром.
+
+[dependencies]
+serde = { workspace = true }
+fastrand = { workspace = true }

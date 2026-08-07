@@ -1,0 +1,13 @@
+[package]
+name = "driftling-platform"
+description = "Overlay backends: Wayland (wlr-layer-shell via smithay-client-toolkit); X11 later"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+driftling-core = { workspace = true }
+smithay-client-toolkit = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
