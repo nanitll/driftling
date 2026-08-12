@@ -41,8 +41,25 @@ pub enum Event {
     PointerPress(Vec2),
     PointerMotion(Vec2),
     PointerRelease(Vec2),
+    /// ПКМ по питомцу — заготовка под контекстное меню (фаза B).
+    PointerMenu(Vec2),
+    /// Wayland-соединение потеряно/слой закрыт; бэкенд попробует
+    /// пересоздаться сам — приложению только знать (пауза симуляции).
+    OutputLost,
     /// Запрошено завершение (например, IPC Quit).
     Shutdown,
+}
+
+/// Желаемый темп симуляции — энергобюджет ТЗ §7: спящий питомец не должен
+/// будить CPU 30 раз в секунду.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pace {
+    /// Движение/падение/drag: ~30 Гц.
+    Active,
+    /// Спокойный idle: ~5 Гц.
+    Calm,
+    /// Сон или питомец убран: ~1 Гц.
+    Drowsy,
 }
 
 pub trait App {
@@ -55,5 +72,10 @@ pub trait App {
     /// (например, после IPC Quit, принятого внутри tick).
     fn wants_exit(&self) -> bool {
         false
+    }
+
+    /// Желаемый темп следующего тика; бэкенд адаптирует таймер.
+    fn pace(&self) -> Pace {
+        Pace::Active
     }
 }
