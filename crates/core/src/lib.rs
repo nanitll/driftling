@@ -18,4 +18,4 @@ pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, PetState};
 pub use config::Config;
 pub use geometry::{Rect, Vec2};
-pub use pet::{Direction, Pet, PointerEvent, World};
+pub use pet::{Direction, Pet, PointerEvent, SimPace, World};

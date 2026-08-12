@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -31,3 +32,61 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - run: cargo check -p driftling-core --target wasm32-unknown-unknown
+
+  # MSRV (ТД-27): rust-version из workspace.package (1.86 — MSRV
+  # wayland-protocols). Проверяются крейты демона; driftling-settings
+  # исключён — eframe/egui требуют свежий rustc (0.36 → 1.95) и двигают
+  # MSRV с каждым релизом, GUI живёт на stable.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+      - run: >
+          cargo check -p driftling -p driftling-core
+          -p driftling-platform -p driftling-ipc
+
+  # Лицензии и уязвимости зависимостей (ТД-27): конфиг — deny.toml в корне.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # Headless-смоук (ТД-27, ТЗ §8): демон под sway в headless-режиме wlroots.
+  # Скрипт также гоняется локально: SMOKE_COMPOSITOR=session ci/smoke.sh.
+  smoke:
+    runs-on: ubuntu-latest
+    # TODO: снять continue-on-error после первого зелёного прогона в Actions.
+    # Скрипт проверен локально против живой Wayland-сессии
+    # (SMOKE_COMPOSITOR=session); против sway --headless — только вычиткой,
+    # на дев-машине sway не установлен.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends sway dbus
+      - run: cargo build --release -p driftling
+      - run: dbus-run-session -- ci/smoke.sh
+
+  # Release-артефакты по тегу v* (ТД-27): пока просто бинарники из workflow.
+  # TODO(фаза F): cargo-dist (тарболы, SHA256, attestations) + cargo-deb +
+  # AppImage с zsync — см. ROADMAP F2.
+  release-artifacts:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --workspace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: driftling-${{ github.ref_name }}-linux-x86_64
+          path: |
+            target/release/driftling
+            target/release/driftling-settings
+          if-no-files-found: error

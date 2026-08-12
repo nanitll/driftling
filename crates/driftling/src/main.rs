@@ -5,13 +5,12 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod daemon;
+mod i18n;
+
+use i18n::fl;
 
 #[derive(Parser)]
-#[command(
-    name = "driftling",
-    version,
-    about = "Desktop tamagotchi that drifts between your devices"
-)]
+#[command(name = "driftling", version, about = fl!("cli-about"))]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -19,32 +18,49 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Управление запущенным демоном.
+    // Управление запущенным демоном.
+    #[command(about = fl!("cli-about-ctl"))]
     Ctl {
         #[command(subcommand)]
         action: CtlAction,
     },
-    /// Открыть окно настроек (запускает driftling-settings).
+    // Открыть окно настроек (запускает driftling-settings).
+    #[command(about = fl!("cli-about-settings"))]
     Settings,
 }
 
 #[derive(Subcommand)]
 enum CtlAction {
-    /// Позвать питомца на экран.
+    // Позвать питомца на экран.
+    #[command(about = fl!("cli-about-summon"))]
     Summon,
-    /// Убрать питомца с экрана (демон продолжает работать).
+    // Убрать питомца с экрана (демон продолжает работать).
+    #[command(about = fl!("cli-about-dismiss"))]
     Dismiss,
-    /// Показать состояние.
+    // Показать состояние.
+    #[command(about = fl!("cli-about-status"))]
     Status,
-    /// Перечитать конфиг и применить на лету.
+    // Карточка питомца: имя, состояние, характеристики.
+    #[command(about = fl!("cli-about-info"))]
+    Info,
+    // Перечитать конфиг и применить на лету.
+    #[command(about = fl!("cli-about-reload"))]
     Reload,
-    /// Остановить демон.
+    // Остановить демон.
+    #[command(about = fl!("cli-about-quit"))]
     Quit,
+    // Диагностика: окружение, сокет, файлы, автозапуск (работает без демона).
+    #[command(about = fl!("cli-about-doctor"))]
+    Doctor,
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
+    // Логирование демона настраивает daemon::run() сам (journald под
+    // systemd, ТД-19) — env_logger здесь перехватил бы его первым.
+    if cli.command.is_some() {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    }
     match cli.command {
         None => daemon::run(),
         Some(Command::Settings) => {
@@ -55,10 +71,14 @@ fn main() -> Result<()> {
                 .and_then(|p| p.parent().map(|d| d.join("driftling-settings")))
                 .filter(|p| p.exists());
             let program = sibling.unwrap_or_else(|| "driftling-settings".into());
-            let status = std::process::Command::new(&program)
-                .status()
-                .map_err(|e| anyhow::anyhow!("не удалось запустить {program:?}: {e}"))?;
-            anyhow::ensure!(status.success(), "driftling-settings завершился с ошибкой");
+            let status = std::process::Command::new(&program).status().map_err(|e| {
+                anyhow::anyhow!(fl!(
+                    "settings-launch-failed",
+                    program = format!("{program:?}"),
+                    error = e.to_string()
+                ))
+            })?;
+            anyhow::ensure!(status.success(), fl!("settings-exited-with-error"));
             Ok(())
         }
         Some(Command::Ctl { action }) => {
@@ -66,17 +86,27 @@ fn main() -> Result<()> {
                 CtlAction::Summon => driftling_ipc::Request::Summon,
                 CtlAction::Dismiss => driftling_ipc::Request::Dismiss,
                 CtlAction::Status => driftling_ipc::Request::Status,
+                CtlAction::Info => driftling_ipc::Request::PetInfo,
                 CtlAction::Reload => driftling_ipc::Request::Reload,
                 CtlAction::Quit => driftling_ipc::Request::Quit,
+                CtlAction::Doctor => return doctor(),
             };
             match driftling_ipc::call(&req)? {
-                driftling_ipc::Response::Ok => println!("ok"),
+                driftling_ipc::Response::Ok => println!("{}", fl!("ctl-ok")),
                 driftling_ipc::Response::Status {
                     pets,
                     state,
                     uptime_secs,
                 } => {
-                    println!("питомцев: {pets}, состояние: {state}, аптайм: {uptime_secs}s");
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-status",
+                            pets = pets,
+                            state = state,
+                            uptime = uptime_secs
+                        )
+                    );
                 }
                 driftling_ipc::Response::PetInfo {
                     name,
@@ -84,12 +114,198 @@ fn main() -> Result<()> {
                     attributes,
                     uptime_secs,
                 } => {
-                    let state = state.unwrap_or_else(|| "убран с экрана".into());
-                    println!("{name}: {state}, аптайм {uptime_secs}s, {attributes:?}");
+                    let state = state.unwrap_or_else(|| fl!("state-dismissed"));
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-petinfo",
+                            name = name,
+                            state = state,
+                            uptime = uptime_secs,
+                            attributes = format!("{attributes:?}")
+                        )
+                    );
                 }
                 driftling_ipc::Response::Error(e) => anyhow::bail!(e),
             }
             Ok(())
         }
     }
+}
+
+/// Одна строка чек-листа доктора.
+fn check(ok: bool, msg: &str) {
+    println!("  {} {msg}", if ok { "✓" } else { "✗" });
+}
+
+/// `driftling ctl doctor`: человекочитаемый чек-лист окружения (П-12, ТД-19).
+/// Работает без демона. Выход с кодом 1, если демон должен работать
+/// (автозапуск настроен или сокет существует), но не отвечает.
+fn doctor() -> Result<()> {
+    use std::path::PathBuf;
+
+    println!("{}\n", fl!("doctor-title"));
+
+    // 1. Wayland-сессия.
+    match std::env::var("WAYLAND_DISPLAY") {
+        Ok(v) => check(true, &fl!("doctor-wayland-ok", value = v)),
+        Err(_) => check(false, &fl!("doctor-wayland-missing")),
+    }
+
+    // 2. XDG_RUNTIME_DIR + управляющий сокет.
+    let mut socket_exists = false;
+    let mut daemon_answering = false;
+    match driftling_ipc::runtime_dir() {
+        Ok(dir) => {
+            check(
+                true,
+                &fl!("doctor-runtime-dir", path = dir.display().to_string()),
+            );
+            let sock = driftling_ipc::socket_path_in(&dir);
+            socket_exists = sock.exists();
+            if socket_exists {
+                match driftling_ipc::call(&driftling_ipc::Request::Status) {
+                    Ok(driftling_ipc::Response::Status {
+                        pets,
+                        state,
+                        uptime_secs,
+                    }) => {
+                        daemon_answering = true;
+                        check(
+                            true,
+                            &fl!(
+                                "doctor-daemon-answering",
+                                version = driftling_ipc::PROTOCOL_VERSION,
+                                pets = pets,
+                                state = state,
+                                uptime = uptime_secs
+                            ),
+                        );
+                    }
+                    Ok(other) => {
+                        daemon_answering = true;
+                        check(
+                            true,
+                            &fl!(
+                                "doctor-daemon-unexpected-reply",
+                                reply = format!("{other:?}")
+                            ),
+                        );
+                    }
+                    // Сюда же попадает несовпадение версии протокола —
+                    // call() сам объясняет обе версии и советует рестарт.
+                    Err(e) => check(
+                        false,
+                        &fl!(
+                            "doctor-daemon-not-answering",
+                            path = sock.display().to_string(),
+                            error = format!("{e:#}")
+                        ),
+                    ),
+                }
+            } else {
+                check(
+                    false,
+                    &fl!("doctor-socket-missing", path = sock.display().to_string()),
+                );
+            }
+        }
+        Err(e) => check(
+            false,
+            &fl!("doctor-socket-uncheckable", error = format!("{e:#}")),
+        ),
+    }
+
+    // 3. pet.json.
+    let pet_path = driftling_core::attributes::record_path();
+    match driftling_core::PetRecord::load() {
+        Ok(Some(rec)) => check(
+            true,
+            &fl!(
+                "doctor-pet-ok",
+                name = rec.name,
+                path = pet_path.display().to_string()
+            ),
+        ),
+        Ok(None) => check(
+            false,
+            &fl!("doctor-pet-missing", path = pet_path.display().to_string()),
+        ),
+        Err(e) => check(
+            false,
+            &fl!(
+                "doctor-pet-unreadable",
+                path = pet_path.display().to_string(),
+                error = e
+            ),
+        ),
+    }
+
+    // 4. config.toml.
+    let cfg_path = driftling_core::config::path();
+    if cfg_path.exists() {
+        match driftling_core::Config::load() {
+            Ok(_) => check(
+                true,
+                &fl!("doctor-config-ok", path = cfg_path.display().to_string()),
+            ),
+            Err(e) => check(
+                false,
+                &fl!(
+                    "doctor-config-broken",
+                    path = cfg_path.display().to_string(),
+                    error = e
+                ),
+            ),
+        }
+    } else {
+        check(
+            true,
+            &fl!(
+                "doctor-config-missing",
+                path = cfg_path.display().to_string()
+            ),
+        );
+    }
+
+    // 5. Автозапуск: systemd user unit или .desktop в autostart.
+    let unit_enabled = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", "driftling.service"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let desktop_path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .map(|c| c.join("autostart").join("driftling.desktop"));
+    let desktop_present = desktop_path.as_deref().is_some_and(|p| p.exists());
+    let autostart = unit_enabled || desktop_present;
+    if unit_enabled {
+        check(true, &fl!("doctor-autostart-systemd"));
+    } else if desktop_present {
+        check(
+            true,
+            &fl!(
+                "doctor-autostart-desktop",
+                path = desktop_path
+                    .expect("desktop_present ⇒ путь есть")
+                    .display()
+                    .to_string()
+            ),
+        );
+    } else {
+        check(false, &fl!("doctor-autostart-none"));
+    }
+
+    // Вердикт.
+    println!();
+    if daemon_answering {
+        println!("{}", fl!("doctor-verdict-ok"));
+    } else if autostart || socket_exists {
+        println!("{}", fl!("doctor-verdict-should-run"));
+        std::process::exit(1);
+    } else {
+        println!("{}", fl!("doctor-verdict-not-running"));
+    }
+    Ok(())
 }

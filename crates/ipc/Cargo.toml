@@ -11,3 +11,8 @@ driftling-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+log = { workspace = true }
+rustix = { workspace = true }
+i18n-embed = { workspace = true }
+i18n-embed-fl = { workspace = true }
+rust-embed = { workspace = true }

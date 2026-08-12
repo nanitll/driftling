@@ -1,0 +1,5 @@
+# Конфиг i18n-embed/cargo-i18n (ТД-30): en — обязательный полный фолбэк.
+fallback_language = "en"
+
+[fluent]
+assets_dir = "i18n"

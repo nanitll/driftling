@@ -1,0 +1,46 @@
+# cargo-deny (ТД-27, ROADMAP A8): лицензии и уязвимости зависимостей.
+# Локальный прогон: cargo deny check
+
+[graph]
+all-features = true
+
+[advisories]
+# RustSec: уязвимости — ошибка; unmaintained проверяем только по прямым
+# зависимостям (транзитивный шум не блокирует CI).
+unmaintained = "workspace"
+yanked = "deny"
+
+[licenses]
+# Разрешительные лицензии, совместимые с MIT OR Apache-2.0 проекта.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "ISC",
+    # Данные Unicode: icu_*/unicode-ident/zerovec (транзитивно через eframe).
+    "Unicode-3.0",
+    # Boost: clipboard-win/error-code (windows-ветка arboard).
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+# Шрифты, вшитые в egui: SIL OFL и Ubuntu Font — только для этого крейта.
+[[licenses.exceptions]]
+crate = "epaint_default_fonts"
+allow = ["OFL-1.1", "Ubuntu-font-1.0"]
+
+[bans]
+# Дубликаты версий не блокируют сборку — только предупреждают.
+multiple-versions = "warn"
+# TODO(фаза F): вернуть "deny", когда крейты получат publish = false или
+# версии в path-зависимостях — пока workspace-члены без версий выглядят
+# для cargo-deny «публичными» wildcard-зависимостями.
+wildcards = "warn"
+# Внутренние path-зависимости workspace версии не требуют.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

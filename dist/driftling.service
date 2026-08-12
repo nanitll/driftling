@@ -1,0 +1,22 @@
+# Driftling — systemd user unit (основной способ автозапуска, ТД-28).
+#
+# Пути установки:
+#   бинарь демона  -> ~/.local/bin/driftling   (%h = домашний каталог)
+#   этот юнит      -> ~/.config/systemd/user/driftling.service
+#
+# Установка описана в dist/README.md. Restart=on-failure возвращает питомца
+# после краша; PartOf/WantedBy=graphical-session.target привязывают демон к
+# жизни графической сессии (без неё Wayland-оверлею негде жить).
+
+[Unit]
+Description=Driftling desktop pet daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/driftling
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

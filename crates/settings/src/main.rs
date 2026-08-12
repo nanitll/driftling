@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod i18n;
+use i18n::fl;
+
 use driftling_core::sprite::{placeholder, Frame};
 use driftling_core::PetAttributes;
 use driftling_ipc::{call, Request, Response};
@@ -51,17 +54,17 @@ fn tinted(c: Color32, a: u8) -> Color32 {
 // Чистая логика (юнит-тесты внизу файла)
 // ---------------------------------------------------------------------------
 
-/// Русская подпись состояния питомца для бейджа.
-fn state_label(state: Option<&str>) -> &'static str {
+/// Локализованная подпись состояния питомца для бейджа (ТД-30).
+fn state_label(state: Option<&str>) -> String {
     match state {
-        None => "Убран с экрана",
-        Some("Idle") => "Отдыхает",
-        Some("Walk") => "Гуляет",
-        Some("Sleep") => "Спит",
-        Some("Falling") => "Падает",
-        Some("Dragged") => "В руках",
-        Some("Landing") => "Приземлился",
-        Some(_) => "Неизвестно",
+        None => fl!("state-absent"),
+        Some("Idle") => fl!("state-idle"),
+        Some("Walk") => fl!("state-walk"),
+        Some("Sleep") => fl!("state-sleep"),
+        Some("Falling") => fl!("state-falling"),
+        Some("Dragged") => fl!("state-dragged"),
+        Some("Landing") => fl!("state-landing"),
+        Some(_) => fl!("state-unknown"),
     }
 }
 
@@ -85,15 +88,24 @@ fn norm(v: f32, min: f32, max: f32) -> f32 {
     ((v - min) / (max - min)).clamp(0.0, 1.0)
 }
 
-/// Аптайм демона в человекочитаемом виде.
+/// Аптайм демона в человекочитаемом виде: плюральные формы — по правилам
+/// CLDR через Fluent («1 минута / 2 минуты / 5 минут», ТД-30).
 fn format_uptime(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if h > 0 {
-        format!("{h} ч {m} мин")
+        format!(
+            "{} {}",
+            fl!("uptime-hours", hours = h),
+            fl!("uptime-minutes", minutes = m)
+        )
     } else if m > 0 {
-        format!("{m} мин {s} с")
+        format!(
+            "{} {}",
+            fl!("uptime-minutes", minutes = m),
+            fl!("uptime-seconds", seconds = s)
+        )
     } else {
-        format!("{s} с")
+        fl!("uptime-seconds", seconds = s)
     }
 }
 
@@ -107,8 +119,41 @@ fn argb_to_color32(p: u32) -> Color32 {
     )
 }
 
+/// Экранировать аргумент для ключа Exec по Desktop Entry spec: значение
+/// проходит два разбора — общий unescape строки файла, затем разбор
+/// аргументов с кавычками. Простые пути не трогаем; всё остальное берём
+/// в двойные кавычки, а `"` `` ` `` `$` `\` экранируем с учётом обоих
+/// уровней (`\` в файле пишется как `\\`).
+fn exec_quote(arg: &str) -> String {
+    let simple = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':' | '+'));
+    if simple {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for c in arg.chars() {
+        match c {
+            // Уровень Exec-разбора требует `\"`; чтобы `\` пережил общий
+            // unescape, в файле это `\\"`.
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            // Литеральный бэкслеш: `\\` на уровне Exec = `\\\\` в файле.
+            '\\' => out.push_str("\\\\\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Содержимое autostart-файла для KDE: запускаем демона после панели.
 fn desktop_file_content(exec: &str) -> String {
+    let exec = exec_quote(exec);
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
@@ -150,9 +195,66 @@ fn daemon_exec() -> String {
     daemon_exec_in(exe.as_deref().and_then(Path::parent))
 }
 
-/// Включить/выключить автозапуск: создать или удалить .desktop-файл.
+/// Каким механизмом управлять автозапуском (ТД-28): предпочитаем systemd
+/// user unit (Restart=on-failure, journald), .desktop — фолбэк.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutostartBackend {
+    /// Установлен dist/driftling.service — рулим через systemctl --user.
+    SystemdUnit,
+    /// Юнита нет (или нет systemd) — XDG autostart .desktop-файл.
+    DesktopFile,
+}
+
+/// Определить бэкенд: юнит считается установленным, если systemd его видит.
+fn autostart_backend() -> AutostartBackend {
+    let installed = std::process::Command::new("systemctl")
+        .args(["--user", "list-unit-files", "driftling.service"])
+        .output()
+        .map(|o| {
+            o.status.success() && String::from_utf8_lossy(&o.stdout).contains("driftling.service")
+        })
+        .unwrap_or(false);
+    if installed {
+        AutostartBackend::SystemdUnit
+    } else {
+        AutostartBackend::DesktopFile
+    }
+}
+
+/// systemctl --user enable/disable driftling.service.
+fn set_autostart_systemd(enable: bool) -> Result<(), String> {
+    let action = if enable { "enable" } else { "disable" };
+    let out = std::process::Command::new("systemctl")
+        .args(["--user", action, "driftling.service"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Текущее фактическое состояние автозапуска (для тумблера).
+fn autostart_enabled() -> bool {
+    match autostart_backend() {
+        AutostartBackend::SystemdUnit => std::process::Command::new("systemctl")
+            .args(["--user", "is-enabled", "--quiet", "driftling.service"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false),
+        AutostartBackend::DesktopFile => autostart_path().exists(),
+    }
+}
+
+/// Включить/выключить автозапуск выбранным бэкендом.
 fn set_autostart(enable: bool) -> Result<(), String> {
-    set_autostart_at(&autostart_path(), enable, &daemon_exec())
+    match autostart_backend() {
+        AutostartBackend::SystemdUnit => set_autostart_systemd(enable),
+        AutostartBackend::DesktopFile => {
+            set_autostart_at(&autostart_path(), enable, &daemon_exec())
+        }
+    }
 }
 
 /// Та же логика с явными путями — для юнит-тестов.
@@ -242,16 +344,16 @@ fn spawn_poller(slot: Arc<Mutex<PollState>>, ctx: egui::Context) {
 /// после команды сразу дёргаем свежий PetInfo, чтобы UI не ждал секунду.
 fn spawn_action(
     req: Request,
-    ok_text: &'static str,
+    ok_text: String,
     result: Arc<Mutex<Option<String>>>,
     poll: Arc<Mutex<PollState>>,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
         let text = match call(&req) {
-            Ok(Response::Error(e)) => format!("Ошибка демона: {e}"),
-            Ok(_) => ok_text.to_string(),
-            Err(e) => format!("Ошибка: {e:#}"),
+            Ok(Response::Error(e)) => fl!("daemon-error", error = e),
+            Ok(_) => ok_text,
+            Err(e) => fl!("generic-error", error = format!("{e:#}")),
         };
         *result.lock().unwrap() = Some(text);
         poll_once(&poll);
@@ -559,11 +661,11 @@ fn daemon_dot(ui: &mut egui::Ui, up: bool, checked: bool) {
         };
         ui.painter().circle_filled(rect.center(), 4.0, color);
         let text = if !checked {
-            "Проверяем…"
+            fl!("badge-checking")
         } else if up {
-            "Демон работает"
+            fl!("daemon-running")
         } else {
-            "Демон не запущен"
+            fl!("daemon-not-running")
         };
         ui.label(RichText::new(text).size(12.5).color(MUTED));
     });
@@ -672,7 +774,7 @@ impl SettingsApp {
             pet_action: Arc::new(Mutex::new(None)),
             daemon_action: Arc::new(Mutex::new(None)),
             debug_action: Arc::new(Mutex::new(None)),
-            autostart: autostart_path().exists(),
+            autostart: autostart_enabled(),
             autostart_result: None,
             stop_armed_at: None,
             form: PetAttributes::default(),
@@ -682,13 +784,7 @@ impl SettingsApp {
         }
     }
 
-    fn action(
-        &self,
-        ui: &egui::Ui,
-        req: Request,
-        ok: &'static str,
-        slot: &Arc<Mutex<Option<String>>>,
-    ) {
+    fn action(&self, ui: &egui::Ui, req: Request, ok: String, slot: &Arc<Mutex<Option<String>>>) {
         spawn_action(
             req,
             ok,
@@ -747,12 +843,12 @@ impl SettingsApp {
         });
         ui.add_space(14.0);
 
-        self.nav_item(ui, Page::Pet, "Питомец");
+        self.nav_item(ui, Page::Pet, &fl!("nav-pet"));
         ui.add_space(4.0);
-        self.nav_item(ui, Page::App, "Приложение");
+        self.nav_item(ui, Page::App, &fl!("nav-app"));
         if self.debug_enabled {
             ui.add_space(4.0);
-            self.nav_item(ui, Page::Debug, "Отладка");
+            self.nav_item(ui, Page::Debug, &fl!("nav-debug"));
         }
 
         let (checked, up) = {
@@ -803,7 +899,7 @@ impl SettingsApp {
                     let name = info
                         .as_ref()
                         .map(|i| i.name.clone())
-                        .unwrap_or_else(|| "Дрифтлинг".to_string());
+                        .unwrap_or_else(|| fl!("default-pet-name"));
                     ui.label(
                         RichText::new(name)
                             .size(20.0)
@@ -812,20 +908,23 @@ impl SettingsApp {
                     );
                     ui.add_space(2.0);
                     ui.horizontal(|ui| match (&st.checked, &st.up, &info) {
-                        (false, ..) => badge(ui, "Проверяем…", MUTED),
-                        (true, false, _) => badge(ui, "Демон не запущен", DANGER),
+                        (false, ..) => badge(ui, &fl!("badge-checking"), MUTED),
+                        (true, false, _) => badge(ui, &fl!("daemon-not-running"), DANGER),
                         (true, true, Some(i)) => {
                             let s = i.state.as_deref();
-                            badge(ui, state_label(s), state_color(s));
+                            badge(ui, &state_label(s), state_color(s));
                         }
-                        (true, true, None) => badge(ui, "Нет данных", MUTED),
+                        (true, true, None) => badge(ui, &fl!("badge-no-data"), MUTED),
                     });
                     if st.up {
                         if let Some(i) = &info {
                             ui.label(
-                                RichText::new(format!("в сети {}", format_uptime(i.uptime_secs)))
-                                    .size(12.5)
-                                    .color(MUTED),
+                                RichText::new(fl!(
+                                    "online-for",
+                                    uptime = format_uptime(i.uptime_secs)
+                                ))
+                                .size(12.5)
+                                .color(MUTED),
                             );
                         }
                     }
@@ -833,12 +932,22 @@ impl SettingsApp {
 
                     let present = info.as_ref().is_some_and(|i| i.state.is_some());
                     ui.horizontal(|ui| {
-                        if primary_button(ui, "Призвать", st.up && !present).clicked() {
-                            self.action(ui, Request::Summon, "Питомец призван", &self.pet_action);
+                        if primary_button(ui, &fl!("btn-summon"), st.up && !present).clicked() {
+                            self.action(
+                                ui,
+                                Request::Summon,
+                                fl!("msg-pet-summoned"),
+                                &self.pet_action,
+                            );
                         }
-                        if outline_button(ui, "Убрать с экрана", TEXT, st.up && present).clicked()
+                        if outline_button(ui, &fl!("btn-dismiss"), TEXT, st.up && present).clicked()
                         {
-                            self.action(ui, Request::Dismiss, "Питомец убран", &self.pet_action);
+                            self.action(
+                                ui,
+                                Request::Dismiss,
+                                fl!("msg-pet-dismissed"),
+                                &self.pet_action,
+                            );
                         }
                     });
                     if let Some(text) = &*self.pet_action.lock().unwrap() {
@@ -853,7 +962,7 @@ impl SettingsApp {
 
     fn stats_card(&mut self, ui: &mut egui::Ui, st: &PollState) {
         card(ui, |ui| {
-            section_label(ui, "Характеристики");
+            section_label(ui, &fl!("section-stats"));
             ui.add_space(2.0);
             match &st.info {
                 Some(i) => {
@@ -862,40 +971,47 @@ impl SettingsApp {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     stat_row(
                         ui,
-                        "Скорость",
-                        &format!("{:.0} px/с", a.walk_speed),
+                        &fl!("stat-speed"),
+                        &fl!("stat-speed-value", value = format!("{:.0}", a.walk_speed)),
                         Some(norm(a.walk_speed, 5.0, 400.0)),
                     );
                     stat_row(
                         ui,
-                        "Непоседливость",
+                        &fl!("stat-curiosity"),
                         &format!("{}/100", a.curiosity),
                         Some(a.curiosity as f32 / 100.0),
                     );
                     stat_row(
                         ui,
-                        "Сонливость",
+                        &fl!("stat-sleepiness"),
                         &format!("{}/100", a.sleepiness),
                         Some(a.sleepiness as f32 / 100.0),
                     );
-                    stat_row(ui, "Размер", &format!("{} px", a.size), None);
                     stat_row(
                         ui,
-                        "Сон",
-                        &format!("{:.0}–{:.0} сек", a.sleep_min, a.sleep_max),
+                        &fl!("stat-size"),
+                        &fl!("stat-size-value", value = a.size.to_string()),
+                        None,
+                    );
+                    stat_row(
+                        ui,
+                        &fl!("stat-sleep"),
+                        &fl!(
+                            "stat-sleep-value",
+                            min = format!("{:.0}", a.sleep_min),
+                            max = format!("{:.0}", a.sleep_max)
+                        ),
                         None,
                     );
                     ui.spacing_mut().item_spacing.y = 10.0;
                 }
                 None => {
-                    ui.label(
-                        RichText::new("Демон не запущен — характеристики недоступны.").color(MUTED),
-                    );
+                    ui.label(RichText::new(fl!("stats-unavailable")).color(MUTED));
                 }
             }
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Характеристики растут вместе с питомцем")
+                RichText::new(fl!("stats-grow-note"))
                     .size(12.5)
                     .color(MUTED)
                     .italics(),
@@ -913,7 +1029,7 @@ impl SettingsApp {
                 raw: None,
             }
         };
-        page_title(ui, "Питомец");
+        page_title(ui, &fl!("nav-pet"));
         ui.add_space(4.0);
         self.hero_card(ui, &st);
         ui.add_space(2.0);
@@ -928,30 +1044,26 @@ impl SettingsApp {
             (st.checked, st.up, st.info.as_ref().map(|i| i.uptime_secs))
         };
 
-        page_title(ui, "Приложение");
+        page_title(ui, &fl!("nav-app"));
         ui.add_space(4.0);
 
         card(ui, |ui| {
-            section_label(ui, "Запуск");
+            section_label(ui, &fl!("section-launch"));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label("Автозапуск при входе в систему");
-                    ui.label(
-                        RichText::new("Демон запустится вместе с рабочим столом")
-                            .size(12.5)
-                            .color(MUTED),
-                    );
+                    ui.label(fl!("autostart-title"));
+                    ui.label(RichText::new(fl!("autostart-desc")).size(12.5).color(MUTED));
                 });
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if toggle_switch(ui, &mut self.autostart).changed() {
                         self.autostart_result = Some(match set_autostart(self.autostart) {
-                            Ok(()) if self.autostart => "Автозапуск включён".to_string(),
-                            Ok(()) => "Автозапуск выключен".to_string(),
+                            Ok(()) if self.autostart => fl!("msg-autostart-on"),
+                            Ok(()) => fl!("msg-autostart-off"),
                             Err(e) => {
                                 // Не вышло — галка возвращается к факту.
-                                self.autostart = autostart_path().exists();
-                                format!("Ошибка: {e}")
+                                self.autostart = autostart_enabled();
+                                fl!("generic-error", error = e)
                             }
                         });
                     }
@@ -964,13 +1076,13 @@ impl SettingsApp {
         ui.add_space(2.0);
 
         card(ui, |ui| {
-            section_label(ui, "Демон");
+            section_label(ui, &fl!("section-daemon"));
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 daemon_dot(ui, up, checked);
                 if let (true, Some(secs)) = (up, uptime) {
                     ui.label(
-                        RichText::new(format!("· аптайм {}", format_uptime(secs)))
+                        RichText::new(fl!("uptime-label", uptime = format_uptime(secs)))
                             .size(12.5)
                             .color(MUTED),
                     );
@@ -987,14 +1099,19 @@ impl SettingsApp {
             }
             let armed = self.stop_armed_at.is_some();
             let label = if armed {
-                "Точно остановить?"
+                fl!("btn-stop-confirm")
             } else {
-                "Остановить демона"
+                fl!("btn-stop-daemon")
             };
-            if outline_button(ui, label, DANGER, up).clicked() {
+            if outline_button(ui, &label, DANGER, up).clicked() {
                 if armed {
                     self.stop_armed_at = None;
-                    self.action(ui, Request::Quit, "Демон остановлен", &self.daemon_action);
+                    self.action(
+                        ui,
+                        Request::Quit,
+                        fl!("msg-daemon-stopped"),
+                        &self.daemon_action,
+                    );
                 } else {
                     self.stop_armed_at = Some(now);
                     ui.ctx().request_repaint_after(Duration::from_secs(3));
@@ -1007,21 +1124,17 @@ impl SettingsApp {
         ui.add_space(2.0);
 
         card(ui, |ui| {
-            section_label(ui, "О программе");
+            section_label(ui, &fl!("section-about"));
             ui.add_space(2.0);
             ui.label(format!("Driftling {}", env!("CARGO_PKG_VERSION")));
-            ui.label(
-                RichText::new("Питомец для рабочего стола Wayland. Живёт на нижней кромке экрана, гуляет, спит и падает в руки.")
-                    .size(12.5)
-                    .color(MUTED),
-            );
+            ui.label(RichText::new(fl!("about-desc")).size(12.5).color(MUTED));
         });
     }
 
     // -- Страница «Отладка» ---------------------------------------------------
 
     fn page_debug(&mut self, ui: &mut egui::Ui) {
-        page_title(ui, "Отладка");
+        page_title(ui, &fl!("nav-debug"));
         ui.add_space(4.0);
 
         // Предупреждение: это админка, а не игровой путь.
@@ -1031,59 +1144,50 @@ impl SettingsApp {
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::same(12))
             .show(ui, |ui| {
-                ui.label(
-                    RichText::new(
-                        "Админ-панель. Прямое редактирование характеристик — для отладки; \
-                         в игре они будут расти через уход за питомцем.",
-                    )
-                    .size(13.5)
-                    .color(AMBER),
-                );
+                ui.label(RichText::new(fl!("debug-warning")).size(13.5).color(AMBER));
             });
         ui.add_space(2.0);
 
         card(ui, |ui| {
-            section_label(ui, "Характеристики питомца");
+            section_label(ui, &fl!("section-pet-attrs"));
             ui.add_space(2.0);
 
             let f = &mut self.form;
-            ui.add(Slider::new(&mut f.size, 32..=256).text("Размер, px"));
-            ui.add(Slider::new(&mut f.walk_speed, 5.0..=400.0).text("Скорость, px/с"));
-            ui.add(Slider::new(&mut f.curiosity, 0..=100).text("Непоседливость"));
-            ui.add(Slider::new(&mut f.sleepiness, 0..=100).text("Сонливость"));
+            ui.add(Slider::new(&mut f.size, 32..=256).text(fl!("slider-size")));
+            ui.add(Slider::new(&mut f.walk_speed, 5.0..=400.0).text(fl!("slider-speed")));
+            ui.add(Slider::new(&mut f.curiosity, 0..=100).text(fl!("slider-curiosity")));
+            ui.add(Slider::new(&mut f.sleepiness, 0..=100).text(fl!("slider-sleepiness")));
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Сон, сек:").color(MUTED));
+                ui.label(RichText::new(fl!("sleep-secs-label")).color(MUTED));
                 ui.add(
                     DragValue::new(&mut f.sleep_min)
                         .range(1.0..=3600.0)
-                        .prefix("от "),
+                        .prefix(format!("{} ", fl!("sleep-from"))),
                 );
                 ui.add(
                     DragValue::new(&mut f.sleep_max)
                         .range(1.0..=7200.0)
-                        .prefix("до "),
+                        .prefix(format!("{} ", fl!("sleep-to"))),
                 );
             });
             ui.label(
-                RichText::new(
-                    "Демон клампит значения: непоседливость + сонливость ≤ 100, мин. сна ≤ макс.",
-                )
-                .size(12.5)
-                .color(MUTED),
+                RichText::new(fl!("debug-clamp-note"))
+                    .size(12.5)
+                    .color(MUTED),
             );
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {
-                if primary_button(ui, "Применить", true).clicked() {
+                if primary_button(ui, &fl!("btn-apply"), true).clicked() {
                     self.form = self.form.clamped();
                     self.action(
                         ui,
                         Request::SetAttributes(self.form),
-                        "Применено и сохранено",
+                        fl!("msg-applied"),
                         &self.debug_action,
                     );
                 }
-                if outline_button(ui, "Сбросить к дефолту", TEXT, true).clicked() {
+                if outline_button(ui, &fl!("btn-reset"), TEXT, true).clicked() {
                     self.form = PetAttributes::default();
                 }
             });
@@ -1094,7 +1198,7 @@ impl SettingsApp {
         ui.add_space(2.0);
 
         card(ui, |ui| {
-            section_label(ui, "Сырой ответ демона");
+            section_label(ui, &fl!("section-raw"));
             let raw = self.poll.lock().unwrap().raw.clone();
             CollapsingHeader::new(RichText::new("PetInfo (JSON)").color(MUTED))
                 .default_open(false)
@@ -1103,7 +1207,7 @@ impl SettingsApp {
                         ui.add(Label::new(RichText::new(json).monospace().color(TEXT)));
                     }
                     None => {
-                        ui.label(RichText::new("Нет ответа от демона.").color(MUTED));
+                        ui.label(RichText::new(fl!("raw-none")).color(MUTED));
                     }
                 });
         });
@@ -1201,17 +1305,22 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
+    /// Отображение всех состояний тотально и идёт через i18n (ТД-30):
+    /// сравниваем с fl!-рендером — тест не зависит от локали машины.
     #[test]
-    fn state_labels_are_russian_and_total() {
-        assert_eq!(state_label(None), "Убран с экрана");
-        assert_eq!(state_label(Some("Idle")), "Отдыхает");
-        assert_eq!(state_label(Some("Walk")), "Гуляет");
-        assert_eq!(state_label(Some("Sleep")), "Спит");
-        assert_eq!(state_label(Some("Falling")), "Падает");
-        assert_eq!(state_label(Some("Dragged")), "В руках");
-        assert_eq!(state_label(Some("Landing")), "Приземлился");
-        assert_eq!(state_label(Some("???")), "Неизвестно");
+    fn state_labels_are_localized_and_total() {
+        assert_eq!(state_label(None), fl!("state-absent"));
+        assert_eq!(state_label(Some("Idle")), fl!("state-idle"));
+        assert_eq!(state_label(Some("Walk")), fl!("state-walk"));
+        assert_eq!(state_label(Some("Sleep")), fl!("state-sleep"));
+        assert_eq!(state_label(Some("Falling")), fl!("state-falling"));
+        assert_eq!(state_label(Some("Dragged")), fl!("state-dragged"));
+        assert_eq!(state_label(Some("Landing")), fl!("state-landing"));
+        assert_eq!(state_label(Some("???")), fl!("state-unknown"));
+        // Известные состояния не проваливаются в «неизвестно».
+        assert_ne!(state_label(Some("Idle")), state_label(Some("???")));
     }
 
     #[test]
@@ -1243,12 +1352,67 @@ mod tests {
         assert_eq!(argb_to_color32(0).a(), 0);
     }
 
+    /// Структура аптайма: часы+минуты / минуты+секунды / секунды.
+    /// Сравниваем с fl!-рендером — не зависит от локали машины.
     #[test]
-    fn uptime_formatting() {
-        assert_eq!(format_uptime(7), "7 с");
-        assert_eq!(format_uptime(75), "1 мин 15 с");
-        assert_eq!(format_uptime(3700), "1 ч 1 мин");
-        assert_eq!(format_uptime(7980), "2 ч 13 мин");
+    fn uptime_formatting_structure() {
+        assert_eq!(format_uptime(7), fl!("uptime-seconds", seconds = 7));
+        assert_eq!(
+            format_uptime(75),
+            format!(
+                "{} {}",
+                fl!("uptime-minutes", minutes = 1),
+                fl!("uptime-seconds", seconds = 15)
+            )
+        );
+        assert_eq!(
+            format_uptime(3700),
+            format!(
+                "{} {}",
+                fl!("uptime-hours", hours = 1),
+                fl!("uptime-minutes", minutes = 1)
+            )
+        );
+        assert_eq!(
+            format_uptime(7980),
+            format!(
+                "{} {}",
+                fl!("uptime-hours", hours = 2),
+                fl!("uptime-minutes", minutes = 13)
+            )
+        );
+    }
+
+    /// Русские плюральные формы CLDR (ТД-30): «1 минута / 2 минуты /
+    /// 5 минут» — детерминированно, через явный ru-загрузчик.
+    #[test]
+    fn uptime_russian_plural_forms() {
+        let ru = crate::i18n::loader_for("ru");
+        let minutes = |n: u64| ru.get_args("uptime-minutes", HashMap::from([("minutes", n)]));
+        assert_eq!(minutes(1), "1 минута");
+        assert_eq!(minutes(2), "2 минуты");
+        assert_eq!(minutes(5), "5 минут");
+        assert_eq!(minutes(21), "21 минута");
+        assert_eq!(minutes(64), "64 минуты");
+        let hours = |n: u64| ru.get_args("uptime-hours", HashMap::from([("hours", n)]));
+        assert_eq!(hours(1), "1 час");
+        assert_eq!(hours(3), "3 часа");
+        assert_eq!(hours(11), "11 часов");
+        let seconds = |n: u64| ru.get_args("uptime-seconds", HashMap::from([("seconds", n)]));
+        assert_eq!(seconds(1), "1 секунда");
+        assert_eq!(seconds(15), "15 секунд");
+    }
+
+    /// Английские плюральные формы (фолбэк-язык обязан быть полным).
+    #[test]
+    fn uptime_english_plural_forms() {
+        let en = crate::i18n::loader_for("en");
+        let minutes = |n: u64| en.get_args("uptime-minutes", HashMap::from([("minutes", n)]));
+        assert_eq!(minutes(1), "1 minute");
+        assert_eq!(minutes(2), "2 minutes");
+        let hours = |n: u64| en.get_args("uptime-hours", HashMap::from([("hours", n)]));
+        assert_eq!(hours(1), "1 hour");
+        assert_eq!(hours(5), "5 hours");
     }
 
     #[test]
@@ -1260,6 +1424,33 @@ mod tests {
         assert!(text.contains("Exec=/usr/bin/driftling\n"));
         assert!(text.contains("X-KDE-autostart-after=panel\n"));
         assert!(text.ends_with('\n'));
+    }
+
+    /// Exec экранируется по Desktop Entry spec: путь с пробелами/кавычками
+    /// переживает оба уровня разбора (общий unescape + разбор аргументов).
+    #[test]
+    fn exec_quoting_survives_special_paths() {
+        // Простой путь остаётся как есть.
+        assert_eq!(exec_quote("/usr/bin/driftling"), "/usr/bin/driftling");
+        assert_eq!(exec_quote("driftling"), "driftling");
+
+        // Пробел: достаточно кавычек, внутри ничего не экранируется.
+        assert_eq!(
+            exec_quote("/opt/my apps/driftling"),
+            "\"/opt/my apps/driftling\""
+        );
+        let text = desktop_file_content("/opt/my apps/driftling");
+        assert!(text.contains("Exec=\"/opt/my apps/driftling\"\n"));
+
+        // Кавычка: в файле `\\"` (общий unescape -> `\"` для Exec-разбора).
+        assert_eq!(exec_quote(r#"/tmp/a"b"#), "\"/tmp/a\\\\\"b\"");
+        // Доллар и бэктик — та же схема.
+        assert_eq!(exec_quote("/tmp/a$b"), "\"/tmp/a\\\\$b\"");
+        assert_eq!(exec_quote("/tmp/a`b"), "\"/tmp/a\\\\`b\"");
+        // Литеральный бэкслеш: четыре в файле.
+        assert_eq!(exec_quote(r"/tmp/a\b"), "\"/tmp/a\\\\\\\\b\"");
+        // Пустая строка не даёт пустого Exec без кавычек.
+        assert_eq!(exec_quote(""), "\"\"");
     }
 
     #[test]

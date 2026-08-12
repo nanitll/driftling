@@ -38,6 +38,18 @@ impl World {
     }
 }
 
+/// Желаемый темп симуляции (энергобюджет ТЗ §7): ядро не знает о платформе,
+/// демон мапит SimPace на таймер бэкенда (см. driftling_platform::Pace).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimPace {
+    /// Движение/падение/drag — нужен частый тик.
+    Active,
+    /// Спокойный idle/оглушение — редкий тик.
+    Calm,
+    /// Сон — тик раз в секунду.
+    Drowsy,
+}
+
 /// События указателя, которые платформа передаёт в симуляцию.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PointerEvent {
@@ -68,7 +80,14 @@ pub struct Pet {
     drag_offset: Vec2,
     /// Недавние позиции курсора для скорости броска.
     drag_history: [(f32, Vec2); 4],
+    /// Точка нажатия, пока не решено «клик или drag» (ТД-24): кнопка зажата,
+    /// но порог движения ещё не пройден. None — кнопка не зажата.
+    pressed_at: Option<Vec2>,
 }
+
+/// Порог движения курсора, после которого нажатие становится захватом,
+/// а не кликом (ТД-24), логические пиксели.
+const DRAG_THRESHOLD: f32 = 4.0;
 
 impl Pet {
     pub fn new(pos: Vec2, size: f32, cfg: BehaviorConfig, seed: u64) -> Self {
@@ -86,6 +105,7 @@ impl Pet {
             rng,
             drag_offset: Vec2::default(),
             drag_history: [(0.0, Vec2::default()); 4],
+            pressed_at: None,
         }
     }
 
@@ -110,9 +130,23 @@ impl Pet {
         )
     }
 
+    /// Желаемый темп тика: адаптивный таймер бэкенда (ТД-3) спрашивает у
+    /// симуляции, как часто её надо будить.
+    pub fn pace(&self) -> SimPace {
+        match self.state {
+            PetState::Falling | PetState::Dragged | PetState::Walk => SimPace::Active,
+            PetState::Idle | PetState::Landing => SimPace::Calm,
+            PetState::Sleep => SimPace::Drowsy,
+        }
+    }
+
     /// Один шаг симуляции. `dt` — секунды с прошлого шага (клампится).
+    ///
+    /// Кламп 1.5 с — под адаптивный таймер (ТД-3): спящий питомец тикает
+    /// ~1 Гц, и его таймеры должны идти в реальном темпе, а не в 10 раз
+    /// медленнее. Больший dt (сон компоситора, лаг) честно обрезаем.
     pub fn tick(&mut self, world: &World, dt: f32) {
-        let dt = dt.clamp(0.0, 0.1);
+        let dt = dt.clamp(0.0, 1.5);
         self.state_time += dt;
 
         match self.state {
@@ -120,23 +154,31 @@ impl Pet {
                 // Позицию ведёт указатель (см. pointer()); физика выключена.
             }
             PetState::Falling => {
-                self.vel.y += self.cfg.gravity * dt;
-                self.pos = self.pos + self.vel * dt;
-                self.clamp_horizontal(world);
-                if self.pos.y >= world.ground_y() {
-                    self.pos.y = world.ground_y();
-                    let impact = self.vel.y;
-                    self.vel = Vec2::default();
-                    self.enter(if impact > self.cfg.hard_landing_speed {
-                        PetState::Landing
-                    } else {
-                        PetState::Idle
-                    });
-                    self.state_left = if self.state == PetState::Landing {
-                        self.cfg.landing_time
-                    } else {
-                        1.0 + self.rng.f32()
-                    };
+                // Падение при частом тике не случается с большим dt, но
+                // подстраховываем интегрирование: подшаги ≤0.05 с, иначе
+                // редкий тик протыкает землю и завышает скорость удара.
+                let mut left = dt;
+                while left > 0.0 && self.state == PetState::Falling {
+                    let step = left.min(0.05);
+                    left -= step;
+                    self.vel.y += self.cfg.gravity * step;
+                    self.pos = self.pos + self.vel * step;
+                    self.clamp_horizontal(world);
+                    if self.pos.y >= world.ground_y() {
+                        self.pos.y = world.ground_y();
+                        let impact = self.vel.y;
+                        self.vel = Vec2::default();
+                        self.enter(if impact > self.cfg.hard_landing_speed {
+                            PetState::Landing
+                        } else {
+                            PetState::Idle
+                        });
+                        self.state_left = if self.state == PetState::Landing {
+                            self.cfg.landing_time
+                        } else {
+                            1.0 + self.rng.f32()
+                        };
+                    }
                 }
             }
             PetState::Walk => {
@@ -164,14 +206,25 @@ impl Pet {
                 if !self.bounds().contains(p) {
                     return false;
                 }
-                self.drag_offset = Vec2::new(self.pos.x - p.x, self.pos.y - p.y);
+                // Захват начнётся только после порога движения (ТД-24):
+                // пока лишь запоминаем точку нажатия.
+                self.pressed_at = Some(p);
                 self.drag_history = [(now, p); 4];
-                self.enter(PetState::Dragged);
                 true
             }
             PointerEvent::Motion(p) => {
                 if self.state != PetState::Dragged {
-                    return false;
+                    let Some(origin) = self.pressed_at else {
+                        return false;
+                    };
+                    if (p.x - origin.x).hypot(p.y - origin.y) < DRAG_THRESHOLD {
+                        // Дрожание в пределах порога — всё ещё клик.
+                        return true;
+                    }
+                    // Порог пройден — это захват. Смещение от текущей позиции
+                    // питомца, чтобы он не прыгал под курсор.
+                    self.drag_offset = Vec2::new(self.pos.x - p.x, self.pos.y - p.y);
+                    self.enter(PetState::Dragged);
                 }
                 self.drag_history.rotate_left(1);
                 self.drag_history[3] = (now, p);
@@ -182,8 +235,10 @@ impl Pet {
                 true
             }
             PointerEvent::Release(_) => {
+                let was_pressed = self.pressed_at.take().is_some();
                 if self.state != PetState::Dragged {
-                    return false;
+                    // Клик без захвата: потребляем, реакция придёт в фазе B.
+                    return was_pressed;
                 }
                 // Скорость броска — по финальному «флику»: берём самую раннюю
                 // точку истории не старше ~120 мс, чтобы медленное таскание
@@ -287,8 +342,9 @@ mod tests {
         }
         let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
         assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
-        assert_eq!(p.state, PetState::Dragged);
+        assert_ne!(p.state, PetState::Dragged, "до порога движения — не захват");
         assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(500.0, 300.0)), 0.1));
+        assert_eq!(p.state, PetState::Dragged);
         assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(700.0, 280.0)), 0.2));
         assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(700.0, 280.0)), 0.2));
         assert_eq!(p.state, PetState::Falling);
@@ -305,5 +361,104 @@ mod tests {
         let w = world();
         let mut p = pet();
         assert!(!p.pointer(&w, PointerEvent::Press(Vec2::new(5.0, 5.0)), 0.0));
+    }
+
+    /// ТД-24: клик (нажал-отпустил, дрожание в пределах порога) — не захват.
+    #[test]
+    fn click_is_not_a_grab() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let state = p.state;
+        let pos = p.pos;
+        let press = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        let jitter = Vec2::new(press.x + 1.0, press.y - 1.0);
+        assert!(p.pointer(&w, PointerEvent::Press(press), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Motion(jitter), 0.05));
+        assert!(p.pointer(&w, PointerEvent::Release(jitter), 0.1));
+        assert_eq!(p.state, state, "клик не должен менять состояние");
+        assert_eq!(
+            (p.pos.x, p.pos.y),
+            (pos.x, pos.y),
+            "клик не двигает питомца"
+        );
+        // Отпустили — дальнейший Motion питомца не касается.
+        assert!(!p.pointer(&w, PointerEvent::Motion(Vec2::new(500.0, 300.0)), 0.2));
+    }
+
+    /// ТД-3: при редком тике (~1 Гц во сне) таймеры состояния должны идти
+    /// в реальном темпе — старый кламп 0.1 растягивал сон в 10 раз.
+    #[test]
+    fn sleep_timer_is_exact_at_one_second_ticks() {
+        let w = world();
+        let mut p = pet();
+        p.pos.y = w.ground_y();
+        p.vel = Vec2::default();
+        p.state = PetState::Sleep;
+        p.state_time = 0.0;
+        p.state_left = 20.0;
+        for _ in 0..19 {
+            p.tick(&w, 1.0);
+        }
+        assert_eq!(p.state, PetState::Sleep, "19 секунд из 20 — ещё спит");
+        p.tick(&w, 1.0);
+        assert_eq!(p.state, PetState::Idle, "ровно на 20-й секунде проснулся");
+    }
+
+    /// dt больше клампа честно обрезается до 1.5 с.
+    #[test]
+    fn dt_above_clamp_is_cut() {
+        let w = world();
+        let mut p = pet();
+        p.pos.y = w.ground_y();
+        p.state = PetState::Sleep;
+        p.state_time = 0.0;
+        p.state_left = 10.0;
+        p.tick(&w, 100.0);
+        assert_eq!(p.state, PetState::Sleep);
+        assert!((p.state_time - 1.5).abs() < 1e-6);
+    }
+
+    /// Интегрирование падения при dt=1.5 идёт подшагами и совпадает с
+    /// мелкошаговой референс-симуляцией: земля не протыкается, скорость
+    /// удара не завышается.
+    #[test]
+    fn fall_substepping_matches_fine_steps() {
+        let w = world();
+        // Два одинаковых питомца: один тикает крупно, другой мелко.
+        let mut coarse = pet();
+        let mut fine = pet();
+        coarse.tick(&w, 1.5);
+        for _ in 0..30 {
+            fine.tick(&w, 0.05);
+        }
+        // За 1.5 с при g=1800 оба обязаны долететь до земли без пролёта.
+        assert_eq!(coarse.pos.y, w.ground_y());
+        assert_eq!(fine.pos.y, w.ground_y());
+        assert_eq!(coarse.state, fine.state);
+        assert!(
+            (coarse.pos.x - fine.pos.x).abs() < 1.0,
+            "траектории разошлись: {} vs {}",
+            coarse.pos.x,
+            fine.pos.x
+        );
+    }
+
+    #[test]
+    fn pace_maps_states_to_sim_pace() {
+        let mut p = pet();
+        for (state, pace) in [
+            (PetState::Falling, SimPace::Active),
+            (PetState::Dragged, SimPace::Active),
+            (PetState::Walk, SimPace::Active),
+            (PetState::Idle, SimPace::Calm),
+            (PetState::Landing, SimPace::Calm),
+            (PetState::Sleep, SimPace::Drowsy),
+        ] {
+            p.state = state;
+            assert_eq!(p.pace(), pace, "{state:?}");
+        }
     }
 }
