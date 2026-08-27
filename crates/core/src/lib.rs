@@ -11,6 +11,7 @@ pub mod config;
 pub mod geometry;
 pub mod growth;
 pub mod journal;
+pub mod palette;
 pub mod pet;
 pub mod physics;
 pub mod sprite;
@@ -27,5 +28,6 @@ pub use journal::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use journal::{journal_path_in, Journal};
+pub use palette::{DEFAULT_PET_COLOR, PET_PRESETS};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
 pub use stats::PetStats;

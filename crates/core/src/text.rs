@@ -20,11 +20,11 @@ use std::sync::OnceLock;
 
 static FONT_DATA: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
-// Язык дизайна settings-окна: тёмная карточка, светлый текст, сиреневый акцент.
+// Язык дизайна settings-окна: тёмная карточка, светлый текст; акцент
+// приходит параметром (menu_frame) — он следует за цветом питомца.
 const CARD_BG: u32 = 0xff_23_23_2e;
 const CARD_STROKE: u32 = 0xff_2f_2f_3d;
 const TEXT_COLOR: u32 = 0xff_e8_e8_f0;
-const ACCENT: u32 = 0xff_8a_63_d2;
 /// Скругление карточек, px (как в настройках).
 const CARD_RADIUS: f32 = 10.0;
 /// Сила подсветки строки меню под курсором.
@@ -220,9 +220,15 @@ pub fn bubble_frame(text: &str, px: f32) -> Frame {
 }
 
 /// Вертикальное меню в языке дизайна настроек: карточка, скругление 10px,
-/// строка под курсором подсвечена акцентом. Возвращает кадр и хит-области
-/// строк в координатах кадра (для маппинга курсора в индекс строки).
-pub fn menu_frame(rows: &[&str], hovered: Option<usize>, px: f32) -> (Frame, Vec<Rect>) {
+/// строка под курсором подсвечена цветом `accent` (ARGB; демон передаёт
+/// осветлённый цвет питомца). Возвращает кадр и хит-области строк в
+/// координатах кадра (для маппинга курсора в индекс строки).
+pub fn menu_frame(
+    rows: &[&str],
+    hovered: Option<usize>,
+    px: f32,
+    accent: u32,
+) -> (Frame, Vec<Rect>) {
     let pad = (px * 0.4).round().max(4.0);
     let row_pad_x = (px * 0.8).round().max(8.0);
     let row_h = (px * 1.8).round();
@@ -242,7 +248,7 @@ pub fn menu_frame(rows: &[&str], hovered: Option<usize>, px: f32) -> (Frame, Vec
         let top = pad + i as f32 * row_h;
         let row_rect = Rect::new(pad, top, w - 2.0 * pad, row_h);
         if hovered == Some(i) {
-            fill_rounded(&mut frame, row_rect, 6.0, ACCENT, HOVER_STRENGTH);
+            fill_rounded(&mut frame, row_rect, 6.0, accent, HOVER_STRENGTH);
         }
         draw_text(
             &mut frame,
@@ -301,10 +307,13 @@ mod tests {
         assert_eq!(f.argb[(cy * f.w + cx) as usize] >> 24, 0xff);
     }
 
+    /// Акцент для тестов меню — любой непрозрачный цвет.
+    const TEST_ACCENT: u32 = 0xff_b0_a2_94;
+
     #[test]
     fn menu_hit_rects_match_rows() {
         let rows = ["Покормить", "Играть", "Спать"];
-        let (frame, rects) = menu_frame(&rows, None, 14.0);
+        let (frame, rects) = menu_frame(&rows, None, 14.0, TEST_ACCENT);
         assert_eq!(rects.len(), rows.len());
         assert!(ink(&frame) > 0);
         // Хит-области внутри кадра и не пересекаются по вертикали.
@@ -319,9 +328,21 @@ mod tests {
     #[test]
     fn hover_changes_pixels() {
         let rows = ["Feed", "Play"];
-        let (plain, _) = menu_frame(&rows, None, 14.0);
-        let (hovered, _) = menu_frame(&rows, Some(1), 14.0);
+        let (plain, _) = menu_frame(&rows, None, 14.0, TEST_ACCENT);
+        let (hovered, _) = menu_frame(&rows, Some(1), 14.0, TEST_ACCENT);
         assert_eq!((plain.w, plain.h), (hovered.w, hovered.h));
         assert_ne!(plain.argb, hovered.argb);
+    }
+
+    /// Акцент виден только на подсвеченной строке и реально красит её.
+    #[test]
+    fn hover_accent_recolors_highlight() {
+        let rows = ["Feed", "Play"];
+        let (a, _) = menu_frame(&rows, Some(0), 14.0, 0xff_e8_94_4a);
+        let (b, _) = menu_frame(&rows, Some(0), 14.0, 0xff_5f_bf_8f);
+        assert_ne!(a.argb, b.argb, "разный акцент — разная подсветка");
+        let (p1, _) = menu_frame(&rows, None, 14.0, 0xff_e8_94_4a);
+        let (p2, _) = menu_frame(&rows, None, 14.0, 0xff_5f_bf_8f);
+        assert_eq!(p1.argb, p2.argb, "без ховера акцент не участвует");
     }
 }

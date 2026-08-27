@@ -61,6 +61,20 @@ daemon-down-hint = The daemon is not running — start it to take care of the pe
 btn-start-daemon = Start the daemon
 msg-daemon-starting = Starting the daemon…
 
+# --- Appearance card (pet color) ---
+section-appearance = Appearance
+appearance-hint = The pet's color also drives the app's accent color.
+color-custom = Custom color
+msg-recolored = Pet recolored
+color-greige = Greige
+color-amber = Amber
+color-mint = Mint
+color-sky = Sky
+color-rose = Rose
+color-slate = Slate
+color-sand = Sand
+color-violet = Violet
+
 # --- Growth stage chip ---
 stage-egg = Egg
 stage-baby = Baby

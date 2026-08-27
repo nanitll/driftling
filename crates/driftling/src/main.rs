@@ -59,6 +59,9 @@ enum CtlAction {
     // Переименовать питомца (= событие журнала).
     #[command(about = fl!("cli-about-rename"))]
     Rename { name: String },
+    // Перекрасить питомца: hex-цвет #rrggbb или rrggbb (= событие журнала).
+    #[command(about = fl!("cli-about-recolor"))]
+    Recolor { color: String },
     // Перечитать конфиг и применить на лету.
     #[command(about = fl!("cli-about-reload"))]
     Reload,
@@ -107,6 +110,10 @@ fn main() -> Result<()> {
                 CtlAction::Play => driftling_ipc::Request::Play,
                 CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
                 CtlAction::Rename { name } => driftling_ipc::Request::Rename(name),
+                CtlAction::Recolor { color } => match parse_hex_color(&color) {
+                    Some(argb) => driftling_ipc::Request::Recolor(argb),
+                    None => anyhow::bail!(fl!("ctl-recolor-bad-hex", value = color)),
+                },
                 CtlAction::Reload => driftling_ipc::Request::Reload,
                 CtlAction::Quit => driftling_ipc::Request::Quit,
                 CtlAction::Doctor => return doctor(),
@@ -134,6 +141,7 @@ fn main() -> Result<()> {
                     attributes,
                     stats,
                     stage,
+                    color,
                     uptime_secs,
                 } => {
                     let state = state.unwrap_or_else(|| fl!("state-dismissed"));
@@ -160,6 +168,13 @@ fn main() -> Result<()> {
                     println!(
                         "{}",
                         fl!(
+                            "ctl-petinfo-color",
+                            color = format!("#{:06x}", color & 0x00ff_ffff)
+                        )
+                    );
+                    println!(
+                        "{}",
+                        fl!(
                             "ctl-petinfo-attributes",
                             attributes = format!("{attributes:?}")
                         )
@@ -170,6 +185,19 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Разобрать пользовательский hex-цвет `#rrggbb`/`rrggbb` в ARGB
+/// (альфа ff). Кривой ввод — None, дальше внятная ошибка ctl.
+fn parse_hex_color(s: &str) -> Option<u32> {
+    let hex = s.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16)
+        .ok()
+        .map(|rgb| 0xff00_0000 | rgb)
 }
 
 /// Локализованное имя стадии роста (демон шлёт машинное значение, ТД-30).
@@ -387,4 +415,27 @@ fn doctor() -> Result<()> {
         println!("{}", fl!("doctor-verdict-not-running"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_hex_color;
+
+    #[test]
+    fn hex_color_parses_with_and_without_hash() {
+        assert_eq!(parse_hex_color("e8944a"), Some(0xff_e8_94_4a));
+        assert_eq!(parse_hex_color("#e8944a"), Some(0xff_e8_94_4a));
+        assert_eq!(parse_hex_color("#E8944A"), Some(0xff_e8_94_4a));
+        assert_eq!(parse_hex_color("  b0a294 "), Some(0xff_b0_a2_94));
+        assert_eq!(parse_hex_color("000000"), Some(0xff_00_00_00));
+    }
+
+    #[test]
+    fn hex_color_rejects_garbage() {
+        for bad in [
+            "", "#", "e8944", "e8944a0", "e8944a00", "zzzzzz", "##e8944a", "#e894 4a",
+        ] {
+            assert_eq!(parse_hex_color(bad), None, "{bad:?} не должен парситься");
+        }
+    }
 }

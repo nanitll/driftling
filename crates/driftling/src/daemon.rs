@@ -67,6 +67,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use driftling_core::palette;
 use driftling_core::physics::Platform;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
@@ -90,6 +91,9 @@ const REFOLD_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Кегль строк меню ПКМ, px (язык дизайна настроек, text::menu_frame).
 const MENU_PX: f32 = 15.0;
+/// Акцент подсветки меню: цвет питомца осветляется — на тёмной карточке
+/// сам тёмный цвет тела был бы не виден.
+const MENU_ACCENT_LIGHTEN: f32 = 1.25;
 /// Кегль текста речевого пузыря, px.
 const BUBBLE_PX: f32 = 14.0;
 /// Зазор между пузырём и макушкой питомца, логические px.
@@ -353,6 +357,8 @@ struct Menu {
     /// Хит-области строк в координатах кадра (из text::menu_frame).
     rects: Vec<Rect>,
     hovered: Option<usize>,
+    /// Акцент подсветки строк: осветлённый цвет питомца на момент открытия.
+    accent: u32,
 }
 
 impl Menu {
@@ -370,7 +376,7 @@ impl Menu {
     /// карточка; вызывается только при реальной смене hovered).
     fn rebake(&mut self) {
         let rows: Vec<&str> = self.rows.iter().map(String::as_str).collect();
-        let (frame, rects) = text::menu_frame(&rows, self.hovered, MENU_PX);
+        let (frame, rects) = text::menu_frame(&rows, self.hovered, MENU_PX, self.accent);
         self.frame = frame;
         self.rects = rects;
     }
@@ -482,6 +488,9 @@ struct DaemonApp {
     /// Стадия, под которую сгенерирован набор, — детектор смены стадии
     /// (регенерация спрайтов + анимация вылупления Egg -> Baby).
     sprite_stage: Stage,
+    /// Цвет тела, под который сгенерирован набор, — детектор перекраски
+    /// (Recolored в журнале меняет derived.color, спрайты догоняют).
+    sprite_color: u32,
     /// Активный оверлей-экшен (еда/вылупление), B5/B6.
     overlay: Option<Overlay>,
     /// Речевой пузырь над питомцем (приветствие), B5/B6.
@@ -554,8 +563,9 @@ impl DaemonApp {
         );
         let size = derived.attributes.clamped().size;
         let stage = derived.stage;
+        let color = derived.color;
         Self {
-            sprites: sprite::placeholder_for_stage(size, stage),
+            sprites: sprite::placeholder_colored(size, stage, color),
             events: storage.events,
             clock: storage.clock,
             fold_cfg,
@@ -564,6 +574,7 @@ impl DaemonApp {
             journal_writable: storage.writable,
             sprite_base: size,
             sprite_stage: stage,
+            sprite_color: color,
             overlay: None,
             bubble: None,
             happy_until: None,
@@ -763,19 +774,27 @@ impl DaemonApp {
         wall_now_ms() >= self.derived.born_ms.saturating_add(gate_ms)
     }
 
-    /// Догнать спрайты до свёртки (B4/B6): смена стадии или базового
-    /// размера пересоздаёт набор кадров и перенастраивает питомца; переход
-    /// Egg -> дальше играет вылупление и пузырь «Привет!».
+    /// Догнать спрайты до свёртки (B4/B6): смена стадии, базового размера
+    /// или цвета тела пересоздаёт набор кадров и перенастраивает питомца;
+    /// переход Egg -> дальше играет вылупление и пузырь «Привет!».
     fn sync_visuals(&mut self, now: f64) {
         let stage = self.derived.stage;
         let base = self.derived.attributes.clamped().size;
-        if stage == self.sprite_stage && base == self.sprite_base {
+        let color = self.derived.color;
+        if stage == self.sprite_stage && base == self.sprite_base && color == self.sprite_color {
             return;
         }
         let hatched = self.sprite_stage == Stage::Egg && stage > Stage::Egg;
-        self.sprites = sprite::placeholder_for_stage(base, stage);
+        if color != self.sprite_color {
+            log::info!(
+                "перекраска: спрайты пересозданы под #{:06x}",
+                color & 0x00ff_ffff
+            );
+        }
+        self.sprites = sprite::placeholder_colored(base, stage, color);
         self.sprite_stage = stage;
         self.sprite_base = base;
+        self.sprite_color = color;
         let attrs = self.derived.attributes;
         if let Some(pet) = &mut self.pet {
             pet.apply_config(attrs.behavior_config(), self.sprites.size as f32);
@@ -805,7 +824,9 @@ impl DaemonApp {
         }
         let rows = menu_rows();
         let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let (frame, rects) = text::menu_frame(&refs, None, MENU_PX);
+        // Подсветка строк — осветлённый цвет питомца (контраст на карточке).
+        let accent = palette::lighten(self.derived.color, MENU_ACCENT_LIGHTEN);
+        let (frame, rects) = text::menu_frame(&refs, None, MENU_PX, accent);
         let origin = clamp_menu_origin(p, (frame.w as f32, frame.h as f32), &world.screen);
         self.menu = Some(Menu {
             origin,
@@ -813,6 +834,7 @@ impl DaemonApp {
             frame,
             rects,
             hovered: None,
+            accent,
         });
     }
 
@@ -910,6 +932,7 @@ impl DaemonApp {
                     attributes: self.derived.attributes,
                     stats: self.derived.stats,
                     stage: self.derived.stage,
+                    color: self.derived.color,
                     uptime_secs: self.started.elapsed().as_secs(),
                 }
             }
@@ -922,6 +945,14 @@ impl DaemonApp {
                     return Response::Error(fl!("daemon-rename-empty"));
                 }
                 self.care(EventKind::Renamed { name })
+            }
+            Request::Recolor(argb) => {
+                // Косметика уровня пользователя: цвет — событие журнала,
+                // альфа принудительно ff; спрайты догонит sync_visuals
+                // этого же тика.
+                self.care(EventKind::Recolored {
+                    argb: 0xff00_0000 | (argb & 0x00ff_ffff),
+                })
             }
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
@@ -1596,6 +1627,74 @@ mod tests {
             journal_kinds(&dir).last().unwrap(),
             EventKind::Renamed { name } if name == "Дрифт"
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recolor: альфа нормализуется, событие в журнале, свёртка и спрайты
+    /// перекрашены в том же тике, PetInfo отдаёт цвет.
+    #[test]
+    fn recolor_appends_event_and_regenerates_sprites() {
+        let (mut app, tx, dir) = app("recolor");
+        geometry(&mut app);
+        assert_eq!(app.sprite_color, driftling_core::DEFAULT_PET_COLOR);
+        let before = app.sprites.egg[0].argb.clone();
+
+        // Клиент прислал цвет без альфы — демон нормализует в ff.
+        let reply = send(&tx, Request::Recolor(0x00_e8_94_4a));
+        app.tick(0.1);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert_eq!(app.derived.color, 0xff_e8_94_4a);
+        assert_eq!(app.sprite_color, 0xff_e8_94_4a, "спрайты догнали свёртку");
+        assert_ne!(app.sprites.egg[0].argb, before, "скорлупа перекрашена");
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Recolored {
+                argb: 0xff_e8_94_4a
+            }
+        ));
+
+        let reply = send(&tx, Request::PetInfo);
+        app.tick(0.2);
+        match reply.recv().unwrap() {
+            Response::PetInfo { color, .. } => assert_eq!(color, 0xff_e8_94_4a),
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
+
+        // «Рестарт»: цвет переживает пересборку демона из журнала.
+        let (app2, _tx2) = app_in(&dir);
+        assert_eq!(app2.derived.color, 0xff_e8_94_4a);
+        assert_eq!(app2.sprite_color, 0xff_e8_94_4a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Акцент подсветки меню следует за цветом питомца.
+    #[test]
+    fn menu_hover_accent_follows_pet_color() {
+        let (mut app, tx, dir) = adult_app("menu-accent");
+        geometry(&mut app);
+        let p = app.pet.as_ref().unwrap().pos;
+
+        app.event(Event::PointerMenu(p), 0.0);
+        assert_eq!(
+            app.menu.as_ref().unwrap().accent,
+            palette::lighten(driftling_core::DEFAULT_PET_COLOR, MENU_ACCENT_LIGHTEN)
+        );
+        app.event(Event::PointerMotion(row_center(&app, 1)), 0.1);
+        let before = app.menu.as_ref().unwrap().frame.argb.clone();
+        app.event(Event::PointerMenu(p), 0.2); // закрыть
+
+        let reply = send(&tx, Request::Recolor(0xff_5f_bf_8f));
+        app.tick(0.3);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+
+        app.event(Event::PointerMenu(p), 0.4);
+        app.event(Event::PointerMotion(row_center(&app, 1)), 0.5);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(
+            menu.accent,
+            palette::lighten(0xff_5f_bf_8f, MENU_ACCENT_LIGHTEN)
+        );
+        assert_ne!(menu.frame.argb, before, "подсветка в новом акценте");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

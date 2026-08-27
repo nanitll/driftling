@@ -14,6 +14,7 @@ cli-about-feed-treat = Give a treat instead (mood up; overuse hurts health)
 cli-about-play = Play with the pet
 cli-about-sleep = Put the pet to sleep
 cli-about-rename = Rename the pet
+cli-about-recolor = Recolor the pet (hex color #rrggbb, e.g. e8944a)
 cli-about-reload = Re-read the config and apply it on the fly
 cli-about-quit = Stop the daemon
 cli-about-doctor = Diagnostics: environment, socket, files, autostart (works without the daemon)
@@ -23,7 +24,9 @@ ctl-ok = ok
 ctl-status = pets: { $pets }, state: { $state }, uptime: { $uptime }s
 ctl-petinfo = { $name } ({ $stage }): { $state }, uptime { $uptime }s
 ctl-petinfo-stats = satiety { $satiety } · energy { $energy } · mood { $mood } · health { $health }
+ctl-petinfo-color = color: { $color }
 ctl-petinfo-attributes = attributes: { $attributes }
+ctl-recolor-bad-hex = "{ $value }" is not a color — expected hex #rrggbb, e.g. e8944a
 state-dismissed = removed from screen
 
 # --- growth stages (machine name comes from the daemon) ---

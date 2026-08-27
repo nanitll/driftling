@@ -66,6 +66,20 @@ daemon-down-hint = Демон не запущен — запустите его,
 btn-start-daemon = Запустить демона
 msg-daemon-starting = Запускаем демона…
 
+# --- Карточка «Внешний вид» (цвет питомца) ---
+section-appearance = Внешний вид
+appearance-hint = Цвет питомца задаёт и акцент всего приложения.
+color-custom = Свой цвет
+msg-recolored = Питомец перекрашен
+color-greige = Бежевый
+color-amber = Янтарный
+color-mint = Мятный
+color-sky = Голубой
+color-rose = Розовый
+color-slate = Графитовый
+color-sand = Песочный
+color-violet = Фиолетовый
+
 # --- Чип стадии роста ---
 stage-egg = Яйцо
 stage-baby = Малыш

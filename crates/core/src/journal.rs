@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::attributes::PetAttributes;
 use crate::growth::{self, Stage};
+use crate::palette::DEFAULT_PET_COLOR;
 use crate::stats::PetStats;
 
 const MIN_MS: u64 = 60 * 1000;
@@ -164,6 +165,11 @@ pub enum EventKind {
     /// Характеристики выставлены напрямую — только дебаг-панель (IPC
     /// `SetAttributes`); игровая прокачка — B5.
     AttributesSet { attributes: PetAttributes },
+    /// Перекрасили питомца: базовый цвет тела (ARGB8888). Косметическая
+    /// пользовательская настройка (не дебаг); альфу fold нормализует в ff.
+    /// Событие аддитивное: старые журналы его просто не содержат — тогда
+    /// действует [`DEFAULT_PET_COLOR`].
+    Recolored { argb: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +286,9 @@ pub struct DerivedPet {
     pub born_ms: u64,
     /// Болезнь: скрытое здоровье ниже порога (смерти нет).
     pub ill: bool,
+    /// Базовый цвет тела (ARGB, альфа ff): [`DEFAULT_PET_COLOR`],
+    /// пока питомца не перекрасили ([`EventKind::Recolored`]).
+    pub color: u32,
 }
 
 /// Индексы видимых статов в массивах пола/эпизодов.
@@ -304,6 +313,8 @@ struct FoldState {
     treats: Vec<u64>,
     /// Поглаживания за скользящий час: (когда, сколько настроения дало).
     pets: Vec<(u64, f32)>,
+    /// Базовый цвет тела (ARGB, альфа ff).
+    color: u32,
 }
 
 impl FoldState {
@@ -322,6 +333,7 @@ impl FoldState {
             pending_food: 0.0,
             treats: Vec::new(),
             pets: Vec::new(),
+            color: DEFAULT_PET_COLOR,
         }
     }
 
@@ -456,6 +468,8 @@ fn apply(st: &mut FoldState, ev: &Event, cfg: &FoldCfg) {
         EventKind::Summoned => st.summoned = true,
         EventKind::Dismissed => st.summoned = false,
         EventKind::AttributesSet { attributes } => st.attributes = *attributes,
+        // Альфа принудительно ff: цвет тела всегда непрозрачен.
+        EventKind::Recolored { argb } => st.color = 0xff00_0000 | (argb & 0x00ff_ffff),
     }
     st.note_zero_episodes();
 }
@@ -499,6 +513,7 @@ pub fn fold(events: &[Event], now_ms: u64, cfg: &FoldCfg) -> DerivedPet {
         care_mistakes: st.care_mistakes,
         born_ms,
         ill,
+        color: st.color,
     }
 }
 
@@ -731,6 +746,17 @@ mod tests {
         let slept = ev(43, EventKind::Slept { minutes: 12.5 });
         let back: Event = serde_json::from_str(&serde_json::to_string(&slept).unwrap()).unwrap();
         assert_eq!(back, slept);
+
+        let recolored = ev(
+            44,
+            EventKind::Recolored {
+                argb: 0xff_e8_94_4a,
+            },
+        );
+        let json = serde_json::to_string(&recolored).unwrap();
+        assert!(json.contains(r#""type":"Recolored""#), "{json}");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, recolored);
     }
 
     // ---- merge ----
@@ -739,6 +765,14 @@ mod tests {
     fn merge_is_commutative() {
         let a = vec![
             ev_on("a", 1, 0, EventKind::Petted),
+            ev_on(
+                "a",
+                4,
+                0,
+                EventKind::Recolored {
+                    argb: 0xff_5f_bf_8f,
+                },
+            ),
             ev_on("a", 5, 0, EventKind::Played),
         ];
         let b = vec![
@@ -750,7 +784,7 @@ mod tests {
         let mut ba = b.clone();
         merge(&mut ba, &a);
         assert_eq!(ab, ba);
-        assert_eq!(ab.len(), 4);
+        assert_eq!(ab.len(), 5);
     }
 
     #[test]
@@ -789,6 +823,12 @@ mod tests {
             genesis(0),
             ev(10 * MIN, EventKind::Fed { treat: false }),
             ev(20 * MIN, EventKind::Fed { treat: true }),
+            ev(
+                30 * MIN,
+                EventKind::Recolored {
+                    argb: 0xff_e8_94_4a,
+                },
+            ),
             ev(40 * MIN, EventKind::Played),
             ev(41 * MIN, EventKind::Petted),
             ev(
@@ -819,6 +859,37 @@ mod tests {
         assert_eq!(pet.born_ms, 12_345);
         assert_eq!(pet.care_mistakes, 0);
         assert!(pet.summoned && !pet.ill);
+        assert_eq!(pet.color, DEFAULT_PET_COLOR);
+    }
+
+    // ---- fold: цвет тела ----
+
+    /// Genesis цвета не несёт — действует дефолт; Recolored меняет цвет,
+    /// последняя перекраска побеждает, кривая альфа нормализуется в ff.
+    #[test]
+    fn recolor_updates_color_and_normalizes_alpha() {
+        let mut events = vec![genesis(0)];
+        let cfg = FoldCfg::default();
+        assert_eq!(fold(&events, MIN, &cfg).color, DEFAULT_PET_COLOR);
+
+        events.push(ev(
+            MIN,
+            EventKind::Recolored {
+                argb: 0x00_e8_94_4a,
+            },
+        ));
+        assert_eq!(fold(&events, 2 * MIN, &cfg).color, 0xff_e8_94_4a);
+
+        events.push(ev(
+            2 * MIN,
+            EventKind::Recolored {
+                argb: 0xff_5f_bf_8f,
+            },
+        ));
+        let pet = fold(&events, 3 * MIN, &cfg);
+        assert_eq!(pet.color, 0xff_5f_bf_8f, "последняя перекраска побеждает");
+        // Цвет — косметика: статы и рост перекраска не трогает.
+        assert_eq!(pet.care_mistakes, 0);
     }
 
     #[test]

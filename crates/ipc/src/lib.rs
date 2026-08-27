@@ -23,7 +23,8 @@ use std::time::Duration;
 /// `Request`/`Response`; политика — версии либо равны, либо ошибка.
 /// v2 (фаза B): care-команды (Feed/Play/PutToSleep/Rename), в PetInfo
 /// добавлены статы и стадия роста.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: пользовательский цвет питомца — Recolor, в PetInfo добавлен color.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Сколько сервер ждёт строку запроса от подключившегося клиента,
 /// прежде чем молча бросить соединение (ТД-12: защита от зависших клиентов).
@@ -47,6 +48,9 @@ pub enum Request {
     PutToSleep,
     /// Переименовать питомца (= событие журнала).
     Rename(String),
+    /// Перекрасить питомца: базовый цвет тела ARGB8888 (альфу демон
+    /// нормализует в ff). Пользовательская косметика, не дебаг.
+    Recolor(u32),
     /// ТОЛЬКО дебаг-панель (ТЗ §3.3): напрямую задать характеристики.
     /// Демон клампит значения, применяет к живому питомцу и персистит.
     SetAttributes(PetAttributes),
@@ -72,6 +76,8 @@ pub enum Response {
         stats: driftling_core::PetStats,
         /// Стадия роста (машинное имя, локализует UI).
         stage: driftling_core::Stage,
+        /// Базовый цвет тела (ARGB, альфа ff) — акцент UI следует за ним.
+        color: u32,
         uptime_secs: u64,
     },
     Error(String),
@@ -517,10 +523,11 @@ mod tests {
         let server = Server::bind_in(dir.path()).unwrap();
         let t = spawn_server(server);
 
-        // Клиент шлёт запрос и рвёт соединение, не читая ответ.
+        // Клиент шлёт валидный запрос и рвёт соединение, не читая ответ.
         {
             let mut stream = UnixStream::connect(socket_path_in(dir.path())).unwrap();
-            stream.write_all(b"{\"v\":1,\"req\":\"Status\"}\n").unwrap();
+            let line = format!("{{\"v\":{PROTOCOL_VERSION},\"req\":\"Status\"}}\n");
+            stream.write_all(line.as_bytes()).unwrap();
         } // drop: сокет закрыт, ответ полетит в закрытую трубу
 
         std::thread::sleep(Duration::from_millis(100));

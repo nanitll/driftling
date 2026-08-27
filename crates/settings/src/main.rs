@@ -17,8 +17,8 @@ use std::time::Duration;
 mod i18n;
 use i18n::fl;
 
-use driftling_core::sprite::{placeholder, Frame};
-use driftling_core::{PetAttributes, PetStats, Stage};
+use driftling_core::sprite::{placeholder, placeholder_colored, Frame};
+use driftling_core::{palette, PetAttributes, PetStats, Stage, DEFAULT_PET_COLOR, PET_PRESETS};
 use driftling_ipc::{call, Request, Response};
 use eframe::egui::{
     self, Align2, Button, CollapsingHeader, Color32, CornerRadius, DragValue, FontData,
@@ -36,8 +36,6 @@ const CARD: Color32 = Color32::from_rgb(0x23, 0x23, 0x2e);
 const CARD_STROKE: Color32 = Color32::from_rgb(0x2f, 0x2f, 0x3d);
 const TEXT: Color32 = Color32::from_rgb(0xe8, 0xe8, 0xf0);
 const MUTED: Color32 = Color32::from_rgb(0x9a, 0x9a, 0xac);
-const ACCENT: Color32 = Color32::from_rgb(0x8a, 0x63, 0xd2);
-const ACCENT_LIGHT: Color32 = Color32::from_rgb(0xb2, 0x96, 0xe8);
 const SUCCESS: Color32 = Color32::from_rgb(0x6c, 0xcb, 0x5f);
 const DANGER: Color32 = Color32::from_rgb(0xe0, 0x5f, 0x5f);
 const SLEEP_BLUE: Color32 = Color32::from_rgb(0x6b, 0x8f, 0xd2);
@@ -45,9 +43,36 @@ const AMBER: Color32 = Color32::from_rgb(0xe0, 0xa8, 0x4f);
 const TRACK: Color32 = Color32::from_rgb(0x2f, 0x2f, 0x3d);
 const PORTRAIT_BG: Color32 = Color32::from_rgb(0x1d, 0x1d, 0x27);
 
+// Акцент интерфейса — НЕ константа: он следует за цветом питомца из
+// PetInfo (fallback DEFAULT_PET_COLOR, когда демон лежит), см. accent_pair
+// и SettingsApp::{accent, accent_light}.
+
 /// Полупрозрачная версия цвета — подложки бейджей и выделений.
 fn tinted(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// Акцентная пара из цвета питомца (ARGB): сам цвет для заливок и его
+/// осветлённый тон для текста/линий на тёмном фоне.
+fn accent_pair(argb: u32) -> (Color32, Color32) {
+    (
+        argb_to_color32(0xff00_0000 | (argb & 0x00ff_ffff)),
+        argb_to_color32(palette::lighten(0xff00_0000 | (argb & 0x00ff_ffff), 1.35)),
+    )
+}
+
+/// Упаковать RGB-триплет цветового пикера в непрозрачный ARGB.
+fn rgb_to_argb([r, g, b]: [u8; 3]) -> u32 {
+    0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+/// Распаковать ARGB в RGB-триплет для цветового пикера.
+fn argb_to_rgb(argb: u32) -> [u8; 3] {
+    [
+        ((argb >> 16) & 0xff) as u8,
+        ((argb >> 8) & 0xff) as u8,
+        (argb & 0xff) as u8,
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -68,15 +93,31 @@ fn state_label(state: Option<&str>) -> String {
     }
 }
 
-/// Цвет бейджа состояния.
-fn state_color(state: Option<&str>) -> Color32 {
+/// Цвет бейджа состояния; `accent_light` — светлый тон цвета питомца.
+fn state_color(state: Option<&str>, accent_light: Color32) -> Color32 {
     match state {
         None => MUTED,
         Some("Idle") => SUCCESS,
-        Some("Walk") => ACCENT_LIGHT,
+        Some("Walk") => accent_light,
         Some("Sleep") => SLEEP_BLUE,
         Some("Falling" | "Dragged" | "Landing") => AMBER,
         Some(_) => MUTED,
+    }
+}
+
+/// Локализованная подпись пресета цвета по машинному имени из
+/// [`PET_PRESETS`]; незнакомое имя показывается как есть (не падаем).
+fn preset_label(name: &str) -> String {
+    match name {
+        "greige" => fl!("color-greige"),
+        "amber" => fl!("color-amber"),
+        "mint" => fl!("color-mint"),
+        "sky" => fl!("color-sky"),
+        "rose" => fl!("color-rose"),
+        "slate" => fl!("color-slate"),
+        "sand" => fl!("color-sand"),
+        "violet" => fl!("color-violet"),
+        other => other.to_string(),
     }
 }
 
@@ -323,6 +364,8 @@ struct PetSnapshot {
     stats: PetStats,
     /// Стадия роста (локализуется на нашей стороне).
     stage: Stage,
+    /// Базовый цвет тела (ARGB) — акцент всего окна следует за ним.
+    color: u32,
     uptime_secs: u64,
 }
 
@@ -350,6 +393,7 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
         attributes,
         stats,
         stage,
+        color,
         uptime_secs,
     }) = call(&Request::PetInfo)
     {
@@ -361,6 +405,7 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
                 "attributes": serde_json::to_value(attributes).unwrap_or_default(),
                 "stats": serde_json::to_value(stats).unwrap_or_default(),
                 "stage": stage.as_str(),
+                "color": format!("#{:06x}", color & 0x00ff_ffff),
                 "uptime_secs": uptime_secs,
             }))
             .unwrap_or_default(),
@@ -371,6 +416,7 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
             attributes,
             stats,
             stage,
+            color,
             uptime_secs,
         });
     }
@@ -476,12 +522,13 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Тёмная тема дизайн-системы поверх egui-дефолтов.
-fn apply_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(style_mut);
+/// Тёмная тема дизайн-системы поверх egui-дефолтов; акцент — цвет питомца.
+/// Повторный вызов при перекраске идемпотентен.
+fn apply_style(ctx: &egui::Context, accent: Color32, accent_light: Color32) {
+    ctx.all_styles_mut(|style| style_mut(style, accent, accent_light));
 }
 
-fn style_mut(style: &mut egui::Style) {
+fn style_mut(style: &mut egui::Style, accent: Color32, accent_light: Color32) {
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(14.0, 7.0);
     style.spacing.interact_size.y = 30.0;
@@ -502,8 +549,8 @@ fn style_mut(style: &mut egui::Style) {
     v.panel_fill = BG;
     v.extreme_bg_color = SIDEBAR_BG;
     v.faint_bg_color = Color32::from_rgb(0x27, 0x27, 0x33);
-    v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, ACCENT_LIGHT);
+    v.selection.bg_fill = accent;
+    v.selection.stroke = Stroke::new(1.0, accent_light);
     v.slider_trailing_fill = true;
     v.handle_shape = egui::style::HandleShape::Circle;
 
@@ -528,7 +575,7 @@ fn style_mut(style: &mut egui::Style) {
 
     v.widgets.active.bg_fill = Color32::from_rgb(0x3b, 0x3b, 0x50);
     v.widgets.active.weak_bg_fill = Color32::from_rgb(0x3b, 0x3b, 0x50);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
     v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.active.corner_radius = r;
 
@@ -587,9 +634,9 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
 }
 
 /// Акцентная (заливка) кнопка; выключенная — заметно приглушена.
-fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool, accent: Color32) -> egui::Response {
     let (fill, fg) = if enabled {
-        (ACCENT, Color32::WHITE)
+        (accent, Color32::WHITE)
     } else {
         (
             Color32::from_rgb(0x2c, 0x2a, 0x38),
@@ -622,8 +669,8 @@ fn outline_button(ui: &mut egui::Ui, text: &str, color: Color32, enabled: bool) 
 }
 
 /// Кастомный тумблер-переключатель с анимированной ручкой (по мотивам
-/// канонического toggle из egui demo).
-fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+/// канонического toggle из egui demo); включённый трек — в акценте.
+fn toggle_switch(ui: &mut egui::Ui, on: &mut bool, accent: Color32) -> egui::Response {
     let size = egui::vec2(44.0, 24.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
@@ -633,9 +680,9 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     if ui.is_rect_visible(rect) {
         let t = ui.ctx().animate_bool_responsive(response.id, *on);
         let bg = Color32::from_rgb(
-            (TRACK.r() as f32 + (ACCENT.r() as f32 - TRACK.r() as f32) * t) as u8,
-            (TRACK.g() as f32 + (ACCENT.g() as f32 - TRACK.g() as f32) * t) as u8,
-            (TRACK.b() as f32 + (ACCENT.b() as f32 - TRACK.b() as f32) * t) as u8,
+            (TRACK.r() as f32 + (accent.r() as f32 - TRACK.r() as f32) * t) as u8,
+            (TRACK.g() as f32 + (accent.g() as f32 - TRACK.g() as f32) * t) as u8,
+            (TRACK.b() as f32 + (accent.b() as f32 - TRACK.b() as f32) * t) as u8,
         );
         let p = ui.painter();
         p.rect(
@@ -653,6 +700,26 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
         );
     }
     response
+}
+
+/// Квадратик-пресет цвета питомца; текущий обведён кольцом.
+fn swatch(ui: &mut egui::Ui, argb: u32, selected: bool, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        p.rect_filled(rect.shrink(3.0), 6.0, argb_to_color32(0xff00_0000 | argb));
+        if selected {
+            p.rect_stroke(rect, 8.0, Stroke::new(2.0, TEXT), StrokeKind::Inside);
+        } else if response.hovered() {
+            p.rect_stroke(
+                rect,
+                8.0,
+                Stroke::new(1.0, tinted(TEXT, 90)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+    response.on_hover_text(tooltip)
 }
 
 /// Строка характеристики: подпись, значение, опциональный тонкий бар
@@ -729,19 +796,20 @@ fn frame_to_image(f: &Frame) -> egui::ColorImage {
     )
 }
 
-/// Кэш idle-кадров под текущий размер питомца.
+/// Кэш idle-кадров под текущие размер и цвет питомца.
 #[derive(Default)]
 struct Portrait {
     size: u32,
+    color: u32,
     frames: Vec<TextureHandle>,
 }
 
 impl Portrait {
-    fn ensure(&mut self, ctx: &egui::Context, size: u32) {
-        if self.size == size && !self.frames.is_empty() {
+    fn ensure(&mut self, ctx: &egui::Context, size: u32, color: u32) {
+        if self.size == size && self.color == color && !self.frames.is_empty() {
             return;
         }
-        let set = placeholder(size.clamp(32, 256));
+        let set = placeholder_colored(size.clamp(32, 256), Stage::Adult, color);
         self.frames = set
             .idle
             .iter()
@@ -755,6 +823,7 @@ impl Portrait {
             })
             .collect();
         self.size = size;
+        self.color = color;
     }
 
     /// Кадр на момент времени `t` (2 fps, как idle в спрайт-движке).
@@ -804,12 +873,21 @@ struct SettingsApp {
     form_synced: bool,
     portrait: Portrait,
     logo: Option<TextureHandle>,
+    /// Цвет питомца, под который выведен текущий акцент (и логотип).
+    accent_argb: u32,
+    /// Акцент интерфейса = цвет питомца (fallback DEFAULT_PET_COLOR).
+    accent: Color32,
+    /// Светлый тон акцента (текст/линии на тёмном фоне).
+    accent_light: Color32,
+    /// Буфер RGB-пикера «свой цвет» (карточка «Внешний вид»).
+    custom_rgb: [u8; 3],
 }
 
 impl SettingsApp {
     fn new(cc: &eframe::CreationContext<'_>, debug_enabled: bool) -> Self {
         install_fonts(&cc.egui_ctx);
-        apply_style(&cc.egui_ctx);
+        let (accent, accent_light) = accent_pair(DEFAULT_PET_COLOR);
+        apply_style(&cc.egui_ctx, accent, accent_light);
 
         let poll = Arc::new(Mutex::new(PollState::default()));
         spawn_poller(Arc::clone(&poll), cc.egui_ctx.clone());
@@ -837,7 +915,31 @@ impl SettingsApp {
             form_synced: false,
             portrait: Portrait::default(),
             logo: None,
+            accent_argb: DEFAULT_PET_COLOR,
+            accent,
+            accent_light,
+            custom_rgb: argb_to_rgb(DEFAULT_PET_COLOR),
         }
+    }
+
+    /// Догнать акцент интерфейса до цвета питомца из последнего PetInfo
+    /// (демон лежит — дефолт). Смена цвета перекатывает стиль egui и
+    /// сбрасывает логотип; портрет догонит hero_card сам.
+    fn sync_accent(&mut self, ctx: &egui::Context) {
+        let pet_color = {
+            let st = self.poll.lock().unwrap();
+            st.info
+                .as_ref()
+                .map(|i| i.color)
+                .unwrap_or(DEFAULT_PET_COLOR)
+        };
+        if pet_color == self.accent_argb {
+            return;
+        }
+        self.accent_argb = pet_color;
+        (self.accent, self.accent_light) = accent_pair(pet_color);
+        apply_style(ctx, self.accent, self.accent_light);
+        self.logo = None; // перекрасится лениво в sidebar
     }
 
     fn action(&self, ui: &egui::Ui, req: Request, ok: String, slot: &Arc<Mutex<Option<String>>>) {
@@ -881,11 +983,11 @@ impl SettingsApp {
         }
         let p = ui.painter();
         if selected {
-            p.rect_filled(rect, 8.0, tinted(ACCENT, 42));
+            p.rect_filled(rect, 8.0, tinted(self.accent, 42));
         } else if response.hovered() {
             p.rect_filled(rect, 8.0, tinted(Color32::WHITE, 10));
         }
-        let color = if selected { ACCENT_LIGHT } else { MUTED };
+        let color = if selected { self.accent_light } else { MUTED };
         p.text(
             egui::pos2(rect.left() + 12.0, rect.center().y),
             Align2::LEFT_CENTER,
@@ -900,7 +1002,8 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             if self.logo.is_none() {
-                let set = placeholder(64);
+                // Логотип в цвете питомца; сбрасывается в sync_accent.
+                let set = placeholder_colored(64, Stage::Adult, self.accent_argb);
                 self.logo = Some(ui.ctx().load_texture(
                     "logo",
                     frame_to_image(&set.idle[0]),
@@ -985,7 +1088,8 @@ impl SettingsApp {
                 self.rename_focus = false;
             }
             let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            let applied = primary_button(ui, &fl!("btn-apply"), true).clicked() || entered;
+            let applied =
+                primary_button(ui, &fl!("btn-apply"), true, self.accent).clicked() || entered;
             if ui.input(|i| i.key_pressed(Key::Escape)) {
                 self.renaming = false;
             } else if applied {
@@ -1004,6 +1108,59 @@ impl SettingsApp {
                     }
                 }
             }
+        });
+    }
+
+    /// Карточка «Внешний вид»: 8 пресетов цвета питомца (текущий обведён)
+    /// и свой цвет через RGB-пикер. Смена цвета = Request::Recolor
+    /// (журнальное событие на стороне демона); акцент всего окна догонит
+    /// sync_accent при следующем опросе PetInfo.
+    fn appearance_card(&mut self, ui: &mut egui::Ui, st: &PollState) {
+        let current = st
+            .info
+            .as_ref()
+            .map(|i| i.color)
+            .unwrap_or(self.accent_argb);
+        card(ui, |ui| {
+            section_label(ui, &fl!("section-appearance"));
+            ui.add_space(2.0);
+            ui.add_enabled_ui(st.up, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    for &(argb, name) in PET_PRESETS {
+                        let selected = (argb ^ current) & 0x00ff_ffff == 0;
+                        if swatch(ui, argb, selected, &preset_label(name)).clicked() && !selected {
+                            self.action(
+                                ui,
+                                Request::Recolor(argb),
+                                fl!("msg-recolored"),
+                                &self.pet_action,
+                            );
+                        }
+                    }
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(fl!("color-custom")).size(13.0).color(MUTED));
+                    ui.color_edit_button_srgb(&mut self.custom_rgb);
+                    // Отдельная кнопка вместо отправки на каждый тик
+                    // пикера: журнал append-only, спамить события нельзя.
+                    if primary_button(ui, &fl!("btn-apply"), st.up, self.accent).clicked() {
+                        self.action(
+                            ui,
+                            Request::Recolor(rgb_to_argb(self.custom_rgb)),
+                            fl!("msg-recolored"),
+                            &self.pet_action,
+                        );
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(fl!("appearance-hint"))
+                    .size(12.5)
+                    .color(MUTED),
+            );
         });
     }
 
@@ -1049,7 +1206,8 @@ impl SettingsApp {
                     .as_ref()
                     .map(|i| i.attributes.size)
                     .unwrap_or_else(|| PetAttributes::default().size);
-                self.portrait.ensure(ui.ctx(), size);
+                let color = info.as_ref().map(|i| i.color).unwrap_or(DEFAULT_PET_COLOR);
+                self.portrait.ensure(ui.ctx(), size, color);
                 let t = ui.input(|i| i.time);
                 egui::Frame::new()
                     .fill(PORTRAIT_BG)
@@ -1085,7 +1243,7 @@ impl SettingsApp {
                             (true, false, _) => badge(ui, &fl!("daemon-not-running"), DANGER),
                             (true, true, Some(i)) => {
                                 let s = i.state.as_deref();
-                                badge(ui, &state_label(s), state_color(s));
+                                badge(ui, &state_label(s), state_color(s, self.accent_light));
                             }
                             (true, true, None) => badge(ui, &fl!("badge-no-data"), MUTED),
                         }
@@ -1115,7 +1273,8 @@ impl SettingsApp {
                                 .size(12.5)
                                 .color(MUTED),
                         );
-                        if primary_button(ui, &fl!("btn-start-daemon"), true).clicked() {
+                        if primary_button(ui, &fl!("btn-start-daemon"), true, self.accent).clicked()
+                        {
                             self.start_daemon(ui.ctx(), &self.pet_action);
                         }
                         ui.add_space(4.0);
@@ -1123,7 +1282,9 @@ impl SettingsApp {
 
                     let present = info.as_ref().is_some_and(|i| i.state.is_some());
                     ui.horizontal(|ui| {
-                        if primary_button(ui, &fl!("btn-summon"), st.up && !present).clicked() {
+                        if primary_button(ui, &fl!("btn-summon"), st.up && !present, self.accent)
+                            .clicked()
+                        {
                             self.action(
                                 ui,
                                 Request::Summon,
@@ -1164,7 +1325,7 @@ impl SettingsApp {
                             ),
                         ];
                         for (label, req, ok) in buttons {
-                            if outline_button(ui, &label, ACCENT_LIGHT, care).clicked() {
+                            if outline_button(ui, &label, self.accent_light, care).clicked() {
                                 self.action(ui, req, ok, &self.pet_action);
                             }
                         }
@@ -1192,19 +1353,19 @@ impl SettingsApp {
                         ui,
                         &fl!("stat-speed"),
                         &fl!("stat-speed-value", value = format!("{:.0}", a.walk_speed)),
-                        Some((norm(a.walk_speed, 5.0, 400.0), ACCENT)),
+                        Some((norm(a.walk_speed, 5.0, 400.0), self.accent)),
                     );
                     stat_row(
                         ui,
                         &fl!("stat-curiosity"),
                         &format!("{}/100", a.curiosity),
-                        Some((a.curiosity as f32 / 100.0, ACCENT)),
+                        Some((a.curiosity as f32 / 100.0, self.accent)),
                     );
                     stat_row(
                         ui,
                         &fl!("stat-sleepiness"),
                         &format!("{}/100", a.sleepiness),
-                        Some((a.sleepiness as f32 / 100.0, ACCENT)),
+                        Some((a.sleepiness as f32 / 100.0, self.accent)),
                     );
                     stat_row(
                         ui,
@@ -1252,6 +1413,8 @@ impl SettingsApp {
         ui.add_space(4.0);
         self.hero_card(ui, &st);
         ui.add_space(2.0);
+        self.appearance_card(ui, &st);
+        ui.add_space(2.0);
         self.condition_card(ui, &st);
         ui.add_space(2.0);
         self.stats_card(ui, &st);
@@ -1277,7 +1440,7 @@ impl SettingsApp {
                     ui.label(RichText::new(fl!("autostart-desc")).size(12.5).color(MUTED));
                 });
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    if toggle_switch(ui, &mut self.autostart).changed() {
+                    if toggle_switch(ui, &mut self.autostart, self.accent).changed() {
                         self.autostart_result = Some(match set_autostart(self.autostart) {
                             Ok(()) if self.autostart => fl!("msg-autostart-on"),
                             Ok(()) => fl!("msg-autostart-off"),
@@ -1312,7 +1475,10 @@ impl SettingsApp {
             ui.add_space(2.0);
 
             // Демон не запущен — основная кнопка запуска (П-5).
-            if checked && !up && primary_button(ui, &fl!("btn-start-daemon"), true).clicked() {
+            if checked
+                && !up
+                && primary_button(ui, &fl!("btn-start-daemon"), true, self.accent).clicked()
+            {
                 self.start_daemon(ui.ctx(), &self.daemon_action);
             }
 
@@ -1404,7 +1570,7 @@ impl SettingsApp {
             ui.add_space(4.0);
 
             ui.horizontal(|ui| {
-                if primary_button(ui, &fl!("btn-apply"), true).clicked() {
+                if primary_button(ui, &fl!("btn-apply"), true, self.accent).clicked() {
                     self.form = self.form.clamped();
                     self.action(
                         ui,
@@ -1486,6 +1652,9 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Акцент окна следует за цветом питомца (fallback — дефолт).
+        self.sync_accent(ui.ctx());
+
         // Дебаг-форма один раз синкается с живыми характеристиками.
         if !self.form_synced {
             if let Some(info) = &self.poll.lock().unwrap().info {
@@ -1595,11 +1764,52 @@ mod tests {
 
     #[test]
     fn state_colors_match_design_system() {
-        assert_eq!(state_color(Some("Walk")), ACCENT_LIGHT);
-        assert_eq!(state_color(Some("Sleep")), SLEEP_BLUE);
-        assert_eq!(state_color(Some("Falling")), AMBER);
-        assert_eq!(state_color(Some("Dragged")), AMBER);
-        assert_eq!(state_color(None), MUTED);
+        // «Гуляет» подсвечивается акцентом (цветом питомца), остальные
+        // семантические цвета фиксированы.
+        let al = Color32::from_rgb(1, 2, 3);
+        assert_eq!(state_color(Some("Walk"), al), al);
+        assert_eq!(state_color(Some("Sleep"), al), SLEEP_BLUE);
+        assert_eq!(state_color(Some("Falling"), al), AMBER);
+        assert_eq!(state_color(Some("Dragged"), al), AMBER);
+        assert_eq!(state_color(None, al), MUTED);
+    }
+
+    /// Акцентная пара: сам цвет + строго осветлённый тон, альфа входа
+    /// не важна.
+    #[test]
+    fn accent_pair_derives_light_tone() {
+        let (a, l) = accent_pair(0x00_8a_63_d2);
+        assert_eq!((a.r(), a.g(), a.b(), a.a()), (0x8a, 0x63, 0xd2, 0xff));
+        assert!(l.r() >= a.r() && l.g() >= a.g() && l.b() >= a.b());
+        assert_ne!(a, l, "светлый тон отличим от базового");
+        // Дефолт даёт пару без паники и с непрозрачными цветами.
+        let (a, l) = accent_pair(DEFAULT_PET_COLOR);
+        assert_eq!((a.a(), l.a()), (0xff, 0xff));
+    }
+
+    /// Каждый пресет ядра имеет локализованную подпись (ключ существует),
+    /// незнакомое имя не роняет UI.
+    #[test]
+    fn preset_labels_cover_all_presets() {
+        for (_, name) in PET_PRESETS {
+            assert_ne!(
+                preset_label(name),
+                *name,
+                "нет ключа локализации для {name}"
+            );
+        }
+        assert_eq!(preset_label("greige"), fl!("color-greige"));
+        assert_eq!(preset_label("violet"), fl!("color-violet"));
+        assert_eq!(preset_label("no-such-preset"), "no-such-preset");
+    }
+
+    #[test]
+    fn rgb_triplet_roundtrips_to_opaque_argb() {
+        assert_eq!(rgb_to_argb([0xe8, 0x94, 0x4a]), 0xff_e8_94_4a);
+        assert_eq!(argb_to_rgb(0xff_e8_94_4a), [0xe8, 0x94, 0x4a]);
+        assert_eq!(argb_to_rgb(rgb_to_argb([1, 2, 3])), [1, 2, 3]);
+        // Альфа входа не протекает в триплет.
+        assert_eq!(argb_to_rgb(0x00_b0_a2_94), [0xb0, 0xa2, 0x94]);
     }
 
     #[test]

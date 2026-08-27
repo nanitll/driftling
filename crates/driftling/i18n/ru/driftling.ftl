@@ -13,6 +13,7 @@ cli-about-feed-treat = Дать вкусняшку (настроение выш�
 cli-about-play = Поиграть с питомцем
 cli-about-sleep = Уложить питомца спать
 cli-about-rename = Переименовать питомца
+cli-about-recolor = Перекрасить питомца (hex-цвет #rrggbb, например e8944a)
 cli-about-reload = Перечитать конфиг и применить на лету
 cli-about-quit = Остановить демон
 cli-about-doctor = Диагностика: окружение, сокет, файлы, автозапуск (работает без демона)
@@ -22,7 +23,9 @@ ctl-ok = ок
 ctl-status = питомцев: { $pets }, состояние: { $state }, аптайм: { $uptime }s
 ctl-petinfo = { $name } ({ $stage }): { $state }, аптайм { $uptime }s
 ctl-petinfo-stats = сытость { $satiety } · энергия { $energy } · настроение { $mood } · здоровье { $health }
+ctl-petinfo-color = цвет: { $color }
 ctl-petinfo-attributes = характеристики: { $attributes }
+ctl-recolor-bad-hex = «{ $value }» не похоже на цвет — нужен hex #rrggbb, например e8944a
 state-dismissed = убран с экрана
 
 # --- Стадии роста (машинное имя шлёт демон) ---

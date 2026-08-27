@@ -5,6 +5,7 @@
 
 use crate::behavior::PetState;
 use crate::growth::Stage;
+use crate::palette::{self, DEFAULT_PET_COLOR};
 use crate::pet::Direction;
 use crate::stats::PetStats;
 
@@ -137,45 +138,87 @@ fn pick(frames: &[Frame], fps: f32, t: f32) -> &Frame {
     &frames[idx]
 }
 
-const BODY: u32 = 0xff_8a_63_d2; // сиреневый корпус
-const BODY_DARK: u32 = 0xff_6b_47_ad;
 const EYE: u32 = 0xff_1e_1e_2e;
 const EYE_SHINE: u32 = 0xff_ff_ff_ff;
-const CHEEK: u32 = 0xff_e8_9a_c7;
+/// Розовые щёки — читаются на любом светлом теле.
+const CHEEK_PINK: u32 = 0xff_e8_9a_c7;
 const SICK_TINT: u32 = 0xff_7d_c4_7d; // зеленоватый оттенок болезни
 const CRUMB: u32 = 0xff_d9_a0_66; // крошка у рта
-const SHELL: u32 = 0xff_ea_e4_f6; // светлая скорлупа
-const SHELL_DARK: u32 = 0xff_c8_bc_e4;
-const SPECKLE: u32 = 0xff_8a_63_d2; // крапинки — фирменный сиреневый
-const CRACK: u32 = 0xff_4d_3f_6e;
+/// Гард контраста: тело темнее этой яркости гасит розовые щёки —
+/// вместо них берётся осветлённый тон самого тела.
+const CHEEK_DARK_LUMA: f32 = 0.35;
+
+/// Рабочая палитра отрисовки, выведенная из базового цвета тела
+/// (пользовательская настройка, см. palette.rs и журнальное Recolored).
+#[derive(Debug, Clone, Copy)]
+struct BodyColors {
+    body: u32,
+    body_dark: u32,
+    cheek: u32,
+    /// Светлая скорлупа яйца — тело, сильно разбавленное белым.
+    shell: u32,
+    shell_dark: u32,
+    /// Крапинки скорлупы — сам цвет тела.
+    speckle: u32,
+    crack: u32,
+}
+
+impl BodyColors {
+    fn from_argb(argb: u32) -> Self {
+        let body = 0xff00_0000 | (argb & 0x00ff_ffff);
+        let cheek = if palette::luminance(body) < CHEEK_DARK_LUMA {
+            palette::lighten(body, 1.3)
+        } else {
+            CHEEK_PINK
+        };
+        Self {
+            body,
+            body_dark: palette::darken(body, 0.78),
+            cheek,
+            shell: mix(EYE_SHINE, body, 0.18),
+            shell_dark: mix(EYE_SHINE, body, 0.45),
+            speckle: body,
+            crack: palette::darken(body, 0.55),
+        }
+    }
+}
 
 /// Сгенерировать набор кадров размером `size` px (квадрат) для взрослой
-/// формы. Обёртка совместимости над [`placeholder_for_stage`].
+/// формы в цвете по умолчанию. Обёртка над [`placeholder_for_stage`].
 pub fn placeholder(size: u32) -> SpriteSet {
     placeholder_for_stage(size, Stage::Adult)
 }
 
-/// Сгенерировать набор кадров под стадию роста: базовый размер умножается
-/// на [`stage_scale`], яйцо рисуется собственной формой (не сжатым блобом).
+/// Набор кадров под стадию в цвете по умолчанию — обёртка над
+/// [`placeholder_colored`] для мест, которым цвет безразличен.
 pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
+    placeholder_colored(base_size, stage, DEFAULT_PET_COLOR)
+}
+
+/// Сгенерировать набор кадров под стадию роста и базовый цвет тела:
+/// базовый размер умножается на [`stage_scale`], яйцо рисуется собственной
+/// формой (не сжатым блобом), все тона выводятся из `argb` (BodyColors).
+pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet {
     let size = (((base_size as f32) * stage_scale(stage)).round() as u32).max(16);
+    let c = &BodyColors::from_argb(argb);
     SpriteSet {
         size,
         idle: vec![
-            blob(size, BlobStyle::default()),
+            blob(size, BlobStyle::default(), c),
             blob(
                 size,
                 BlobStyle {
                     eyes: Eyes::Closed,
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
         walk: vec![
-            blob_walk(size, 0.06, 0),
-            blob_walk(size, 0.0, 1),
-            blob_walk(size, 0.06, 2),
-            blob_walk(size, 0.0, 3),
+            blob_walk(size, 0.06, 0, c),
+            blob_walk(size, 0.0, 1, c),
+            blob_walk(size, 0.06, 2, c),
+            blob_walk(size, 0.0, 3, c),
         ],
         sleep: vec![
             blob(
@@ -186,6 +229,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     zzz: true,
                     ..BlobStyle::default()
                 },
+                c,
             ),
             blob(
                 size,
@@ -195,6 +239,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     zzz: true,
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
         falling: vec![blob(
@@ -203,6 +248,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                 squash: -0.1,
                 ..BlobStyle::default()
             },
+            c,
         )],
         dragged: vec![blob(
             size,
@@ -210,6 +256,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                 squash: -0.05,
                 ..BlobStyle::default()
             },
+            c,
         )],
         landing: vec![blob(
             size,
@@ -217,12 +264,13 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                 squash: 0.22,
                 ..BlobStyle::default()
             },
+            c,
         )],
-        egg: vec![egg_frame(size, 0.05, 0), egg_frame(size, -0.05, 0)],
+        egg: vec![egg_frame(size, 0.05, 0, c), egg_frame(size, -0.05, 0, c)],
         hatching: vec![
-            egg_frame(size, 0.0, 1),
-            egg_frame(size, 0.04, 2),
-            egg_frame(size, -0.04, 3),
+            egg_frame(size, 0.0, 1, c),
+            egg_frame(size, 0.04, 2, c),
+            egg_frame(size, -0.04, 3, c),
         ],
         eating: vec![
             blob(
@@ -232,6 +280,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     crumb: true,
                     ..BlobStyle::default()
                 },
+                c,
             ),
             blob(
                 size,
@@ -240,6 +289,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     crumb: true,
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
         sad: vec![
@@ -251,6 +301,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     mouth: Mouth::Sad,
                     ..BlobStyle::default()
                 },
+                c,
             ),
             blob(
                 size,
@@ -260,6 +311,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     mouth: Mouth::Sad,
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
         sick: vec![
@@ -271,6 +323,7 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     tint: Some(SICK_TINT),
                     ..BlobStyle::default()
                 },
+                c,
             ),
             blob(
                 size,
@@ -281,16 +334,18 @@ pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
                     tint: Some(SICK_TINT),
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
         happy: vec![
-            blob(size, BlobStyle::default()),
+            blob(size, BlobStyle::default(), c),
             blob(
                 size,
                 BlobStyle {
                     hop: 0.06,
                     ..BlobStyle::default()
                 },
+                c,
             ),
         ],
     }
@@ -346,7 +401,7 @@ impl Default for BlobStyle {
     }
 }
 
-fn blob_walk(size: u32, squash: f32, step: u8) -> Frame {
+fn blob_walk(size: u32, squash: f32, step: u8, c: &BodyColors) -> Frame {
     blob(
         size,
         BlobStyle {
@@ -354,11 +409,12 @@ fn blob_walk(size: u32, squash: f32, step: u8) -> Frame {
             walk_step: Some(step),
             ..BlobStyle::default()
         },
+        c,
     )
 }
 
 /// Рисуем эллипс-тело с прижатием `squash`, глаза, щёки и лапки.
-fn blob(size: u32, st: BlobStyle) -> Frame {
+fn blob(size: u32, st: BlobStyle, c: &BodyColors) -> Frame {
     let s = size as f32;
     let mut argb = vec![0u32; (size * size) as usize];
 
@@ -378,7 +434,7 @@ fn blob(size: u32, st: BlobStyle) -> Frame {
             let d = dx * dx + dy * dy;
             if d <= 1.0 {
                 let i = (y * size + x) as usize;
-                argb[i] = if d > 0.82 { BODY_DARK } else { BODY };
+                argb[i] = if d > 0.82 { c.body_dark } else { c.body };
             }
         }
     }
@@ -396,7 +452,7 @@ fn blob(size: u32, st: BlobStyle) -> Frame {
             fx,
             s - foot_h / 2.0 - lift - lift_all,
             foot_h * 0.9,
-            BODY_DARK,
+            c.body_dark,
         );
     }
 
@@ -446,9 +502,9 @@ fn blob(size: u32, st: BlobStyle) -> Frame {
         }
     }
 
-    // Щёки.
+    // Щёки: розовые на светлом теле, осветлённый тон тела — на тёмном.
     for ex in [cx - rx * 0.6, cx + rx * 0.6] {
-        fill_circle(&mut argb, size, ex, ey + ry * 0.35, s * 0.03, CHEEK);
+        fill_circle(&mut argb, size, ex, ey + ry * 0.35, s * 0.03, c.cheek);
     }
 
     // Рот.
@@ -511,9 +567,9 @@ fn blob(size: u32, st: BlobStyle) -> Frame {
 }
 
 /// Яйцо: собственная форма (не сжатый блоб) — скорлупа сужается кверху,
-/// крапинки фирменного сиреневого. `tilt` — покачивание сдвигом верхушки,
+/// крапинки в цвет тела. `tilt` — покачивание сдвигом верхушки,
 /// `cracks` 0..=3 — растущие трещины вылупления.
-fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
+fn egg_frame(size: u32, tilt: f32, cracks: u8, c: &BodyColors) -> Frame {
     let s = size as f32;
     let mut argb = vec![0u32; (size * size) as usize];
 
@@ -537,7 +593,7 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
             let d = vx * vx + vy * vy;
             if d <= 1.0 {
                 let i = (y * size + x) as usize;
-                argb[i] = if d > 0.82 { SHELL_DARK } else { SHELL };
+                argb[i] = if d > 0.82 { c.shell_dark } else { c.shell };
             }
         }
     }
@@ -553,7 +609,7 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
     for (ox, oy) in SPECKLES {
         let sy = cy + oy * ry;
         let sx = cx0 + ox * rx + tilt * (cy - sy);
-        fill_circle_inside(&mut argb, size, sx, sy, s * 0.03, SPECKLE);
+        fill_circle_inside(&mut argb, size, sx, sy, s * 0.03, c.speckle);
     }
 
     // Трещины: ломаные от макушки вниз, растут с каждым кадром вылупления.
@@ -566,6 +622,7 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
             top,
             &[(2.0, 4.0), (-2.0, 4.0), (3.0, 4.0)],
             s,
+            c.crack,
         );
     }
     if cracks >= 2 {
@@ -576,6 +633,7 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
             top + ry * 0.25,
             &[(-2.0, 3.0), (2.0, 4.0), (-3.0, 4.0)],
             s,
+            c.crack,
         );
     }
     if cracks >= 3 {
@@ -586,6 +644,7 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
             top + ry * 0.35,
             &[(3.0, 3.0), (-2.0, 4.0), (2.0, 5.0), (-3.0, 4.0)],
             s,
+            c.crack,
         );
     }
 
@@ -597,12 +656,12 @@ fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
 }
 
 /// Ломаная трещина: шаги в долях 1/32 размера, рисуем только по скорлупе.
-fn crack_line(argb: &mut [u32], size: u32, x0: f32, y0: f32, steps: &[(f32, f32)], s: f32) {
+fn crack_line(argb: &mut [u32], size: u32, x0: f32, y0: f32, steps: &[(f32, f32)], s: f32, c: u32) {
     let k = s / 32.0;
     let (mut x, mut y) = (x0, y0);
     for (dx, dy) in steps {
         let (nx, ny) = (x + dx * k, y + dy * k);
-        line_inside(argb, size, x, y, nx, ny, CRACK);
+        line_inside(argb, size, x, y, nx, ny, c);
         (x, y) = (nx, ny);
     }
 }
@@ -876,19 +935,86 @@ mod tests {
         assert_eq!(stage_scale(Stage::Adult), 1.0);
     }
 
+    fn greenness(f: &Frame) -> u64 {
+        f.argb
+            .iter()
+            .filter(|&&p| p >> 24 != 0)
+            .map(|&p| ((p >> 8) & 0xff) as u64)
+            .sum::<u64>()
+    }
+
     #[test]
     fn sick_frames_are_tinted() {
         let set = placeholder(96);
         // У больного тело зеленее здорового: сравним пиксели тел.
-        let healthy = &set.idle[0];
-        let sick = &set.sick[0];
-        let greenness = |f: &Frame| -> u64 {
-            f.argb
-                .iter()
-                .filter(|&&p| p >> 24 != 0)
-                .map(|&p| ((p >> 8) & 0xff) as u64)
-                .sum::<u64>()
-        };
-        assert!(greenness(sick) > greenness(healthy));
+        assert!(greenness(&set.sick[0]) > greenness(&set.idle[0]));
+    }
+
+    // ---- Цвет тела (пользовательская настройка) ----
+
+    /// Каждый пресет даёт непустые и попарно различные кадры — и для
+    /// блоба, и для яйца (скорлупа тоже выводится из цвета).
+    #[test]
+    fn presets_paint_distinct_nonempty_frames() {
+        let mut idles: Vec<Vec<u32>> = Vec::new();
+        let mut eggs: Vec<Vec<u32>> = Vec::new();
+        for &(argb, name) in palette::PET_PRESETS {
+            let set = placeholder_colored(96, Stage::Adult, argb);
+            for (fam, frames) in families(&set) {
+                for f in frames.iter() {
+                    assert!(
+                        f.argb.iter().any(|&p| p >> 24 != 0),
+                        "{name}/{fam}: кадр не должен быть пустым"
+                    );
+                }
+            }
+            idles.push(set.idle[0].argb.clone());
+            eggs.push(set.egg[0].argb.clone());
+        }
+        for i in 0..idles.len() {
+            for j in i + 1..idles.len() {
+                assert_ne!(idles[i], idles[j], "тела пресетов {i} и {j} совпали");
+                assert_ne!(eggs[i], eggs[j], "яйца пресетов {i} и {j} совпали");
+            }
+        }
+    }
+
+    /// Обёртки совместимости рисуют ровно дефолтный цвет.
+    #[test]
+    fn default_wrappers_use_default_color() {
+        let a = placeholder_for_stage(96, Stage::Adult);
+        let b = placeholder_colored(96, Stage::Adult, DEFAULT_PET_COLOR);
+        assert_eq!(a.idle[0].argb, b.idle[0].argb);
+        let egg_a = placeholder_for_stage(96, Stage::Egg);
+        let egg_b = placeholder_colored(96, Stage::Egg, DEFAULT_PET_COLOR);
+        assert_eq!(egg_a.egg[0].argb, egg_b.egg[0].argb);
+    }
+
+    /// Гард контраста щёк: на светлых телах — розовые, на тёмном —
+    /// осветлённый тон самого тела. Кривая альфа входа нормализуется.
+    #[test]
+    fn cheeks_keep_contrast_on_dark_bodies() {
+        for &(argb, name) in palette::PET_PRESETS {
+            let c = BodyColors::from_argb(argb);
+            assert_eq!(c.cheek, CHEEK_PINK, "{name}: светлое тело — розовые щёки");
+        }
+        let dark = 0xff_20_20_30;
+        let c = BodyColors::from_argb(dark);
+        assert_eq!(c.cheek, palette::lighten(dark, 1.3));
+        assert_ne!(c.cheek, CHEEK_PINK);
+        // Альфа входа не важна: тело всегда непрозрачное.
+        assert_eq!(BodyColors::from_argb(0x00_20_20_30).body, dark);
+    }
+
+    /// Оттенок болезни подмешивается поверх любого цвета тела.
+    #[test]
+    fn sick_tint_applies_over_any_preset() {
+        for &(argb, name) in palette::PET_PRESETS {
+            let set = placeholder_colored(96, Stage::Adult, argb);
+            assert!(
+                greenness(&set.sick[0]) > greenness(&set.idle[0]),
+                "{name}: больной должен зеленеть"
+            );
+        }
     }
 }

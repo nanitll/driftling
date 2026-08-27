@@ -3,9 +3,10 @@
 //! Работает в собственном потоке (blocking-API ksni) и разговаривает с
 //! циклом приложения тем же каналом, что и IPC-сервер: на каждое действие
 //! заводится одноразовый reply-канал, ответ логируется. Состояние
-//! «призван/убран» держим опросом Request::Status раз в POLL_INTERVAL
-//! (плюс оптимистично сразу после успешного действия) — без общих
-//! атомиков с DaemonApp.
+//! «призван/убран» и цвет питомца держим опросом Request::PetInfo раз в
+//! POLL_INTERVAL (плюс оптимистично сразу после успешного действия) — без
+//! общих атомиков с DaemonApp. Иконка пересоздаётся при смене цвета:
+//! ksni диффит свойства при update() и сам сигналит хосту NewIcon.
 //!
 //! Нет SNI-вотчера (GNOME без расширения) — `run()` возвращает ошибку,
 //! демон продолжает работать без трея: трей не единственный вход (B7).
@@ -14,7 +15,7 @@ use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use driftling_core::sprite::placeholder;
+use driftling_core::{sprite, Stage, DEFAULT_PET_COLOR};
 use driftling_ipc::{Request, Response};
 use ksni::blocking::TrayMethods;
 
@@ -34,11 +35,15 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Поднять трей и крутить опрос состояния до завершения демона.
 /// Блокирует текущий поток — вызывается из выделенного потока daemon::run().
 pub fn run(tx: Sender<IpcMessage>) -> Result<()> {
-    let summoned = matches!(query_summoned(&tx), Ok(Some(true)));
+    let (summoned, color) = match query_info(&tx) {
+        Ok(Some(pair)) => pair,
+        _ => (false, DEFAULT_PET_COLOR),
+    };
     let tray = DriftlingTray {
         tx: tx.clone(),
         summoned,
-        icon: tray_icon(),
+        color,
+        icon: tray_icon(color),
     };
     let handle = tray.spawn().context("SNI-сервис трея не поднялся")?;
     log::info!("трей: SNI-иконка зарегистрирована");
@@ -49,11 +54,19 @@ pub fn run(tx: Sender<IpcMessage>) -> Result<()> {
             log::info!("трей: SNI-сервис остановлен");
             return Ok(());
         }
-        match query_summoned(&tx) {
+        match query_info(&tx) {
             // update() дёшев: ksni сигналит хосту только при реальной
-            // смене свойств/меню (диффит по хэшам).
-            Ok(Some(summoned)) => {
-                if handle.update(|t| t.summoned = summoned).is_none() {
+            // смене свойств/меню (диффит по хэшам); перекраска питомца
+            // пересоздаёт иконку — хост получает NewIcon.
+            Ok(Some((summoned, color))) => {
+                let updated = handle.update(|t| {
+                    t.summoned = summoned;
+                    if t.color != color {
+                        t.color = color;
+                        t.icon = tray_icon(color);
+                    }
+                });
+                if updated.is_none() {
                     return Ok(());
                 }
             }
@@ -74,7 +87,9 @@ pub fn run(tx: Sender<IpcMessage>) -> Result<()> {
 struct DriftlingTray {
     tx: Sender<IpcMessage>,
     summoned: bool,
-    /// Готовый ARGB32-кадр: idle-кадр текущего плейсхолдера.
+    /// Последний известный цвет питомца — детектор перекраски иконки.
+    color: u32,
+    /// Готовый ARGB32-кадр: idle-кадр плейсхолдера в цвете питомца.
     icon: ksni::Icon,
 }
 
@@ -179,22 +194,26 @@ fn call(tx: &Sender<IpcMessage>, req: Request) -> Result<Option<Response>> {
     Ok(reply_rx.recv_timeout(REPLY_TIMEOUT).ok())
 }
 
-/// Спросить демона, призван ли питомец. Семантика ошибок как у `call`.
-fn query_summoned(tx: &Sender<IpcMessage>) -> Result<Option<bool>> {
-    match call(tx, Request::Status)? {
-        Some(Response::Status { pets, .. }) => Ok(Some(pets > 0)),
+/// Спросить демона о питомце: (призван ли, цвет тела).
+/// Семантика ошибок как у `call`.
+fn query_info(tx: &Sender<IpcMessage>) -> Result<Option<(bool, u32)>> {
+    match call(tx, Request::PetInfo)? {
+        // state = None означает «убран с экрана» (контракт PetInfo).
+        Some(Response::PetInfo { state, color, .. }) => Ok(Some((state.is_some(), color))),
         Some(other) => {
-            log::warn!("трей: неожиданный ответ на Status: {other:?}");
+            log::warn!("трей: неожиданный ответ на PetInfo: {other:?}");
             Ok(None)
         }
         None => Ok(None),
     }
 }
 
-/// idle-кадр плейсхолдера -> ksni::Icon: ARGB32 в network byte order,
-/// то есть big-endian побайтово (кадр ядра — те же ARGB8888-слова).
-fn tray_icon() -> ksni::Icon {
-    let frame = &placeholder(ICON_SIZE).idle[0];
+/// idle-кадр плейсхолдера в цвете питомца -> ksni::Icon: ARGB32 в network
+/// byte order, то есть big-endian побайтово (кадр ядра — те же
+/// ARGB8888-слова).
+fn tray_icon(color: u32) -> ksni::Icon {
+    let set = sprite::placeholder_colored(ICON_SIZE, Stage::Adult, color);
+    let frame = &set.idle[0];
     let mut data = Vec::with_capacity(frame.argb.len() * 4);
     for px in &frame.argb {
         data.extend_from_slice(&px.to_be_bytes());
@@ -243,18 +262,28 @@ mod tests {
         DriftlingTray {
             tx,
             summoned,
-            icon: tray_icon(),
+            color: DEFAULT_PET_COLOR,
+            icon: tray_icon(DEFAULT_PET_COLOR),
         }
     }
 
     #[test]
     fn icon_is_argb32_of_expected_size() {
-        let icon = tray_icon();
+        let icon = tray_icon(DEFAULT_PET_COLOR);
         assert_eq!(icon.width, ICON_SIZE as i32);
         assert_eq!(icon.height, ICON_SIZE as i32);
         assert_eq!(icon.data.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
         // Хоть один непрозрачный пиксель: альфа (первый байт ARGB) = 255.
         assert!(icon.data.chunks_exact(4).any(|px| px[0] == 0xff));
+    }
+
+    /// Иконка следует за цветом питомца: разные цвета — разные пиксели.
+    #[test]
+    fn icon_follows_pet_color() {
+        let default = tray_icon(DEFAULT_PET_COLOR);
+        let amber = tray_icon(0xff_e8_94_4a);
+        assert_eq!(default.data.len(), amber.data.len());
+        assert_ne!(default.data, amber.data);
     }
 
     #[test]
@@ -294,35 +323,34 @@ mod tests {
         let (tx, rx) = mpsc::channel::<IpcMessage>();
         drop(rx);
         assert!(call(&tx, Request::Status).is_err());
-        assert!(query_summoned(&tx).is_err());
+        assert!(query_info(&tx).is_err());
+    }
+
+    /// Картинка PetInfo для ответов «демона» в тестах.
+    fn petinfo(state: Option<&str>, color: u32) -> Response {
+        Response::PetInfo {
+            name: "Тестик".into(),
+            state: state.map(str::to_string),
+            attributes: driftling_core::PetAttributes::default(),
+            stats: driftling_core::PetStats::default(),
+            stage: Stage::Adult,
+            color,
+            uptime_secs: 1,
+        }
     }
 
     #[test]
-    fn query_summoned_maps_status() {
+    fn query_info_maps_petinfo() {
         let (tx, rx) = mpsc::channel();
         let daemon = std::thread::spawn(move || {
-            answer(
-                &rx,
-                Response::Status {
-                    pets: 1,
-                    state: "Idle".into(),
-                    uptime_secs: 1,
-                },
-            );
-            answer(
-                &rx,
-                Response::Status {
-                    pets: 0,
-                    state: "dismissed".into(),
-                    uptime_secs: 2,
-                },
-            );
+            answer(&rx, petinfo(Some("Idle"), 0xff_e8_94_4a));
+            answer(&rx, petinfo(None, DEFAULT_PET_COLOR));
             // Неожиданный ответ -> None (не фатально).
             answer(&rx, Response::Ok);
         });
-        assert_eq!(query_summoned(&tx).unwrap(), Some(true));
-        assert_eq!(query_summoned(&tx).unwrap(), Some(false));
-        assert_eq!(query_summoned(&tx).unwrap(), None);
+        assert_eq!(query_info(&tx).unwrap(), Some((true, 0xff_e8_94_4a)));
+        assert_eq!(query_info(&tx).unwrap(), Some((false, DEFAULT_PET_COLOR)));
+        assert_eq!(query_info(&tx).unwrap(), None);
         daemon.join().unwrap();
     }
 
