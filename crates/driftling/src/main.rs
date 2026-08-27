@@ -113,6 +113,7 @@ fn main() -> Result<()> {
                     state,
                     attributes,
                     uptime_secs,
+                    ..
                 } => {
                     let state = state.unwrap_or_else(|| fl!("state-dismissed"));
                     println!(

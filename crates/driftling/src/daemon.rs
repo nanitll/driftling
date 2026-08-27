@@ -272,8 +272,16 @@ impl DaemonApp {
                 name: self.record.name.clone(),
                 state: self.pet.as_ref().map(|p| format!("{:?}", p.state)),
                 attributes: self.record.attributes,
+                // Заглушки до журнала фазы B (волна 1 wave-B).
+                stats: driftling_core::PetStats::default(),
+                stage: driftling_core::Stage::Adult,
                 uptime_secs: self.started.elapsed().as_secs(),
             },
+            // Care-команды обретают смысл вместе с журналом (фаза B);
+            // до его интеграции честно отвечаем «не реализовано».
+            Request::Feed { .. } | Request::Play | Request::PutToSleep | Request::Rename(_) => {
+                Response::Error("care actions are not wired yet (phase B in progress)".into())
+            }
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
             Request::Quit => {

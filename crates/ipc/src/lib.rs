@@ -21,7 +21,9 @@ use std::time::Duration;
 
 /// Версия wire-протокола. Меняется при любом несовместимом изменении
 /// `Request`/`Response`; политика — версии либо равны, либо ошибка.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2 (фаза B): care-команды (Feed/Play/PutToSleep/Rename), в PetInfo
+/// добавлены статы и стадия роста.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Сколько сервер ждёт строку запроса от подключившегося клиента,
 /// прежде чем молча бросить соединение (ТД-12: защита от зависших клиентов).
@@ -34,6 +36,17 @@ pub enum Request {
     Status,
     /// Полная карточка питомца для настроек: имя, характеристики, состояние.
     PetInfo,
+    /// Покормить: `treat=false` — обычная еда, `treat=true` — вкусняшка
+    /// (настроение выше, но злоупотребление бьёт по здоровью, ТЗ §3.2).
+    Feed {
+        treat: bool,
+    },
+    /// Поиграть с питомцем.
+    Play,
+    /// Уложить спать.
+    PutToSleep,
+    /// Переименовать питомца (= событие журнала).
+    Rename(String),
     /// ТОЛЬКО дебаг-панель (ТЗ §3.3): напрямую задать характеристики.
     /// Демон клампит значения, применяет к живому питомцу и персистит.
     SetAttributes(PetAttributes),
@@ -55,6 +68,10 @@ pub enum Response {
         /// None = питомец сейчас убран с экрана (dismiss).
         state: Option<String>,
         attributes: PetAttributes,
+        /// Статы тамагочи (сытость/энергия/настроение/здоровье).
+        stats: driftling_core::PetStats,
+        /// Стадия роста (машинное имя, локализует UI).
+        stage: driftling_core::Stage,
         uptime_secs: u64,
     },
     Error(String),
@@ -447,7 +464,7 @@ mod tests {
     #[test]
     fn daemon_with_other_version_yields_clear_client_error() {
         let dir = TestDir::new("oldd");
-        // Поддельный «демон v2»: одно соединение, ответ с чужой версией.
+        // Поддельный «демон v99»: одно соединение, ответ с чужой версией.
         let listener = UnixListener::bind(socket_path_in(dir.path())).unwrap();
         let t = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
@@ -455,7 +472,7 @@ mod tests {
             let mut buf = String::new();
             reader.read_line(&mut buf).unwrap();
             let mut s = &stream;
-            s.write_all(b"{\"v\":2,\"resp\":\"Ok\"}\n").unwrap();
+            s.write_all(b"{\"v\":99,\"resp\":\"Ok\"}\n").unwrap();
         });
 
         let err = call_in(dir.path(), &Request::Status)
@@ -466,7 +483,7 @@ mod tests {
             fl!(
                 "ipc-incompatible-protocol",
                 client = PROTOCOL_VERSION,
-                daemon = 2
+                daemon = 99
             )
         );
         t.join().unwrap();

@@ -308,6 +308,8 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
         name,
         state,
         attributes,
+        stats,
+        stage,
         uptime_secs,
     }) = call(&Request::PetInfo)
     {
@@ -317,6 +319,8 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
                 "name": name,
                 "state": state,
                 "attributes": serde_json::to_value(attributes).unwrap_or_default(),
+                "stats": serde_json::to_value(stats).unwrap_or_default(),
+                "stage": stage.as_str(),
                 "uptime_secs": uptime_secs,
             }))
             .unwrap_or_default(),

@@ -9,13 +9,18 @@ pub mod attributes;
 pub mod behavior;
 pub mod config;
 pub mod geometry;
+pub mod growth;
 pub mod journal;
 pub mod pet;
 pub mod physics;
 pub mod sprite;
+pub mod stats;
+pub mod text;
 
 pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, PetState};
 pub use config::Config;
 pub use geometry::{Rect, Vec2};
+pub use growth::Stage;
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
+pub use stats::PetStats;
