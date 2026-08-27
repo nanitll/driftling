@@ -1,7 +1,9 @@
 //! Демон: симуляция + платформа + IPC.
 //!
 //! Связывает:
-//! - `driftling_core::Pet` (симуляция, tick + pointer);
+//! - `driftling_core::journal` — журнал событий, единственный источник
+//!   истины о питомце (имя, характеристики, статы, стадия, summoned);
+//! - `driftling_core::Pet` (поведение на экране, tick + pointer);
 //! - `driftling_core::sprite::placeholder` (кадры);
 //! - `driftling_platform::wayland::run` (оверлей: App::tick -> Scene);
 //! - `driftling_ipc::Server` в отдельном потоке -> канал -> DaemonApp::tick.
@@ -10,20 +12,31 @@
 //! (`SpriteSet::frame(state, state_time, facing)`, origin = bounds().{x,y},
 //! mirror = facing==Left) и input_rects = [bounds()], когда питомец призван.
 //!
-//! Живучесть (ТД-18, 19, 20): SIGTERM/SIGINT — graceful-выход с сохранением
-//! pet.json; паника — запись в журнал + сохранение записи + abort (рестарт
+//! Персистентность (фаза B): каждое действие ухода — событие журнала,
+//! записанное на диск в момент команды (append + fsync в `Journal::append`);
+//! состояние всегда выводится свёрткой [`fold`]. Кэш свёртки обновляется
+//! после каждого события и раз в [`REFOLD_INTERVAL`] (декей для
+//! Status/PetInfo). pet.json (schema v3) хранит только device_id для
+//! HLC-меток и после старта демоном не пишется.
+//!
+//! Живучесть (ТД-18, 19, 20): SIGTERM/SIGINT — graceful-выход (сохранять
+//! нечего: журнал уже на диске); паника — причина в лог + abort (рестарт
 //! отдаётся systemd, Restart=on-failure); логи — journald под systemd.
+//!
+//! Волна 2 фазы B: видимые реакции на уход (анимация еды, принудительный
+//! сон + событие Slept, меню ПКМ, спрайты по стадии/настроению).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use driftling_core::sprite::{placeholder, SpriteSet};
 use driftling_core::{
-    Config, Direction, Pet, PetAttributes, PetRecord, PointerEvent, Rect, SimPace, Vec2, World,
+    fold, Config, DerivedPet, Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock,
+    Journal, Pet, PetAttributes, PetRecord, PointerEvent, Rect, SimPace, Stage, Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
@@ -33,8 +46,14 @@ use crate::i18n::fl;
 /// Сколько IPC-поток ждёт ответа от цикла приложения, прежде чем сдаться.
 const IPC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Как часто пересворачивать журнал без новых событий: декей статов в
+/// Status/PetInfo между командами. Сам fold дешёвый (файлы малы), но
+/// гонять его каждый кадр незачем.
+const REFOLD_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Сообщение из IPC-потока: запрос + канал для ровно одного ответа.
-type IpcMessage = (Request, Sender<Response>);
+/// Тем же каналом пользуется поток трея (B7).
+pub(crate) type IpcMessage = (Request, Sender<Response>);
 
 /// Инициализация логирования демона (ТД-19): под systemd/journald пишем
 /// прямо в журнал с идентификатором "driftling", иначе — env_logger в
@@ -56,21 +75,23 @@ pub fn init_logging() {
         .try_init();
 }
 
-/// Паника не должна молча терять питомца (ТД-18): пишем причину в журнал,
-/// сохраняем последнюю известную запись и завершаемся abort'ом — рестарт
-/// делает systemd (Restart=on-failure), а не полуживой процесс.
-fn install_panic_hook(mirror: Arc<Mutex<PetRecord>>, data_dir: PathBuf) {
+/// Настенное unix-время в мс для HLC-меток и свёртки журнала. Демон — не
+/// ядро: часы ОС здесь читать можно (ТЗ §3.7 ограничивает только core).
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Паника не должна прятаться (ТД-18): причина — в лог, затем abort —
+/// рестарт делает systemd (Restart=on-failure), а не полуживой процесс.
+/// Спасать состояние не нужно: журнал событий уже на диске (fsync при
+/// каждом append), pet.json после старта не меняется.
+fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log::error!("паника демона: {info}");
-        let record = mirror
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        match record.save_in(&data_dir) {
-            Ok(()) => log::error!("pet.json сохранён перед аварийным выходом"),
-            Err(e) => log::error!("pet.json не сохранён при панике: {e}"),
-        }
+        log::error!("паника демона: {info} (журнал событий цел — он пишется сразу)");
         default_hook(info);
         std::process::abort();
     }));
@@ -81,6 +102,15 @@ pub fn run() -> Result<()> {
     init_logging();
 
     let (tx, rx) = mpsc::channel::<IpcMessage>();
+
+    // Трей (B7): свой поток, тот же канал запросов, что и у IPC. Нет
+    // SNI-вотчера (GNOME без расширения) — просто работаем без трея.
+    let tray_tx = tx.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = crate::tray::run(tray_tx) {
+            log::warn!("трей недоступен (нет SNI-вотчера?), работаем без него: {e:#}");
+        }
+    });
 
     // IPC-поток: каждый запрос пробрасывается в цикл приложения, ответ
     // ждём с таймаутом (цикл мог зависнуть — клиент не должен висеть вечно).
@@ -104,53 +134,106 @@ pub fn run() -> Result<()> {
     });
 
     let data_dir = driftling_core::attributes::data_dir();
-    let record = load_pet_record(&data_dir);
-    let size = record.attributes.clamped().size;
-    let mut app = DaemonApp::new(placeholder(size), rx, data_dir.clone());
-    app.set_record(record);
+    // Характеристики из legacy-секций config.toml — только при первом
+    // рождении питомца (см. load_storage); читаются здесь, чтобы тесты
+    // DaemonApp не зависели от реального конфига (ТД-26).
+    let legacy_attrs = driftling_core::config::raw_text()
+        .and_then(|t| driftling_core::config::legacy_attributes(&t));
+    let app = DaemonApp::new(rx, data_dir, legacy_attrs);
 
-    // SIGTERM/SIGINT (ТД-20): флаг проверяется в tick -> graceful-выход
-    // с финальной записью pet.json.
+    // SIGTERM/SIGINT (ТД-20): флаг проверяется в tick -> graceful-выход.
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(sig, Arc::clone(&app.sig_exit))?;
     }
-    install_panic_hook(Arc::clone(&app.record_mirror), data_dir);
+    install_panic_hook();
 
     driftling_platform::wayland::run(app)
 }
 
-/// Загрузить запись питомца из `data_dir`. Нет файла — мигрируем
-/// характеристики из legacy-секций config.toml (до переезда в pet.json)
-/// либо создаём дефолт; в обоих случаях сразу сохраняем. Битый файл
-/// load_in уже переименовал в pet.json.corrupt-<ts> (улики целы, ТД-15).
+/// Поднятое хранилище питомца: журнал + HLC-часы + признак записи.
+struct PetStorage {
+    events: Vec<JournalEvent>,
+    clock: HlcClock,
+    /// false — деградация: pet.json или журнал не читаются (файл новее
+    /// нашей версии, бэкап битого файла не удался). Работаем в памяти:
+    /// уход действует до рестарта, на диск не пишем ничего.
+    writable: bool,
+}
+
+/// Загрузить журнал и pet.json (schema v3) из `data_dir`.
 ///
-/// Имя питомца локализуется ровно один раз — при первом создании записи
-/// (ТД-30): в pet.json оно хранится как данные и смену локали переживает.
-fn load_pet_record(data_dir: &Path) -> PetRecord {
-    match PetRecord::load_in(data_dir) {
-        Ok(Some(rec)) => rec,
+/// - v1/v2 pet.json `PetRecord::load_in` мигрирует сам: имя/характеристики/
+///   summoned уезжают в журнал (Genesis с born_stage = Adult), файл
+///   переписывается как v3 (ТД-15);
+/// - нет pet.json — первый запуск: создаём v3-запись с device_id;
+/// - журнал без Genesis — рождение питомца: пишем Genesis с born_stage =
+///   Egg (вылупление и онбординг — B6). Имя локализуется ровно один раз —
+///   оно данные журнала и смену локали переживает (ТД-30); характеристики
+///   берутся из `legacy_attrs` (миграция старых секций config.toml).
+fn load_storage(data_dir: &Path, legacy_attrs: Option<PetAttributes>) -> PetStorage {
+    let (record, mut writable) = match PetRecord::load_in(data_dir) {
+        Ok(Some(rec)) => (rec, true),
         Ok(None) => {
-            let mut rec = PetRecord {
-                name: fl!("default-pet-name"),
-                ..PetRecord::default()
-            };
-            if let Some(attrs) = driftling_core::config::raw_text()
-                .and_then(|t| driftling_core::config::legacy_attributes(&t))
-            {
-                log::info!("миграция характеристик из legacy config.toml");
-                rec.attributes = attrs;
-            }
+            let rec = PetRecord::new(driftling_core::random_device_id());
             if let Err(e) = rec.save_in(data_dir) {
+                // Не смертельно: device_id доживёт до рестарта, журнал
+                // пробуем писать всё равно (append сам скажет, если некуда).
                 log::warn!("pet.json не сохранён: {e}");
             }
-            rec
+            (rec, true)
         }
         Err(e) => {
-            // Файл новее нашей схемы или бэкап не удался: НЕ сохраняем
-            // дефолт поверх — работаем на дефолте только в памяти.
-            log::warn!("pet.json не прочитан ({e}), работаем на дефолте без записи");
-            PetRecord::default()
+            log::warn!("pet.json не прочитан ({e}) — деградация: работаем в памяти без записи");
+            (PetRecord::new(driftling_core::random_device_id()), false)
         }
+    };
+
+    let (mut events, warnings) = match Journal::open(data_dir) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("журнал не прочитан ({e}) — деградация: работаем в памяти без записи");
+            writable = false;
+            (Vec::new(), 0)
+        }
+    };
+    if warnings > 0 {
+        log::warn!("журнал: пропущено битых строк: {warnings}");
+    }
+
+    let mut clock = HlcClock::new(record.device_id);
+    for ev in &events {
+        clock.catch_up(&ev.id);
+    }
+
+    // Рождение: журнал без Genesis (первый запуск или журнал утерян).
+    if !events
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::Genesis { .. }))
+    {
+        let attributes = legacy_attrs
+            .inspect(|_| log::info!("миграция характеристик из legacy config.toml"))
+            .unwrap_or_default();
+        let ev = JournalEvent {
+            id: clock.next(wall_now_ms()),
+            kind: EventKind::Genesis {
+                name: fl!("default-pet-name"),
+                attributes,
+                born_stage: Stage::Egg,
+            },
+        };
+        if writable {
+            if let Err(e) = Journal::append(data_dir, &ev) {
+                log::warn!("Genesis не записан в журнал: {e}");
+            }
+        }
+        log::info!("журнал: питомец родился (Genesis)");
+        events.push(ev);
+    }
+
+    PetStorage {
+        events,
+        clock,
+        writable,
     }
 }
 
@@ -158,8 +241,19 @@ fn load_pet_record(data_dir: &Path) -> PetRecord {
 /// кадры из него, поэтому tick возвращает Scene<'_> с временем жизни self.
 struct DaemonApp {
     sprites: SpriteSet,
-    /// Персистентная запись питомца: имя + характеристики (pet.json).
-    record: PetRecord,
+    /// Журнал событий в памяти (отсортирован по id) — источник истины.
+    events: Vec<JournalEvent>,
+    /// HLC-часы устройства (device_id из pet.json v3); подтянуты под
+    /// журнал при старте — новые метки строго больше записанных.
+    clock: HlcClock,
+    /// Игровые константы свёртки.
+    fold_cfg: FoldCfg,
+    /// Кэш свёртки журнала; обновляется в append_event и по таймеру tick.
+    derived: DerivedPet,
+    /// Монотонное время последней свёртки (таймер REFOLD_INTERVAL).
+    last_fold: Instant,
+    /// Журнал пишется на диск (false — деградация, см. load_storage).
+    journal_writable: bool,
     /// None = питомец убран (dismiss).
     pet: Option<Pet>,
     /// Появляется с первым Event::OutputGeometry; до него сцена пустая.
@@ -171,19 +265,39 @@ struct DaemonApp {
     /// `now` прошлого тика для вычисления dt.
     last_now: Option<f64>,
     rx: Receiver<IpcMessage>,
-    /// Каталог pet.json — DI вместо env-переменных (ТД-26).
+    /// Каталог данных (журнал + pet.json) — DI вместо env-переменных (ТД-26).
     data_dir: PathBuf,
     /// Взводится обработчиком SIGTERM/SIGINT; tick превращает в exit.
     sig_exit: Arc<AtomicBool>,
-    /// Зеркало record для panic hook (живёт в замыкании хука).
-    record_mirror: Arc<Mutex<PetRecord>>,
 }
 
 impl DaemonApp {
-    fn new(sprites: SpriteSet, rx: Receiver<IpcMessage>, data_dir: PathBuf) -> Self {
+    /// Поднять демона из каталога данных: журнал -> свёртка -> спрайты
+    /// под текущие характеристики. `legacy_attrs` — миграция старых
+    /// секций config.toml, применяется только при рождении питомца.
+    fn new(
+        rx: Receiver<IpcMessage>,
+        data_dir: PathBuf,
+        legacy_attrs: Option<PetAttributes>,
+    ) -> Self {
+        let storage = load_storage(&data_dir, legacy_attrs);
+        let fold_cfg = FoldCfg::default();
+        let derived = fold(&storage.events, wall_now_ms(), &fold_cfg);
+        log::info!(
+            "питомец «{}»: стадия {}, событий в журнале: {}",
+            derived.name,
+            derived.stage.as_str(),
+            storage.events.len()
+        );
+        let size = derived.attributes.clamped().size;
         Self {
-            sprites,
-            record: PetRecord::default(),
+            sprites: placeholder(size),
+            events: storage.events,
+            clock: storage.clock,
+            fold_cfg,
+            derived,
+            last_fold: Instant::now(),
+            journal_writable: storage.writable,
             pet: None,
             world: None,
             exit: false,
@@ -192,26 +306,42 @@ impl DaemonApp {
             rx,
             data_dir,
             sig_exit: Arc::new(AtomicBool::new(false)),
-            record_mirror: Arc::new(Mutex::new(PetRecord::default())),
         }
     }
 
-    /// Установить запись и синхронизировать зеркало panic hook'а.
-    fn set_record(&mut self, record: PetRecord) {
-        *self
-            .record_mirror
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = record.clone();
-        self.record = record;
+    /// Пересвернуть журнал в текущее состояние (декей до «сейчас»).
+    fn refold(&mut self) {
+        self.derived = fold(&self.events, wall_now_ms(), &self.fold_cfg);
+        self.last_fold = Instant::now();
     }
 
-    /// Сохранить запись на диск и обновить зеркало для panic hook.
-    fn persist_record(&self) -> Result<(), String> {
-        *self
-            .record_mirror
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = self.record.clone();
-        self.record.save_in(&self.data_dir)
+    /// Дописать событие ухода: диск (append + fsync) -> память -> свёртка.
+    /// Ошибка диска = событие не случилось (Err наружу, состояние не
+    /// трогаем). В деградации событие живёт только в памяти — уход
+    /// работает, но рестарт его забудет (залогировано при старте).
+    fn append_event(&mut self, kind: EventKind) -> Result<(), String> {
+        let ev = JournalEvent {
+            id: self.clock.next(wall_now_ms()),
+            kind,
+        };
+        if self.journal_writable {
+            Journal::append(&self.data_dir, &ev)?;
+        }
+        // Часы подтянуты под журнал при старте: новый id строго больше
+        // всех прежних, сортировка сохраняется без пересортировки.
+        self.events.push(ev);
+        self.refold();
+        Ok(())
+    }
+
+    /// Команда ухода: событие в журнал + Ok. Видимая реакция питомца
+    /// (анимация еды, принудительный сон + Slept) — волна 2 фазы B.
+    fn care(&mut self, kind: EventKind) -> Response {
+        log::info!("уход: {kind:?}");
+        match self.append_event(kind) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error(fl!("daemon-journal-append-failed", error = e)),
+        }
     }
 
     /// Призвать питомца (идемпотентно). Требует известной геометрии выхода.
@@ -224,7 +354,7 @@ impl DaemonApp {
             self.pet = Some(Pet::new(
                 pos,
                 self.sprites.size as f32,
-                self.record.attributes.behavior_config(),
+                self.derived.attributes.behavior_config(),
                 // Сид из битов монотонного времени: дёшево и достаточно.
                 now.to_bits(),
             ));
@@ -238,12 +368,9 @@ impl DaemonApp {
         match req {
             Request::Summon => {
                 let resp = self.summon(now);
-                // Призванность переживает рестарт (ТД-17).
-                if resp == Response::Ok && !self.record.summoned {
-                    self.record.summoned = true;
-                    if let Err(e) = self.persist_record() {
-                        return Response::Error(fl!("daemon-summoned-not-saved", error = e));
-                    }
+                // Призванность переживает рестарт (ТД-17) — событием журнала.
+                if resp == Response::Ok && !self.derived.summoned {
+                    return self.care(EventKind::Summoned);
                 }
                 resp
             }
@@ -251,12 +378,9 @@ impl DaemonApp {
                 if self.pet.take().is_some() {
                     log::info!("dismiss: питомец убран с экрана");
                 }
-                // Убранность переживает рестарт (ТД-17).
-                if self.record.summoned {
-                    self.record.summoned = false;
-                    if let Err(e) = self.persist_record() {
-                        return Response::Error(fl!("daemon-dismissed-not-saved", error = e));
-                    }
+                // Убранность переживает рестарт (ТД-17) — событием журнала.
+                if self.derived.summoned {
+                    return self.care(EventKind::Dismissed);
                 }
                 Response::Ok
             }
@@ -268,19 +392,27 @@ impl DaemonApp {
                 },
                 uptime_secs: self.started.elapsed().as_secs(),
             },
-            Request::PetInfo => Response::PetInfo {
-                name: self.record.name.clone(),
-                state: self.pet.as_ref().map(|p| format!("{:?}", p.state)),
-                attributes: self.record.attributes,
-                // Заглушки до журнала фазы B (волна 1 wave-B).
-                stats: driftling_core::PetStats::default(),
-                stage: driftling_core::Stage::Adult,
-                uptime_secs: self.started.elapsed().as_secs(),
-            },
-            // Care-команды обретают смысл вместе с журналом (фаза B);
-            // до его интеграции честно отвечаем «не реализовано».
-            Request::Feed { .. } | Request::Play | Request::PutToSleep | Request::Rename(_) => {
-                Response::Error("care actions are not wired yet (phase B in progress)".into())
+            Request::PetInfo => {
+                // Карточка всегда со свежим декеем — минутный таймер не ждём.
+                self.refold();
+                Response::PetInfo {
+                    name: self.derived.name.clone(),
+                    state: self.pet.as_ref().map(|p| format!("{:?}", p.state)),
+                    attributes: self.derived.attributes,
+                    stats: self.derived.stats,
+                    stage: self.derived.stage,
+                    uptime_secs: self.started.elapsed().as_secs(),
+                }
+            }
+            Request::Feed { treat } => self.care(EventKind::Fed { treat }),
+            Request::Play => self.care(EventKind::Played),
+            Request::PutToSleep => self.care(EventKind::PutToSleep),
+            Request::Rename(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return Response::Error(fl!("daemon-rename-empty"));
+                }
+                self.care(EventKind::Renamed { name })
             }
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
@@ -293,7 +425,7 @@ impl DaemonApp {
     }
 
     /// Дебаг-панель: задать характеристики напрямую. Клампим, применяем к
-    /// живому питомцу, персистим в pet.json.
+    /// живому питомцу, персистим событием журнала (AttributesSet).
     fn set_attributes(&mut self, attrs: PetAttributes) -> Response {
         let a = attrs.clamped();
         if a.size != self.sprites.size {
@@ -302,12 +434,8 @@ impl DaemonApp {
         if let Some(pet) = &mut self.pet {
             pet.apply_config(a.behavior_config(), a.size as f32);
         }
-        self.record.attributes = a;
         log::info!("set_attributes: применены {a:?}");
-        if let Err(e) = self.persist_record() {
-            return Response::Error(fl!("daemon-applied-not-saved", error = e));
-        }
-        Response::Ok
+        self.care(EventKind::AttributesSet { attributes: a })
     }
 
     /// Перечитать config.toml (настройки приложения). Характеристики питомца
@@ -334,12 +462,10 @@ impl DaemonApp {
 
 impl App for DaemonApp {
     fn tick(&mut self, now: f64) -> Scene<'_> {
-        // SIGTERM/SIGINT: graceful-выход с финальной записью (ТД-20).
+        // SIGTERM/SIGINT: graceful-выход (ТД-20). Сохранять нечего —
+        // журнал пишется на диск в момент каждого события.
         if self.sig_exit.load(Ordering::Relaxed) && !self.exit {
-            log::info!("получен SIGTERM/SIGINT: сохраняемся и выходим");
-            if let Err(e) = self.persist_record() {
-                log::warn!("pet.json не сохранён при выходе: {e}");
-            }
+            log::info!("получен SIGTERM/SIGINT: выходим (журнал уже на диске)");
             self.exit = true;
         }
 
@@ -348,6 +474,11 @@ impl App for DaemonApp {
         while let Ok((req, reply)) = self.rx.try_recv() {
             let resp = self.handle(req, now);
             let _ = reply.send(resp);
+        }
+
+        // Ленивый декей: свёртка раз в минуту, а не каждый кадр.
+        if self.last_fold.elapsed() >= REFOLD_INTERVAL {
+            self.refold();
         }
 
         // dt с прошлого тика; кламп согласован с Pet::tick (ТД-3: при
@@ -388,8 +519,8 @@ impl App for DaemonApp {
                     screen: Rect::new(0.0, 0.0, width, height),
                 });
                 // Демон стартует с питомцем на экране — но только если его
-                // не убирали до рестарта (ТД-17: dismissed персистентен).
-                if first && self.record.summoned {
+                // не убирали до рестарта (ТД-17: dismissed в журнале).
+                if first && self.derived.summoned {
                     self.summon(now);
                 }
                 true
@@ -398,9 +529,9 @@ impl App for DaemonApp {
             Event::PointerMotion(p) => self.pointer(PointerEvent::Motion(p), now),
             Event::PointerRelease(p) => self.pointer(PointerEvent::Release(p), now),
             Event::PointerMenu(p) => {
-                // Заглушка: контекстное меню питомца приходит в фазе B.
+                // Заглушка: контекстное меню питомца — волна 2 фазы B (B3).
                 log::info!(
-                    "ПКМ по питомцу в ({:.0}, {:.0}) — меню будет в фазе B",
+                    "ПКМ по питомцу в ({:.0}, {:.0}) — меню будет в волне 2",
                     p.x,
                     p.y
                 );
@@ -408,7 +539,7 @@ impl App for DaemonApp {
             }
             Event::OutputLost => {
                 // Бэкенд пересоздаст слой сам; состояние питомца целиком в
-                // памяти + pet.json — терять нечего, просто ждём.
+                // журнале — терять нечего, просто ждём.
                 log::warn!(
                     "выход потерян (рестарт композитора?) — состояние сохранено, ждём пересоздания"
                 );
@@ -450,10 +581,11 @@ mod tests {
         dir
     }
 
-    /// DaemonApp без Wayland: маленький спрайт и ручной канал запросов.
+    /// DaemonApp без Wayland: ручной канал запросов; legacy-конфиг не
+    /// подмешиваем — тесты не зависят от реального config.toml (ТД-26).
     fn app_in(dir: &Path) -> (DaemonApp, Sender<IpcMessage>) {
         let (tx, rx) = mpsc::channel();
-        (DaemonApp::new(placeholder(32), rx, dir.to_path_buf()), tx)
+        (DaemonApp::new(rx, dir.to_path_buf(), None), tx)
     }
 
     fn app(tag: &str) -> (DaemonApp, Sender<IpcMessage>, PathBuf) {
@@ -479,12 +611,60 @@ mod tests {
         ));
     }
 
+    /// Виды событий журнала на диске (в порядке id).
+    fn journal_kinds(dir: &Path) -> Vec<EventKind> {
+        let (events, warnings) = Journal::open(dir).unwrap();
+        assert_eq!(warnings, 0, "журнал без битых строк");
+        events.into_iter().map(|e| e.kind).collect()
+    }
+
     #[test]
     fn empty_scene_before_geometry() {
         let (mut app, _tx, dir) = app("empty");
         let scene = app.tick(0.0);
         assert!(scene.sprites.is_empty());
         assert!(scene.input_rects.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Первый запуск: рождение записано в журнал (Genesis, born_stage=Egg),
+    /// pet.json создан как v3 (device_id), свёртка — новорождённый питомец.
+    #[test]
+    fn first_start_writes_genesis_and_v3_record() {
+        let (app, _tx, dir) = app("genesis");
+        let kinds = journal_kinds(&dir);
+        assert_eq!(kinds.len(), 1);
+        assert!(matches!(
+            &kinds[0],
+            EventKind::Genesis {
+                born_stage: Stage::Egg,
+                ..
+            }
+        ));
+        let rec = PetRecord::load_in(&dir).unwrap().expect("pet.json создан");
+        assert!(!rec.device_id.is_empty());
+        assert_eq!(app.derived.name, fl!("default-pet-name"));
+        assert_eq!(app.derived.stage, Stage::Egg, "новорождённый — яйцо");
+        assert!(app.derived.summoned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Миграция на уровне демона: v2 pet.json подхватывается стартом —
+    /// имя/характеристики в свёртке, стадия Adult, журнал создан.
+    #[test]
+    fn start_migrates_v2_pet_json() {
+        let dir = tmp_dir("migrate");
+        std::fs::write(
+            dir.join("pet.json"),
+            r#"{"schema_version":2,"name":"Старожил","attributes":{"size":128},"summoned":true}"#,
+        )
+        .unwrap();
+        let (app, _tx) = app_in(&dir);
+        assert_eq!(app.derived.name, "Старожил");
+        assert_eq!(app.derived.attributes.size, 128);
+        assert_eq!(app.derived.stage, Stage::Adult, "мигрант не вылупляется");
+        assert!(app.derived.summoned);
+        assert_eq!(journal_kinds(&dir).len(), 1, "только Genesis");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -513,8 +693,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ТД-17: dismiss/summon персистят summoned, и «рестартовавший» демон
-    /// с summoned=false НЕ призывает питомца на первой геометрии.
+    /// ТД-17: dismiss/summon пишут события журнала, и «рестартовавший»
+    /// демон с Dismissed в хвосте НЕ призывает питомца на первой геометрии.
     #[test]
     fn dismissed_survives_restart() {
         let (mut app, tx, dir) = app("dismissed");
@@ -523,25 +703,28 @@ mod tests {
         let reply = send(&tx, Request::Dismiss);
         app.tick(0.1);
         assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Dismissed
+        ));
 
-        let saved = PetRecord::load_in(&dir).unwrap().expect("запись сохранена");
-        assert!(!saved.summoned, "dismiss персистит summoned=false");
-
-        // «Рестарт»: новое приложение поднимает запись с диска.
+        // «Рестарт»: новое приложение сворачивает журнал с диска.
         let (mut app2, tx2) = app_in(&dir);
-        app2.set_record(load_pet_record(&dir));
+        assert!(!app2.derived.summoned, "dismiss пережил рестарт");
         geometry(&mut app2);
         assert!(
             app2.tick(0.0).sprites.is_empty(),
             "убранный питомец не возвращается сам после рестарта"
         );
 
-        // Явный Summon возвращает питомца и персистит summoned=true.
+        // Явный Summon возвращает питомца и пишет событие Summoned.
         let reply = send(&tx2, Request::Summon);
         assert_eq!(app2.tick(0.1).sprites.len(), 1);
         assert_eq!(reply.recv().unwrap(), Response::Ok);
-        let saved = PetRecord::load_in(&dir).unwrap().unwrap();
-        assert!(saved.summoned);
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Summoned
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -585,9 +768,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Команды ухода отвечают Ok, дописывают события в journal.jsonl и
+    /// мгновенно отражаются в свёртке (игра снимает энергию).
+    #[test]
+    fn care_commands_append_journal_events() {
+        let (mut app, tx, dir) = app("care");
+        geometry(&mut app);
+
+        let requests = [
+            Request::Feed { treat: false },
+            Request::Feed { treat: true },
+            Request::Play,
+            Request::PutToSleep,
+        ];
+        for (i, req) in requests.into_iter().enumerate() {
+            let reply = send(&tx, req);
+            app.tick(0.1 * (i as f64 + 1.0));
+            assert_eq!(reply.recv().unwrap(), Response::Ok);
+        }
+
+        let kinds = journal_kinds(&dir);
+        assert!(matches!(kinds[0], EventKind::Genesis { .. }));
+        assert!(matches!(kinds[1], EventKind::Fed { treat: false }));
+        assert!(matches!(kinds[2], EventKind::Fed { treat: true }));
+        assert!(matches!(kinds[3], EventKind::Played));
+        assert!(matches!(kinds[4], EventKind::PutToSleep));
+        assert!(
+            app.derived.stats.energy < 100.0,
+            "свёртка после Played: энергия снята"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rename: пустое имя — ошибка без события; валидное — событие
+    /// Renamed (с обрезанными пробелами) и новое имя в свёртке.
+    #[test]
+    fn rename_trims_validates_and_persists() {
+        let (mut app, tx, dir) = app("rename");
+
+        let reply = send(&tx, Request::Rename("   ".into()));
+        app.tick(0.0);
+        assert!(matches!(reply.recv().unwrap(), Response::Error(_)));
+        assert_eq!(journal_kinds(&dir).len(), 1, "только Genesis");
+
+        let reply = send(&tx, Request::Rename(" Дрифт ".into()));
+        app.tick(0.1);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert_eq!(app.derived.name, "Дрифт");
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Renamed { name } if name == "Дрифт"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn set_attributes_applies_and_petinfo_reports() {
-        // pet.json изолирован через DI-каталог, env не трогаем (ТД-26).
+        // Данные изолированы через DI-каталог, env не трогаем (ТД-26).
         let (mut app, tx, dir) = app("attrs");
         geometry(&mut app);
 
@@ -602,9 +839,11 @@ mod tests {
         assert_eq!(app.sprites.size, 128);
         assert_eq!(app.pet.as_ref().unwrap().config().walk_speed, 200.0);
 
-        // Характеристики реально доехали до диска.
-        let saved = PetRecord::load_in(&dir).unwrap().unwrap();
-        assert_eq!(saved.attributes.size, 128);
+        // Характеристики реально доехали до журнала.
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::AttributesSet { .. }
+        ));
 
         let reply = send(&tx, Request::PetInfo);
         app.tick(0.1);
@@ -613,12 +852,17 @@ mod tests {
                 name,
                 state,
                 attributes,
+                stats,
+                stage,
                 ..
             } => {
-                assert_eq!(name, PetRecord::default().name);
+                assert_eq!(name, fl!("default-pet-name"));
                 assert!(state.is_some());
                 assert_eq!(attributes.size, 128);
                 assert_eq!(attributes.walk_speed, 200.0);
+                // Новорождённый: статы ещё не успели просесть, стадия — яйцо.
+                assert!(stats.satiety > 99.0 && stats.health > 99.0);
+                assert_eq!(stage, Stage::Egg);
             }
             other => panic!("неожиданный ответ: {other:?}"),
         }
@@ -639,9 +883,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ТД-20: сигнал завершения превращается в graceful-выход с записью.
+    /// ТД-20: сигнал завершения превращается в graceful-выход. Сохранять
+    /// нечего: журнал (единственная персистентность) уже на диске.
     #[test]
-    fn sigterm_flag_saves_and_exits() {
+    fn sigterm_flag_exits_gracefully() {
         let (mut app, _tx, dir) = app("sigterm");
         geometry(&mut app);
         assert!(!app.wants_exit());
@@ -650,8 +895,8 @@ mod tests {
         app.tick(0.1);
         assert!(app.wants_exit());
         assert!(
-            PetRecord::load_in(&dir).unwrap().is_some(),
-            "запись сохранена перед выходом"
+            !journal_kinds(&dir).is_empty(),
+            "журнал на диске (записан ещё при старте)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -22,5 +22,10 @@ pub use behavior::{BehaviorConfig, PetState};
 pub use config::Config;
 pub use geometry::{Rect, Vec2};
 pub use growth::Stage;
+pub use journal::{
+    fold, merge, random_device_id, DerivedPet, Event, EventKind, FoldCfg, Hlc, HlcClock,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use journal::{journal_path_in, Journal};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
 pub use stats::PetStats;

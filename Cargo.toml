@@ -37,6 +37,9 @@ systemd-journal-logger = "2"
 signal-hook = "0.3"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# Иконка в системном трее (B7): чистый Rust SNI, KDE нативно; блокирующий
+# API — трей живёт в своём потоке без async-обвязки в нашем коде.
+ksni = { version = "0.3", features = ["blocking"] }
 # i18n (ТД-30): Fluent-локализация, локаль из ОС, en — полный фолбэк.
 i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"

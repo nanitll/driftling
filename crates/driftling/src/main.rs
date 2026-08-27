@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod daemon;
 mod i18n;
+mod tray;
 
 use i18n::fl;
 
@@ -40,9 +41,24 @@ enum CtlAction {
     // Показать состояние.
     #[command(about = fl!("cli-about-status"))]
     Status,
-    // Карточка питомца: имя, состояние, характеристики.
+    // Карточка питомца: имя, стадия, статы, характеристики.
     #[command(about = fl!("cli-about-info"))]
     Info,
+    // Покормить питомца (--treat — вкусняшка).
+    #[command(about = fl!("cli-about-feed"))]
+    Feed {
+        #[arg(long, help = fl!("cli-about-feed-treat"))]
+        treat: bool,
+    },
+    // Поиграть с питомцем.
+    #[command(about = fl!("cli-about-play"))]
+    Play,
+    // Уложить питомца спать.
+    #[command(about = fl!("cli-about-sleep"))]
+    Sleep,
+    // Переименовать питомца (= событие журнала).
+    #[command(about = fl!("cli-about-rename"))]
+    Rename { name: String },
     // Перечитать конфиг и применить на лету.
     #[command(about = fl!("cli-about-reload"))]
     Reload,
@@ -87,6 +103,10 @@ fn main() -> Result<()> {
                 CtlAction::Dismiss => driftling_ipc::Request::Dismiss,
                 CtlAction::Status => driftling_ipc::Request::Status,
                 CtlAction::Info => driftling_ipc::Request::PetInfo,
+                CtlAction::Feed { treat } => driftling_ipc::Request::Feed { treat },
+                CtlAction::Play => driftling_ipc::Request::Play,
+                CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
+                CtlAction::Rename { name } => driftling_ipc::Request::Rename(name),
                 CtlAction::Reload => driftling_ipc::Request::Reload,
                 CtlAction::Quit => driftling_ipc::Request::Quit,
                 CtlAction::Doctor => return doctor(),
@@ -112,8 +132,9 @@ fn main() -> Result<()> {
                     name,
                     state,
                     attributes,
+                    stats,
+                    stage,
                     uptime_secs,
-                    ..
                 } => {
                     let state = state.unwrap_or_else(|| fl!("state-dismissed"));
                     println!(
@@ -121,8 +142,25 @@ fn main() -> Result<()> {
                         fl!(
                             "ctl-petinfo",
                             name = name,
+                            stage = stage_name(stage),
                             state = state,
-                            uptime = uptime_secs,
+                            uptime = uptime_secs
+                        )
+                    );
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-petinfo-stats",
+                            satiety = format!("{:.0}", stats.satiety),
+                            energy = format!("{:.0}", stats.energy),
+                            mood = format!("{:.0}", stats.mood),
+                            health = format!("{:.0}", stats.health)
+                        )
+                    );
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-petinfo-attributes",
                             attributes = format!("{attributes:?}")
                         )
                     );
@@ -131,6 +169,18 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// Локализованное имя стадии роста (демон шлёт машинное значение, ТД-30).
+fn stage_name(stage: driftling_core::Stage) -> String {
+    use driftling_core::Stage;
+    match stage {
+        Stage::Egg => fl!("stage-egg"),
+        Stage::Baby => fl!("stage-baby"),
+        Stage::Child => fl!("stage-child"),
+        Stage::Teen => fl!("stage-teen"),
+        Stage::Adult => fl!("stage-adult"),
     }
 }
 
@@ -217,17 +267,45 @@ fn doctor() -> Result<()> {
         ),
     }
 
-    // 3. pet.json.
+    // 3. pet.json (v3: только device_id) + журнал событий — источник
+    // истины о питомце. Имя берём свёрткой журнала. load() при v1/v2
+    // сам мигрирует содержимое в журнал — то же сделал бы демон при
+    // старте, операция идемпотентна (ТД-15).
     let pet_path = driftling_core::attributes::record_path();
     match driftling_core::PetRecord::load() {
-        Ok(Some(rec)) => check(
-            true,
-            &fl!(
-                "doctor-pet-ok",
-                name = rec.name,
-                path = pet_path.display().to_string()
-            ),
-        ),
+        Ok(Some(_rec)) => {
+            let data_dir = driftling_core::attributes::data_dir();
+            match driftling_core::Journal::open(&data_dir) {
+                Ok((events, warnings)) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let pet =
+                        driftling_core::fold(&events, now_ms, &driftling_core::FoldCfg::default());
+                    check(
+                        true,
+                        &fl!(
+                            "doctor-pet-ok",
+                            name = pet.name,
+                            path = pet_path.display().to_string()
+                        ),
+                    );
+                    check(
+                        warnings == 0,
+                        &fl!(
+                            "doctor-journal",
+                            events = (events.len() as u64),
+                            warnings = warnings,
+                            path = driftling_core::journal_path_in(&data_dir)
+                                .display()
+                                .to_string()
+                        ),
+                    );
+                }
+                Err(e) => check(false, &fl!("doctor-journal-unreadable", error = e)),
+            }
+        }
         Ok(None) => check(
             false,
             &fl!("doctor-pet-missing", path = pet_path.display().to_string()),

@@ -16,6 +16,7 @@ env_logger = { workspace = true }
 clap = { workspace = true }
 systemd-journal-logger = { workspace = true }
 signal-hook = { workspace = true }
+ksni = { workspace = true }
 i18n-embed = { workspace = true }
 i18n-embed-fl = { workspace = true }
 rust-embed = { workspace = true }

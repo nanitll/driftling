@@ -1,10 +1,14 @@
-//! Характеристики питомца (ТЗ §3.3): принадлежат конкретному питомцу и
-//! персистентны, пользователь напрямую их не меняет — только смотрит.
-//! Правка — исключительно через дебаг-панель (IPC `SetAttributes`);
-//! игровая «прокачка» появится в M2+.
+//! Характеристики питомца (ТЗ §3.3) и запись pet.json (schema v3).
 //!
-//! В M2 характеристики переезжают в журнал событий (изменение = событие)
-//! и начинают синкаться между устройствами.
+//! С фазы B источник истины — журнал событий (`journal.rs`): имя,
+//! характеристики и summoned живут в событиях (Genesis/Renamed/
+//! AttributesSet/...), состояние всегда пересворачивается из журнала при
+//! старте. В pet.json остаётся только то, что не выводится из журнала:
+//! идентификатор устройства для HLC-меток.
+//!
+//! Пользователь напрямую характеристики не меняет — только смотрит;
+//! правка — исключительно через дебаг-панель (IPC `SetAttributes` =
+//! событие `AttributesSet`), игровая «прокачка» — B5.
 
 use serde::{Deserialize, Serialize};
 
@@ -72,40 +76,43 @@ impl PetAttributes {
 /// Текущая версия схемы pet.json (ТД-15). История:
 /// - v1 — неявная (файлы без поля `schema_version`): имя + характеристики;
 /// - v2 — добавлены `schema_version` и `summoned` (убранный питомец
-///   переживает рестарт демона, ТД-17).
-pub const SCHEMA_VERSION: u32 = 2;
+///   переживает рестарт демона, ТД-17);
+/// - v3 — источник истины переехал в журнал (journal.jsonl); в pet.json
+///   остался только `device_id`. Чтение v1/v2 — миграция: содержимое
+///   уезжает в журнал событием Genesis (born_stage = Adult).
+pub const SCHEMA_VERSION: u32 = 3;
 
-/// Персистентная запись питомца — прообраз журнала (M2).
+/// Персистентная запись устройства (schema v3).
 /// Хранится в `$XDG_DATA_HOME/driftling/pet.json`.
+///
+/// Снапшот-курсор журнала намеренно не храним: питомец всегда
+/// пересворачивается из журнала при старте — файлы малы (TODO(E):
+/// снапшот-оптимизация для больших журналов).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct PetRecord {
-    /// Версия схемы файла. Файл без поля (v1) читается как текущая схема —
-    /// serde-default и есть миграция v1 -> v2; файл НОВЕЕ поддерживаемой
-    /// версии load() отвергает явной ошибкой, а не тихим дефолтом.
+    /// Версия схемы файла. Файл НОВЕЕ поддерживаемой версии load()
+    /// отвергает явной ошибкой, а не тихим дефолтом.
     pub schema_version: u32,
-    pub name: String,
-    pub attributes: PetAttributes,
-    /// Питомец призван на экран; false = убран через dismiss (ТД-17).
-    pub summoned: bool,
+    /// Идентификатор устройства для HLC-меток журнала: случайный hex,
+    /// генерируется один раз при создании/миграции записи.
+    #[serde(default)]
+    pub device_id: String,
 }
 
-impl Default for PetRecord {
-    fn default() -> Self {
+impl PetRecord {
+    pub fn new(device_id: String) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            // Нейтральный запасной вариант: локализованное имя питомцу даёт
-            // демон при первом создании записи (ТД-30) — в файле имя данные.
-            name: "Driftling".to_string(),
-            attributes: PetAttributes::default(),
-            summoned: true,
+            device_id,
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod fs {
-    use super::{PetRecord, SCHEMA_VERSION};
+    use super::{PetAttributes, PetRecord, SCHEMA_VERSION};
+    use crate::growth::Stage;
+    use crate::journal::{random_device_id, Event, EventKind, HlcClock, Journal};
     use std::path::{Path, PathBuf};
 
     /// Каталог данных: `$XDG_DATA_HOME/driftling` (или `~/.local/share/...`).
@@ -129,6 +136,103 @@ mod fs {
         path_in(&data_dir())
     }
 
+    /// Unix-время в мс — только для файлового слоя (имена бэкапов, метки
+    /// миграции); симуляция время из ОС не читает (ТЗ §3.7).
+    fn wall_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Зонд версии: у v1-файлов поля нет вовсе.
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        schema_version: Option<u32>,
+    }
+
+    /// Форма pet.json v1/v2 — читается только ради миграции в журнал.
+    /// Дефолты повторяют старую запись: v1 не знал dismiss — питомец призван.
+    #[derive(serde::Deserialize)]
+    #[serde(default)]
+    struct LegacyRecord {
+        name: String,
+        attributes: PetAttributes,
+        summoned: bool,
+    }
+
+    impl Default for LegacyRecord {
+        fn default() -> Self {
+            Self {
+                name: "Driftling".to_string(),
+                attributes: PetAttributes::default(),
+                summoned: true,
+            }
+        }
+    }
+
+    /// Битый pet.json: переименовать в `pet.json.corrupt-<unixts>` (улики
+    /// сохраняются) и стартовать с чистого листа, не перезаписывая оригинал.
+    fn backup_corrupt(
+        p: &Path,
+        parse_err: &serde_json::Error,
+    ) -> Result<Option<PetRecord>, String> {
+        let ts = wall_now_ms() / 1000;
+        let backup = p.with_file_name(format!("pet.json.corrupt-{ts}"));
+        match std::fs::rename(p, &backup) {
+            Ok(()) => Ok(None),
+            // Бэкап не удался — оригинал не трогаем и не даём его молча
+            // перезаписать дефолтом.
+            Err(io_err) => Err(format!(
+                "pet.json is corrupt ({parse_err}) and backup failed: {io_err}"
+            )),
+        }
+    }
+
+    /// Миграция v1/v2 -> v3: имя/характеристики/summoned уезжают в журнал
+    /// (Genesis с born_stage = Adult — взрослый не вылупляется заново,
+    /// + Dismissed, если питомец был убран), pet.json переписывается как v3.
+    ///
+    /// Идемпотентна: если Genesis уже в журнале (краш между шагами прошлой
+    /// миграции), события не дублируются.
+    fn migrate_legacy(dir: &Path, legacy: LegacyRecord) -> Result<PetRecord, String> {
+        let device_id = random_device_id();
+        let (existing, _warnings) = Journal::open(dir)?;
+        let has_genesis = existing
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Genesis { .. }));
+        if !has_genesis {
+            let mut clock = HlcClock::new(device_id.clone());
+            for e in &existing {
+                clock.catch_up(&e.id);
+            }
+            let now_ms = wall_now_ms();
+            Journal::append(
+                dir,
+                &Event {
+                    id: clock.next(now_ms),
+                    kind: EventKind::Genesis {
+                        name: legacy.name,
+                        attributes: legacy.attributes,
+                        born_stage: Stage::Adult,
+                    },
+                },
+            )?;
+            if !legacy.summoned {
+                Journal::append(
+                    dir,
+                    &Event {
+                        id: clock.next(now_ms),
+                        kind: EventKind::Dismissed,
+                    },
+                )?;
+            }
+        }
+        let rec = PetRecord::new(device_id);
+        rec.save_in(dir)?;
+        Ok(rec)
+    }
+
     impl PetRecord {
         /// Прочитать запись из штатного каталога данных.
         pub fn load() -> Result<Option<PetRecord>, String> {
@@ -136,12 +240,13 @@ mod fs {
         }
 
         /// Прочитать запись из `dir`. Семантика (ТД-15,16):
-        /// - нет файла — `Ok(None)`;
+        /// - нет файла — `Ok(None)` (создание записи — за демоном);
         /// - схема новее поддерживаемой — явная ошибка (файл от более
         ///   новой версии Driftling трогать нельзя);
+        /// - v1/v2 — миграция в v3 с переносом содержимого в журнал
+        ///   (см. [`migrate_legacy`]);
         /// - битый JSON — файл переименовывается в
-        ///   `pet.json.corrupt-<unixts>` (улики сохраняются) и `Ok(None)`:
-        ///   демон стартует с чистого листа, не перезаписывая оригинал.
+        ///   `pet.json.corrupt-<unixts>` и `Ok(None)`.
         pub fn load_in(dir: &Path) -> Result<Option<PetRecord>, String> {
             let p = path_in(dir);
             let text = match std::fs::read_to_string(&p) {
@@ -149,30 +254,35 @@ mod fs {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e.to_string()),
             };
+            // Ошибки ядра — технические, по-английски (ТД-30): ядро не
+            // тянет i18n (wasm-чистота), наружу их заворачивают UI-слои.
+            let version = match serde_json::from_str::<Probe>(&text) {
+                Ok(probe) => probe.schema_version.unwrap_or(1),
+                Err(parse_err) => return backup_corrupt(&p, &parse_err),
+            };
+            if version > SCHEMA_VERSION {
+                return Err(format!(
+                    "pet.json schema v{version} is newer than supported v{SCHEMA_VERSION} — \
+                     file from a newer Driftling version, leaving it untouched"
+                ));
+            }
+            if version < SCHEMA_VERSION {
+                return match serde_json::from_str::<LegacyRecord>(&text) {
+                    Ok(legacy) => migrate_legacy(dir, legacy).map(Some),
+                    Err(parse_err) => backup_corrupt(&p, &parse_err),
+                };
+            }
             match serde_json::from_str::<PetRecord>(&text) {
-                // Ошибки ядра — технические, по-английски (ТД-30): ядро не
-                // тянет i18n (wasm-чистота), наружу их заворачивают UI-слои.
-                Ok(rec) if rec.schema_version > SCHEMA_VERSION => Err(format!(
-                    "pet.json schema v{} is newer than supported v{SCHEMA_VERSION} — \
-                     file from a newer Driftling version, leaving it untouched",
-                    rec.schema_version
-                )),
-                Ok(rec) => Ok(Some(rec)),
-                Err(parse_err) => {
-                    let ts = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let backup = p.with_file_name(format!("pet.json.corrupt-{ts}"));
-                    match std::fs::rename(&p, &backup) {
-                        Ok(()) => Ok(None),
-                        // Бэкап не удался — оригинал не трогаем и не даём
-                        // его молча перезаписать дефолтом.
-                        Err(io_err) => Err(format!(
-                            "pet.json is corrupt ({parse_err}) and backup failed: {io_err}"
-                        )),
+                Ok(mut rec) => {
+                    // Пустой device_id (обрезанный руками файл) — чиним:
+                    // идентификатор генерируется один раз и сохраняется.
+                    if rec.device_id.is_empty() {
+                        rec.device_id = random_device_id();
+                        rec.save_in(dir)?;
                     }
+                    Ok(Some(rec))
                 }
+                Err(parse_err) => backup_corrupt(&p, &parse_err),
             }
         }
 
@@ -229,30 +339,20 @@ mod tests {
 
     #[test]
     fn record_json_roundtrip() {
-        let rec = PetRecord::default();
+        let rec = PetRecord::new("cafe0123deadbeef".to_string());
         let text = serde_json::to_string(&rec).unwrap();
         let back: PetRecord = serde_json::from_str(&text).unwrap();
         assert_eq!(rec, back);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
-        assert!(back.summoned);
-    }
-
-    /// v1-файл (без schema_version/summoned) читается через serde-default —
-    /// это и есть миграция v1 -> v2.
-    #[test]
-    fn v1_record_migrates_via_defaults() {
-        let rec: PetRecord =
-            serde_json::from_str(r#"{"name":"Тестик","attributes":{"size":128}}"#).unwrap();
-        assert_eq!(rec.name, "Тестик");
-        assert_eq!(rec.attributes.size, 128);
-        assert_eq!(rec.schema_version, SCHEMA_VERSION);
-        assert!(rec.summoned, "v1 не знал dismiss — питомец призван");
+        assert_eq!(back.device_id, "cafe0123deadbeef");
     }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fs_tests {
     use super::*;
+    use crate::journal::{fold, EventKind, FoldCfg, Journal};
+    use crate::Stage;
     use std::path::PathBuf;
 
     /// Уникальный временный каталог на тест — без мутации env (ТД-26).
@@ -264,22 +364,23 @@ mod fs_tests {
         dir
     }
 
+    fn assert_device_id_ok(id: &str) {
+        assert_eq!(id.len(), 16, "16 hex-символов: {id}");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "hex: {id}");
+    }
+
     #[test]
     fn save_and_load_roundtrip_in_dir() {
         let dir = tmp_dir("roundtrip");
         assert_eq!(PetRecord::load_in(&dir).unwrap(), None, "файла ещё нет");
 
-        let rec = PetRecord {
-            name: "Пробник".into(),
-            summoned: false,
-            ..PetRecord::default()
-        };
+        let rec = PetRecord::new(crate::journal::random_device_id());
         rec.save_in(&dir).unwrap();
 
         let back = PetRecord::load_in(&dir).unwrap().expect("файл сохранён");
         assert_eq!(back, rec);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
-        assert!(!back.summoned, "dismissed переживает перезапись");
+        assert_device_id_ok(&back.device_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -289,7 +390,7 @@ mod fs_tests {
         std::fs::write(
             record_path_in(&dir),
             format!(
-                r#"{{"schema_version":{},"name":"Из будущего"}}"#,
+                r#"{{"schema_version":{},"device_id":"aa"}}"#,
                 SCHEMA_VERSION + 1
             ),
         )
@@ -330,24 +431,130 @@ mod fs_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Реальный v2-фикстур (то, что писал демон фазы A): миграция в v3
+    /// переносит имя/характеристики/summoned в журнал.
     #[test]
-    fn v1_file_on_disk_loads_and_upgrades_on_save() {
-        let dir = tmp_dir("v1");
+    fn v2_file_migrates_to_v3_journal() {
+        let dir = tmp_dir("v2");
         std::fs::write(
             record_path_in(&dir),
-            r#"{"name":"Старичок","attributes":{"walk_speed":100.0}}"#,
+            r#"{
+  "schema_version": 2,
+  "name": "Старожил",
+  "attributes": {
+    "size": 128,
+    "walk_speed": 64.0,
+    "curiosity": 20,
+    "sleepiness": 10,
+    "sleep_min": 10.0,
+    "sleep_max": 60.0
+  },
+  "summoned": false
+}"#,
         )
         .unwrap();
 
-        let rec = PetRecord::load_in(&dir).unwrap().expect("v1 читается");
-        assert_eq!(rec.name, "Старичок");
-        rec.save_in(&dir).unwrap();
+        let rec = PetRecord::load_in(&dir)
+            .unwrap()
+            .expect("миграция вернула запись");
+        assert_eq!(rec.schema_version, SCHEMA_VERSION);
+        assert_device_id_ok(&rec.device_id);
 
+        // pet.json переписан как v3 и больше не содержит имени.
         let text = std::fs::read_to_string(record_path_in(&dir)).unwrap();
-        assert!(
-            text.contains(&format!("\"schema_version\": {SCHEMA_VERSION}")),
-            "после сохранения файл становится v2: {text}"
-        );
+        assert!(text.contains(&format!("\"schema_version\": {SCHEMA_VERSION}")));
+        assert!(!text.contains("Старожил"), "имя уехало в журнал: {text}");
+
+        // Журнал: Genesis (born_stage = Adult) + Dismissed (summoned=false).
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!(warnings, 0);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0].kind,
+            EventKind::Genesis {
+                born_stage: Stage::Adult,
+                ..
+            }
+        ));
+        assert!(matches!(events[1].kind, EventKind::Dismissed));
+        assert_eq!(events[0].id.device, rec.device_id);
+
+        // Fold отдаёт мигрированного питомца: имя, атрибуты, стадия, dismiss.
+        let now = events[1].id.wall_ms;
+        let pet = fold(&events, now, &FoldCfg::default());
+        assert_eq!(pet.name, "Старожил");
+        assert_eq!(pet.attributes.size, 128);
+        assert_eq!(pet.stage, Stage::Adult, "мигрант не вылупляется заново");
+        assert!(!pet.summoned, "dismiss пережил миграцию");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v1-файл (без schema_version/summoned): те же рельсы миграции,
+    /// summoned по умолчанию true — события Dismissed нет.
+    #[test]
+    fn v1_file_migrates_without_dismissed() {
+        let dir = tmp_dir("v1");
+        std::fs::write(
+            record_path_in(&dir),
+            r#"{"name":"Дедуля","attributes":{"walk_speed":100.0}}"#,
+        )
+        .unwrap();
+
+        let rec = PetRecord::load_in(&dir).unwrap().expect("v1 мигрирует");
+        assert_device_id_ok(&rec.device_id);
+
+        let (events, _) = Journal::open(&dir).unwrap();
+        assert_eq!(events.len(), 1, "только Genesis, питомец был призван");
+        let pet = fold(&events, events[0].id.wall_ms, &FoldCfg::default());
+        assert_eq!(pet.name, "Дедуля");
+        assert_eq!(pet.attributes.walk_speed, 100.0);
+        assert!(pet.summoned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Краш между шагами прошлой миграции: Genesis уже в журнале —
+    /// повторная миграция не плодит второго.
+    #[test]
+    fn migration_is_idempotent_after_crash() {
+        let dir = tmp_dir("idem");
+        std::fs::write(
+            record_path_in(&dir),
+            r#"{"schema_version":2,"name":"Крашик","summoned":true}"#,
+        )
+        .unwrap();
+        let first = PetRecord::load_in(&dir).unwrap().unwrap();
+        let (events_before, _) = Journal::open(&dir).unwrap();
+        assert_eq!(events_before.len(), 1);
+
+        // Откатываем pet.json к v2, журнал оставляем — «упали до перезаписи».
+        std::fs::write(
+            record_path_in(&dir),
+            r#"{"schema_version":2,"name":"Крашик","summoned":true}"#,
+        )
+        .unwrap();
+        let second = PetRecord::load_in(&dir).unwrap().unwrap();
+        let (events_after, _) = Journal::open(&dir).unwrap();
+        assert_eq!(events_after.len(), 1, "Genesis не задублирован");
+        assert_eq!(events_before, events_after);
+        // device_id перегенерирован — это допустимо (важна уникальность).
+        assert_device_id_ok(&first.device_id);
+        assert_device_id_ok(&second.device_id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v3_with_empty_device_id_is_repaired() {
+        let dir = tmp_dir("empty-dev");
+        std::fs::write(
+            record_path_in(&dir),
+            format!(r#"{{"schema_version":{SCHEMA_VERSION},"device_id":""}}"#),
+        )
+        .unwrap();
+        let rec = PetRecord::load_in(&dir).unwrap().unwrap();
+        assert_device_id_ok(&rec.device_id);
+        // Починка сохранена: повторное чтение видит тот же id.
+        let again = PetRecord::load_in(&dir).unwrap().unwrap();
+        assert_eq!(rec, again);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

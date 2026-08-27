@@ -1,10 +1,15 @@
-//! Процедурный плейсхолдер-спрайт M0: круглый «дрифтлинг» с глазами и лапками.
-//! Настоящие паки (.driftpack) придут в M4; интерфейс кадров уже финальный.
+//! Процедурный плейсхолдер-спрайт: круглый «дрифтлинг» с глазами и лапками.
+//! Фаза B добавляет тамагочи-семейства: яйцо, вылупление, еда, настроение,
+//! стадии роста. Настоящие паки (.driftpack) придут в M4; интерфейс кадров
+//! уже финальный.
 
 use crate::behavior::PetState;
+use crate::growth::Stage;
 use crate::pet::Direction;
+use crate::stats::PetStats;
 
-/// Кадр: ARGB8888 (premultiplied не требуется — альфа 0 или 255).
+/// Кадр: ARGB8888. Процедурные спрайты держат альфу 0 или 255; текстовые
+/// кадры (text.rs) хранят premultiplied-альфу — детали там же.
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub w: u32,
@@ -12,7 +17,59 @@ pub struct Frame {
     pub argb: Vec<u32>,
 }
 
-/// Набор кадров под каждое состояние.
+/// Градация настроения для выбора семейства кадров (ТЗ §3.2, фаза B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoodTier {
+    Happy,
+    Ok,
+    Sad,
+    Sick,
+}
+
+/// Кратковременная анимация-оверлей поверх базового состояния.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionLook {
+    Eating,
+    Hatching,
+}
+
+/// Полное описание внешнего вида питомца в кадре: состояние поведения,
+/// стадия роста, градация настроения и опциональный оверлей-экшен.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Look {
+    pub state: PetState,
+    pub stage: Stage,
+    pub mood: MoodTier,
+    pub overlay: Option<ActionLook>,
+}
+
+/// Градация настроения из статов (ТЗ §3.2). Отдельного флага болезни в
+/// статах пока нет — болезнь читается как низкое здоровье.
+pub fn mood_tier(stats: &PetStats) -> MoodTier {
+    if stats.health < 40.0 {
+        MoodTier::Sick
+    } else if stats.mood < 30.0 || stats.satiety < 20.0 {
+        MoodTier::Sad
+    } else if stats.mood > 80.0 && stats.satiety > 60.0 {
+        MoodTier::Happy
+    } else {
+        MoodTier::Ok
+    }
+}
+
+/// Масштаб спрайта по стадии роста (доля от базового размера).
+pub fn stage_scale(stage: Stage) -> f32 {
+    match stage {
+        Stage::Egg => 0.55,
+        Stage::Baby => 0.6,
+        Stage::Child => 0.75,
+        Stage::Teen => 0.9,
+        Stage::Adult => 1.0,
+    }
+}
+
+/// Набор кадров под каждое состояние. Все семейства сгенерированы под один
+/// размер `size`; масштаб стадии применяется при генерации набора.
 #[derive(Debug, Clone)]
 pub struct SpriteSet {
     pub size: u32,
@@ -22,23 +79,62 @@ pub struct SpriteSet {
     pub falling: Vec<Frame>,
     pub dragged: Vec<Frame>,
     pub landing: Vec<Frame>,
+    pub egg: Vec<Frame>,
+    pub hatching: Vec<Frame>,
+    pub eating: Vec<Frame>,
+    pub sad: Vec<Frame>,
+    pub sick: Vec<Frame>,
+    pub happy: Vec<Frame>,
 }
 
 impl SpriteSet {
-    /// Кадр для состояния в момент `t` секунд с входа в состояние.
-    pub fn frame(&self, state: PetState, t: f32, facing: Direction) -> &Frame {
-        let (frames, fps) = match state {
-            PetState::Idle => (&self.idle, 2.0),
-            PetState::Walk => (&self.walk, 6.0),
-            PetState::Sleep => (&self.sleep, 1.0),
-            PetState::Falling => (&self.falling, 8.0),
-            PetState::Dragged => (&self.dragged, 4.0),
-            PetState::Landing => (&self.landing, 6.0),
-        };
-        let idx = ((t * fps) as usize) % frames.len().max(1);
-        let _ = facing; // зеркалирование делает рендер по флагу facing
-        &frames[idx]
+    /// Кадр под полный внешний вид в момент `t` секунд с входа в состояние.
+    /// Приоритет: оверлей-экшен -> стадия яйца -> настроение (только в Idle,
+    /// чтобы походка/сон/падение читались как раньше) -> базовое состояние.
+    pub fn frame_look(&self, look: &Look, t: f32) -> &Frame {
+        if let Some(action) = look.overlay {
+            return match action {
+                ActionLook::Eating => pick(&self.eating, 4.0, t),
+                ActionLook::Hatching => pick(&self.hatching, 2.0, t),
+            };
+        }
+        if look.stage == Stage::Egg {
+            return pick(&self.egg, 1.5, t);
+        }
+        match look.state {
+            PetState::Idle => match look.mood {
+                MoodTier::Happy => pick(&self.happy, 3.0, t),
+                MoodTier::Ok => pick(&self.idle, 2.0, t),
+                MoodTier::Sad => pick(&self.sad, 1.5, t),
+                MoodTier::Sick => pick(&self.sick, 1.5, t),
+            },
+            PetState::Walk => pick(&self.walk, 6.0, t),
+            PetState::Sleep => pick(&self.sleep, 1.0, t),
+            PetState::Falling => pick(&self.falling, 8.0, t),
+            PetState::Dragged => pick(&self.dragged, 4.0, t),
+            PetState::Landing => pick(&self.landing, 6.0, t),
+        }
     }
+
+    /// Тонкая обёртка совместимости (до волны 2): взрослый, нейтральное
+    /// настроение, без оверлеев.
+    pub fn frame(&self, state: PetState, t: f32, facing: Direction) -> &Frame {
+        let _ = facing; // зеркалирование делает рендер по флагу facing
+        self.frame_look(
+            &Look {
+                state,
+                stage: Stage::Adult,
+                mood: MoodTier::Ok,
+                overlay: None,
+            },
+            t,
+        )
+    }
+}
+
+fn pick(frames: &[Frame], fps: f32, t: f32) -> &Frame {
+    let idx = ((t * fps) as usize) % frames.len().max(1);
+    &frames[idx]
 }
 
 const BODY: u32 = 0xff_8a_63_d2; // сиреневый корпус
@@ -46,44 +142,234 @@ const BODY_DARK: u32 = 0xff_6b_47_ad;
 const EYE: u32 = 0xff_1e_1e_2e;
 const EYE_SHINE: u32 = 0xff_ff_ff_ff;
 const CHEEK: u32 = 0xff_e8_9a_c7;
+const SICK_TINT: u32 = 0xff_7d_c4_7d; // зеленоватый оттенок болезни
+const CRUMB: u32 = 0xff_d9_a0_66; // крошка у рта
+const SHELL: u32 = 0xff_ea_e4_f6; // светлая скорлупа
+const SHELL_DARK: u32 = 0xff_c8_bc_e4;
+const SPECKLE: u32 = 0xff_8a_63_d2; // крапинки — фирменный сиреневый
+const CRACK: u32 = 0xff_4d_3f_6e;
 
-/// Сгенерировать набор кадров размером `size` px (квадрат).
+/// Сгенерировать набор кадров размером `size` px (квадрат) для взрослой
+/// формы. Обёртка совместимости над [`placeholder_for_stage`].
 pub fn placeholder(size: u32) -> SpriteSet {
+    placeholder_for_stage(size, Stage::Adult)
+}
+
+/// Сгенерировать набор кадров под стадию роста: базовый размер умножается
+/// на [`stage_scale`], яйцо рисуется собственной формой (не сжатым блобом).
+pub fn placeholder_for_stage(base_size: u32, stage: Stage) -> SpriteSet {
+    let size = (((base_size as f32) * stage_scale(stage)).round() as u32).max(16);
     SpriteSet {
         size,
-        idle: vec![blob(size, 0.0, true, false), blob(size, 0.0, false, false)],
-        walk: vec![
-            blob_shift(size, 0.06, true, 0),
-            blob_shift(size, 0.0, true, 1),
-            blob_shift(size, 0.06, true, 2),
-            blob_shift(size, 0.0, true, 3),
+        idle: vec![
+            blob(size, BlobStyle::default()),
+            blob(
+                size,
+                BlobStyle {
+                    eyes: Eyes::Closed,
+                    ..BlobStyle::default()
+                },
+            ),
         ],
-        sleep: vec![blob(size, 0.12, false, true), blob(size, 0.16, false, true)],
-        falling: vec![blob(size, -0.1, true, false)],
-        dragged: vec![blob(size, -0.05, true, false)],
-        landing: vec![blob(size, 0.22, true, false)],
+        walk: vec![
+            blob_walk(size, 0.06, 0),
+            blob_walk(size, 0.0, 1),
+            blob_walk(size, 0.06, 2),
+            blob_walk(size, 0.0, 3),
+        ],
+        sleep: vec![
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.12,
+                    eyes: Eyes::Closed,
+                    zzz: true,
+                    ..BlobStyle::default()
+                },
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.16,
+                    eyes: Eyes::Closed,
+                    zzz: true,
+                    ..BlobStyle::default()
+                },
+            ),
+        ],
+        falling: vec![blob(
+            size,
+            BlobStyle {
+                squash: -0.1,
+                ..BlobStyle::default()
+            },
+        )],
+        dragged: vec![blob(
+            size,
+            BlobStyle {
+                squash: -0.05,
+                ..BlobStyle::default()
+            },
+        )],
+        landing: vec![blob(
+            size,
+            BlobStyle {
+                squash: 0.22,
+                ..BlobStyle::default()
+            },
+        )],
+        egg: vec![egg_frame(size, 0.05, 0), egg_frame(size, -0.05, 0)],
+        hatching: vec![
+            egg_frame(size, 0.0, 1),
+            egg_frame(size, 0.04, 2),
+            egg_frame(size, -0.04, 3),
+        ],
+        eating: vec![
+            blob(
+                size,
+                BlobStyle {
+                    mouth: Mouth::Open,
+                    crumb: true,
+                    ..BlobStyle::default()
+                },
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    mouth: Mouth::Closed,
+                    crumb: true,
+                    ..BlobStyle::default()
+                },
+            ),
+        ],
+        sad: vec![
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.08,
+                    eyes: Eyes::Droopy,
+                    mouth: Mouth::Sad,
+                    ..BlobStyle::default()
+                },
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.11,
+                    eyes: Eyes::Droopy,
+                    mouth: Mouth::Sad,
+                    ..BlobStyle::default()
+                },
+            ),
+        ],
+        sick: vec![
+            blob(
+                size,
+                BlobStyle {
+                    eyes: Eyes::Droopy,
+                    mouth: Mouth::Wavy,
+                    tint: Some(SICK_TINT),
+                    ..BlobStyle::default()
+                },
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.04,
+                    eyes: Eyes::Droopy,
+                    mouth: Mouth::Wavy,
+                    tint: Some(SICK_TINT),
+                    ..BlobStyle::default()
+                },
+            ),
+        ],
+        happy: vec![
+            blob(size, BlobStyle::default()),
+            blob(
+                size,
+                BlobStyle {
+                    hop: 0.06,
+                    ..BlobStyle::default()
+                },
+            ),
+        ],
     }
 }
 
-fn blob(size: u32, squash: f32, eyes_open: bool, zzz: bool) -> Frame {
-    blob_impl(size, squash, eyes_open, zzz, None)
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Eyes {
+    Open,
+    Closed,
+    Droopy,
 }
 
-fn blob_shift(size: u32, squash: f32, eyes_open: bool, step: u8) -> Frame {
-    blob_impl(size, squash, eyes_open, false, Some(step))
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mouth {
+    None,
+    Open,
+    Closed,
+    Sad,
+    Wavy,
+}
+
+/// Параметры отрисовки блоба; собираются в семейства в `placeholder_for_stage`.
+#[derive(Debug, Clone, Copy)]
+struct BlobStyle {
+    /// Прижатие тела: >0 — сплющен, <0 — вытянут.
+    squash: f32,
+    eyes: Eyes,
+    /// «Z z» над головой у спящего.
+    zzz: bool,
+    /// Фаза шага при ходьбе (лапки в противофазе).
+    walk_step: Option<u8>,
+    mouth: Mouth,
+    /// Крошка у рта (кадры еды).
+    crumb: bool,
+    /// Подмешать цвет к телу (болезнь).
+    tint: Option<u32>,
+    /// Подъём тела над землёй в долях размера (прыжок радости).
+    hop: f32,
+}
+
+impl Default for BlobStyle {
+    fn default() -> Self {
+        Self {
+            squash: 0.0,
+            eyes: Eyes::Open,
+            zzz: false,
+            walk_step: None,
+            mouth: Mouth::None,
+            crumb: false,
+            tint: None,
+            hop: 0.0,
+        }
+    }
+}
+
+fn blob_walk(size: u32, squash: f32, step: u8) -> Frame {
+    blob(
+        size,
+        BlobStyle {
+            squash,
+            walk_step: Some(step),
+            ..BlobStyle::default()
+        },
+    )
 }
 
 /// Рисуем эллипс-тело с прижатием `squash`, глаза, щёки и лапки.
-fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Option<u8>) -> Frame {
+fn blob(size: u32, st: BlobStyle) -> Frame {
     let s = size as f32;
     let mut argb = vec![0u32; (size * size) as usize];
 
     let cx = s / 2.0;
     let rx = s * 0.38;
-    let ry = s * 0.34 * (1.0 - squash);
-    // Тело стоит на нижней кромке кадра (минус место под лапки).
+    let ry = s * 0.34 * (1.0 - st.squash);
+    // Тело стоит на нижней кромке кадра (минус место под лапки);
+    // hop поднимает всё тело над землёй.
     let foot_h = s * 0.06;
-    let cy = s - foot_h - ry;
+    let lift_all = st.hop * s;
+    let cy = s - foot_h - ry - lift_all;
 
     for y in 0..size {
         for x in 0..size {
@@ -98,7 +384,7 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
     }
 
     // Лапки: две полукруглые ножки; при ходьбе шагают в противофазе.
-    let (lift_l, lift_r) = match walk_step {
+    let (lift_l, lift_r) = match st.walk_step {
         Some(0) => (foot_h * 0.9, 0.0),
         Some(2) => (0.0, foot_h * 0.9),
         _ => (0.0, 0.0),
@@ -108,29 +394,54 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
             &mut argb,
             size,
             fx,
-            s - foot_h / 2.0 - lift,
+            s - foot_h / 2.0 - lift - lift_all,
             foot_h * 0.9,
             BODY_DARK,
         );
     }
 
+    // Оттенок болезни: подмешивается к телу до лица, чтобы глаза остались чистыми.
+    if let Some(tint) = st.tint {
+        for px in argb.iter_mut() {
+            if *px >> 24 != 0 {
+                *px = mix(*px, tint, 0.35);
+            }
+        }
+    }
+
     // Глаза.
     let ey = cy - ry * 0.15;
-    for ex in [cx - rx * 0.38, cx + rx * 0.38] {
-        if eyes_open {
-            fill_circle(&mut argb, size, ex, ey, s * 0.045, EYE);
-            fill_circle(
-                &mut argb,
-                size,
-                ex + s * 0.012,
-                ey - s * 0.012,
-                s * 0.015,
-                EYE_SHINE,
-            );
-        } else {
-            // Закрытый глаз — короткая дуга.
-            for dx in -3i32..=3 {
-                put(&mut argb, size, (ex + dx as f32) as i32, ey as i32, EYE);
+    for (side, ex) in [(-1i32, cx - rx * 0.38), (1, cx + rx * 0.38)] {
+        match st.eyes {
+            Eyes::Open => {
+                fill_circle(&mut argb, size, ex, ey, s * 0.045, EYE);
+                fill_circle(
+                    &mut argb,
+                    size,
+                    ex + s * 0.012,
+                    ey - s * 0.012,
+                    s * 0.015,
+                    EYE_SHINE,
+                );
+            }
+            Eyes::Closed => {
+                // Закрытый глаз — короткая дуга.
+                for dx in -3i32..=3 {
+                    put(&mut argb, size, (ex + dx as f32) as i32, ey as i32, EYE);
+                }
+            }
+            Eyes::Droopy => {
+                // Поникший глаз: линия со свисающим внешним краем.
+                for dx in -3i32..=3 {
+                    let droop = if dx * side > 0 { dx * side / 2 } else { 0 };
+                    put(
+                        &mut argb,
+                        size,
+                        (ex + dx as f32) as i32,
+                        ey as i32 + droop,
+                        EYE,
+                    );
+                }
             }
         }
     }
@@ -140,8 +451,52 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
         fill_circle(&mut argb, size, ex, ey + ry * 0.35, s * 0.03, CHEEK);
     }
 
+    // Рот.
+    let my = ey + ry * 0.35;
+    match st.mouth {
+        Mouth::None => {}
+        Mouth::Open => fill_circle(&mut argb, size, cx, my, s * 0.035, EYE),
+        Mouth::Closed => {
+            for dx in -3i32..=3 {
+                put(&mut argb, size, cx as i32 + dx, my as i32, EYE);
+            }
+        }
+        Mouth::Sad => {
+            // Дуга уголками вниз.
+            for dx in -4i32..=4 {
+                put(
+                    &mut argb,
+                    size,
+                    cx as i32 + dx,
+                    my as i32 + dx * dx / 8,
+                    EYE,
+                );
+            }
+        }
+        Mouth::Wavy => {
+            // Волнистый рот — питомцу мутит.
+            const WAVE: [i32; 4] = [0, 1, 0, -1];
+            for dx in -4i32..=4 {
+                let off = WAVE[((dx + 4) % 4) as usize];
+                put(&mut argb, size, cx as i32 + dx, my as i32 + off, EYE);
+            }
+        }
+    }
+
+    // Крошка у рта (кадры еды).
+    if st.crumb {
+        fill_circle(
+            &mut argb,
+            size,
+            cx + rx * 0.35,
+            my + s * 0.04,
+            s * 0.02,
+            CRUMB,
+        );
+    }
+
     // «Z z» над головой у спящего.
-    if zzz {
+    if st.zzz {
         let zx = (cx + rx * 0.7) as i32;
         let zy = (cy - ry - s * 0.08) as i32;
         draw_z(&mut argb, size, zx, zy, 5, EYE);
@@ -155,13 +510,140 @@ fn blob_impl(size: u32, squash: f32, eyes_open: bool, zzz: bool, walk_step: Opti
     }
 }
 
+/// Яйцо: собственная форма (не сжатый блоб) — скорлупа сужается кверху,
+/// крапинки фирменного сиреневого. `tilt` — покачивание сдвигом верхушки,
+/// `cracks` 0..=3 — растущие трещины вылупления.
+fn egg_frame(size: u32, tilt: f32, cracks: u8) -> Frame {
+    let s = size as f32;
+    let mut argb = vec![0u32; (size * size) as usize];
+
+    let cx0 = s / 2.0;
+    let rx = s * 0.30;
+    let ry = s * 0.38;
+    let cy = s - ry - s * 0.04;
+
+    for y in 0..size {
+        let fy = y as f32;
+        let vy = (fy - cy) / ry;
+        if vy.abs() > 1.0 {
+            continue;
+        }
+        // Верхняя половина уже нижней — силуэт яйца.
+        let pinch = if vy < 0.0 { 1.0 + 0.22 * vy } else { 1.0 };
+        // Покачивание: верх смещается сильнее низа.
+        let cx = cx0 + tilt * (cy - fy);
+        for x in 0..size {
+            let vx = (x as f32 - cx) / (rx * pinch);
+            let d = vx * vx + vy * vy;
+            if d <= 1.0 {
+                let i = (y * size + x) as usize;
+                argb[i] = if d > 0.82 { SHELL_DARK } else { SHELL };
+            }
+        }
+    }
+
+    // Крапинки: фиксированные позиции в координатах яйца (детерминизм).
+    const SPECKLES: [(f32, f32); 5] = [
+        (-0.35, -0.1),
+        (0.25, -0.45),
+        (0.1, 0.2),
+        (-0.15, 0.45),
+        (0.4, 0.15),
+    ];
+    for (ox, oy) in SPECKLES {
+        let sy = cy + oy * ry;
+        let sx = cx0 + ox * rx + tilt * (cy - sy);
+        fill_circle_inside(&mut argb, size, sx, sy, s * 0.03, SPECKLE);
+    }
+
+    // Трещины: ломаные от макушки вниз, растут с каждым кадром вылупления.
+    let top = cy - ry * 0.9;
+    if cracks >= 1 {
+        crack_line(
+            &mut argb,
+            size,
+            cx0,
+            top,
+            &[(2.0, 4.0), (-2.0, 4.0), (3.0, 4.0)],
+            s,
+        );
+    }
+    if cracks >= 2 {
+        crack_line(
+            &mut argb,
+            size,
+            cx0 - rx * 0.4,
+            top + ry * 0.25,
+            &[(-2.0, 3.0), (2.0, 4.0), (-3.0, 4.0)],
+            s,
+        );
+    }
+    if cracks >= 3 {
+        crack_line(
+            &mut argb,
+            size,
+            cx0 + rx * 0.45,
+            top + ry * 0.35,
+            &[(3.0, 3.0), (-2.0, 4.0), (2.0, 5.0), (-3.0, 4.0)],
+            s,
+        );
+    }
+
+    Frame {
+        w: size,
+        h: size,
+        argb,
+    }
+}
+
+/// Ломаная трещина: шаги в долях 1/32 размера, рисуем только по скорлупе.
+fn crack_line(argb: &mut [u32], size: u32, x0: f32, y0: f32, steps: &[(f32, f32)], s: f32) {
+    let k = s / 32.0;
+    let (mut x, mut y) = (x0, y0);
+    for (dx, dy) in steps {
+        let (nx, ny) = (x + dx * k, y + dy * k);
+        line_inside(argb, size, x, y, nx, ny, CRACK);
+        (x, y) = (nx, ny);
+    }
+}
+
+/// Отрезок, рисуемый только поверх уже непрозрачных пикселей.
+fn line_inside(argb: &mut [u32], size: u32, x0: f32, y0: f32, x1: f32, y1: f32, c: u32) {
+    let n = ((x1 - x0).abs().max((y1 - y0).abs()).ceil() as i32).max(1);
+    for i in 0..=n {
+        let t = i as f32 / n as f32;
+        let x = (x0 + (x1 - x0) * t) as i32;
+        let y = (y0 + (y1 - y0) * t) as i32;
+        put_inside(argb, size, x, y, c);
+    }
+}
+
 fn put(argb: &mut [u32], size: u32, x: i32, y: i32, c: u32) {
     if x >= 0 && y >= 0 && (x as u32) < size && (y as u32) < size {
         argb[(y as u32 * size + x as u32) as usize] = c;
     }
 }
 
+/// Как `put`, но только поверх уже непрозрачных пикселей (не за силуэтом).
+fn put_inside(argb: &mut [u32], size: u32, x: i32, y: i32, c: u32) {
+    if x >= 0 && y >= 0 && (x as u32) < size && (y as u32) < size {
+        let i = (y as u32 * size + x as u32) as usize;
+        if argb[i] >> 24 != 0 {
+            argb[i] = c;
+        }
+    }
+}
+
 fn fill_circle(argb: &mut [u32], size: u32, cx: f32, cy: f32, r: f32, c: u32) {
+    fill_circle_impl(argb, size, cx, cy, r, c, false);
+}
+
+/// Круг только поверх непрозрачных пикселей (крапинки скорлупы).
+fn fill_circle_inside(argb: &mut [u32], size: u32, cx: f32, cy: f32, r: f32, c: u32) {
+    fill_circle_impl(argb, size, cx, cy, r, c, true);
+}
+
+fn fill_circle_impl(argb: &mut [u32], size: u32, cx: f32, cy: f32, r: f32, c: u32, inside: bool) {
     let (x0, x1) = ((cx - r) as i32, (cx + r) as i32);
     let (y0, y1) = ((cy - r) as i32, (cy + r) as i32);
     for y in y0..=y1 {
@@ -169,10 +651,24 @@ fn fill_circle(argb: &mut [u32], size: u32, cx: f32, cy: f32, r: f32, c: u32) {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             if dx * dx + dy * dy <= r * r {
-                put(argb, size, x, y, c);
+                if inside {
+                    put_inside(argb, size, x, y, c);
+                } else {
+                    put(argb, size, x, y, c);
+                }
             }
         }
     }
+}
+
+/// Смешение непрозрачных ARGB-цветов: `k` — доля `b`.
+fn mix(a: u32, b: u32, k: f32) -> u32 {
+    let ch = |sh: u32| {
+        let ca = ((a >> sh) & 0xff) as f32;
+        let cb = ((b >> sh) & 0xff) as f32;
+        ((ca + (cb - ca) * k) as u32) & 0xff
+    };
+    0xff00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// Буква Z из трёх штрихов размера `n`.
@@ -188,24 +684,62 @@ fn draw_z(argb: &mut [u32], size: u32, x: i32, y: i32, n: i32, c: u32) {
 mod tests {
     use super::*;
 
+    const STAGES: [Stage; 5] = [
+        Stage::Egg,
+        Stage::Baby,
+        Stage::Child,
+        Stage::Teen,
+        Stage::Adult,
+    ];
+
+    fn families(set: &SpriteSet) -> [(&'static str, &Vec<Frame>); 12] {
+        [
+            ("idle", &set.idle),
+            ("walk", &set.walk),
+            ("sleep", &set.sleep),
+            ("falling", &set.falling),
+            ("dragged", &set.dragged),
+            ("landing", &set.landing),
+            ("egg", &set.egg),
+            ("hatching", &set.hatching),
+            ("eating", &set.eating),
+            ("sad", &set.sad),
+            ("sick", &set.sick),
+            ("happy", &set.happy),
+        ]
+    }
+
     #[test]
     fn frames_have_pixels() {
         let set = placeholder(96);
-        for frames in [
-            &set.idle,
-            &set.walk,
-            &set.sleep,
-            &set.falling,
-            &set.dragged,
-            &set.landing,
-        ] {
-            assert!(!frames.is_empty());
+        for (name, frames) in families(&set) {
+            assert!(!frames.is_empty(), "{name}: нет кадров");
             for f in frames.iter() {
                 assert_eq!((f.w, f.h), (96, 96));
                 assert!(
                     f.argb.iter().any(|&p| p >> 24 != 0),
-                    "кадр не должен быть пустым"
+                    "{name}: кадр не должен быть пустым"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn every_stage_has_nonempty_families() {
+        for stage in STAGES {
+            let set = placeholder_for_stage(96, stage);
+            assert_eq!(
+                set.size,
+                ((96.0 * stage_scale(stage)).round() as u32).max(16)
+            );
+            for (name, frames) in families(&set) {
+                assert!(!frames.is_empty(), "{stage:?}/{name}: нет кадров");
+                for f in frames.iter() {
+                    assert!(
+                        f.argb.iter().any(|&p| p >> 24 != 0),
+                        "{stage:?}/{name}: кадр не должен быть пустым"
+                    );
+                }
             }
         }
     }
@@ -216,5 +750,145 @@ mod tests {
         let a = set.frame(PetState::Walk, 0.0, Direction::Right) as *const _;
         let b = set.frame(PetState::Walk, 0.5, Direction::Right) as *const _;
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn mood_tier_thresholds() {
+        let base = PetStats::default();
+        assert_eq!(mood_tier(&base), MoodTier::Happy);
+        assert_eq!(
+            mood_tier(&PetStats {
+                health: 39.0,
+                ..base
+            }),
+            MoodTier::Sick
+        );
+        assert_eq!(mood_tier(&PetStats { mood: 29.0, ..base }), MoodTier::Sad);
+        assert_eq!(
+            mood_tier(&PetStats {
+                satiety: 19.0,
+                ..base
+            }),
+            MoodTier::Sad
+        );
+        assert_eq!(mood_tier(&PetStats { mood: 70.0, ..base }), MoodTier::Ok);
+        assert_eq!(
+            mood_tier(&PetStats {
+                mood: 85.0,
+                satiety: 61.0,
+                ..base
+            }),
+            MoodTier::Happy
+        );
+    }
+
+    fn in_family(frame: &Frame, family: &[Frame]) -> bool {
+        family.iter().any(|f| core::ptr::eq(f, frame))
+    }
+
+    #[test]
+    fn frame_look_selects_families() {
+        let set = placeholder_for_stage(96, Stage::Egg);
+        let egg_look = Look {
+            state: PetState::Idle,
+            stage: Stage::Egg,
+            mood: MoodTier::Ok,
+            overlay: None,
+        };
+        assert!(in_family(set.frame_look(&egg_look, 0.0), &set.egg));
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    overlay: Some(ActionLook::Hatching),
+                    ..egg_look
+                },
+                0.0
+            ),
+            &set.hatching
+        ));
+
+        let set = placeholder(96);
+        let idle = Look {
+            state: PetState::Idle,
+            stage: Stage::Adult,
+            mood: MoodTier::Ok,
+            overlay: None,
+        };
+        assert!(in_family(set.frame_look(&idle, 0.0), &set.idle));
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    mood: MoodTier::Sad,
+                    ..idle
+                },
+                0.0
+            ),
+            &set.sad
+        ));
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    mood: MoodTier::Sick,
+                    ..idle
+                },
+                0.0
+            ),
+            &set.sick
+        ));
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    mood: MoodTier::Happy,
+                    ..idle
+                },
+                0.0
+            ),
+            &set.happy
+        ));
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    overlay: Some(ActionLook::Eating),
+                    ..idle
+                },
+                0.0
+            ),
+            &set.eating
+        ));
+        // Настроение не ломает не-Idle состояния.
+        assert!(in_family(
+            set.frame_look(
+                &Look {
+                    state: PetState::Sleep,
+                    mood: MoodTier::Sad,
+                    ..idle
+                },
+                0.0
+            ),
+            &set.sleep
+        ));
+    }
+
+    #[test]
+    fn stage_scale_is_monotonic() {
+        let scales: Vec<f32> = STAGES.iter().map(|s| stage_scale(*s)).collect();
+        assert!(scales.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(stage_scale(Stage::Adult), 1.0);
+    }
+
+    #[test]
+    fn sick_frames_are_tinted() {
+        let set = placeholder(96);
+        // У больного тело зеленее здорового: сравним пиксели тел.
+        let healthy = &set.idle[0];
+        let sick = &set.sick[0];
+        let greenness = |f: &Frame| -> u64 {
+            f.argb
+                .iter()
+                .filter(|&&p| p >> 24 != 0)
+                .map(|&p| ((p >> 8) & 0xff) as u64)
+                .sum::<u64>()
+        };
+        assert!(greenness(sick) > greenness(healthy));
     }
 }
