@@ -75,6 +75,17 @@ tray-dismiss = Remove from screen
 tray-settings = Settings
 tray-quit = Stop the daemon
 
+# --- pet context menu (B3, right-click on the pet) ---
+menu-feed = Feed
+menu-treat = Treat
+menu-play = Play
+menu-sleep = Put to sleep
+menu-settings = Settings
+menu-dismiss = Remove from screen
+
+# --- speech bubbles (B5/B6) ---
+bubble-hello = Hi!
+
 # --- pet ---
 # The default name is written into the journal's Genesis event exactly
 # once, at the pet's birth (it is data and survives locale changes).

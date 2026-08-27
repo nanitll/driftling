@@ -31,6 +31,11 @@ confidence-threshold = 0.9
 crate = "epaint_default_fonts"
 allow = ["OFL-1.1", "Ubuntu-font-1.0"]
 
+# Трей (B7): ksni распространяется как Unlicense (public domain) — только он.
+[[licenses.exceptions]]
+crate = "ksni"
+allow = ["Unlicense"]
+
 [bans]
 # Дубликаты версий не блокируют сборку — только предупреждают.
 multiple-versions = "warn"

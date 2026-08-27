@@ -18,12 +18,12 @@ mod i18n;
 use i18n::fl;
 
 use driftling_core::sprite::{placeholder, Frame};
-use driftling_core::PetAttributes;
+use driftling_core::{PetAttributes, PetStats, Stage};
 use driftling_ipc::{call, Request, Response};
 use eframe::egui::{
     self, Align2, Button, CollapsingHeader, Color32, CornerRadius, DragValue, FontData,
-    FontDefinitions, FontFamily, FontId, Label, Layout, Margin, RichText, ScrollArea, Sense,
-    Slider, Stroke, StrokeKind, TextStyle, TextureHandle, TextureOptions,
+    FontDefinitions, FontFamily, FontId, Key, Label, Layout, Margin, RichText, ScrollArea, Sense,
+    Slider, Stroke, StrokeKind, TextEdit, TextStyle, TextureHandle, TextureOptions,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +78,42 @@ fn state_color(state: Option<&str>) -> Color32 {
         Some("Falling" | "Dragged" | "Landing") => AMBER,
         Some(_) => MUTED,
     }
+}
+
+/// Ключ Fluent подписи стадии роста — чистое отображение, тесты сверяют
+/// его с fl!-рендером каждого ключа (compile-time проверка ключей).
+fn stage_key(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Egg => "stage-egg",
+        Stage::Baby => "stage-baby",
+        Stage::Child => "stage-child",
+        Stage::Teen => "stage-teen",
+        Stage::Adult => "stage-adult",
+    }
+}
+
+/// Локализованная подпись стадии роста для чипа на карточке питомца.
+fn stage_label(stage: Stage) -> String {
+    crate::i18n::loader().get(stage_key(stage))
+}
+
+/// Цвет бара стата ухода (0..=100): выше 60 — зелёный, 30..=60 — янтарный,
+/// ниже 30 — красный (пора ухаживать).
+fn stat_bar_color(v: f32) -> Color32 {
+    if v > 60.0 {
+        SUCCESS
+    } else if v >= 30.0 {
+        AMBER
+    } else {
+        DANGER
+    }
+}
+
+/// Клиентская валидация нового имени: непустое после trim (демон делает
+/// то же самое, но мы не хотим гонять заведомо пустой запрос).
+fn valid_pet_name(name: &str) -> Option<&str> {
+    let trimmed = name.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// Доля значения на шкале min..max (для прогресс-баров характеристик).
@@ -283,6 +319,10 @@ struct PetSnapshot {
     name: String,
     state: Option<String>,
     attributes: PetAttributes,
+    /// Статы тамагочи (сытость/энергия/настроение + скрытое здоровье).
+    stats: PetStats,
+    /// Стадия роста (локализуется на нашей стороне).
+    stage: Stage,
     uptime_secs: u64,
 }
 
@@ -329,6 +369,8 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
             name,
             state,
             attributes,
+            stats,
+            stage,
             uptime_secs,
         });
     }
@@ -613,8 +655,9 @@ fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     response
 }
 
-/// Строка характеристики: подпись, значение, опциональный тонкий бар.
-fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, frac: Option<f32>) {
+/// Строка характеристики: подпись, значение, опциональный тонкий бар
+/// (доля 0..=1 и цвет заливки).
+fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, frac: Option<(f32, Color32)>) {
     let h = 26.0;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), Sense::hover());
     let p = ui.painter();
@@ -633,7 +676,7 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, frac: Option<f32>) {
         FontId::proportional(15.0),
         TEXT,
     );
-    if let Some(f) = frac {
+    if let Some((f, color)) = frac {
         let bar = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 280.0, cy - 3.0),
             egui::pos2(rect.right(), cy + 3.0),
@@ -645,7 +688,7 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: &str, frac: Option<f32>) {
                 p.rect_filled(
                     egui::Rect::from_min_size(bar.min, egui::vec2(w, bar.height())),
                     3.0,
-                    ACCENT,
+                    color,
                 );
             }
         }
@@ -748,6 +791,12 @@ struct SettingsApp {
     debug_action: Arc<Mutex<Option<String>>>,
     autostart: bool,
     autostart_result: Option<String>,
+    /// Имя питомца сейчас редактируется инлайн (карандаш на карточке).
+    renaming: bool,
+    /// Буфер строки редактирования имени.
+    rename_buf: String,
+    /// Одноразовый запрос фокуса в поле имени (взводится карандашом).
+    rename_focus: bool,
     /// Время постановки кнопки остановки «на взвод» (подтверждение).
     stop_armed_at: Option<f64>,
     /// Форма дебаг-панели; один раз синкается с живым PetInfo.
@@ -780,6 +829,9 @@ impl SettingsApp {
             debug_action: Arc::new(Mutex::new(None)),
             autostart: autostart_enabled(),
             autostart_result: None,
+            renaming: false,
+            rename_buf: String::new(),
+            rename_focus: false,
             stop_armed_at: None,
             form: PetAttributes::default(),
             form_synced: false,
@@ -796,6 +848,26 @@ impl SettingsApp {
             Arc::clone(&self.poll),
             ui.ctx().clone(),
         );
+    }
+
+    /// П-5: запустить демона — бинарь `driftling` рядом с текущим (как в
+    /// `daemon_exec`), отсоединённо (`spawn`, без ожидания), затем быстрый
+    /// повторный опрос, чтобы статус ожил раньше секундного поллера.
+    fn start_daemon(&self, ctx: &egui::Context, slot: &Arc<Mutex<Option<String>>>) {
+        let exec = daemon_exec();
+        let msg = match std::process::Command::new(&exec).spawn() {
+            Ok(_) => fl!("msg-daemon-starting"),
+            Err(e) => fl!("generic-error", error = e.to_string()),
+        };
+        *slot.lock().unwrap() = Some(msg);
+        let poll = Arc::clone(&self.poll);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // Демону нужно мгновение, чтобы занять сокет.
+            std::thread::sleep(Duration::from_millis(700));
+            poll_once(&poll);
+            ctx.request_repaint();
+        });
     }
 
     // -- Сайдбар ------------------------------------------------------------
@@ -867,6 +939,107 @@ impl SettingsApp {
 
     // -- Страница «Питомец» -------------------------------------------------
 
+    /// Имя питомца: подпись с карандашом либо инлайн-редактор. Enter или
+    /// кнопка — применить (`Request::Rename`), Esc — отмена; пустое имя
+    /// отбрасывается ещё на клиенте.
+    fn name_row(&mut self, ui: &mut egui::Ui, st: &PollState, name: &str) {
+        let can_rename = st.up && st.info.is_some();
+        if !self.renaming {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(name)
+                        .size(20.0)
+                        .family(semibold_family())
+                        .color(TEXT),
+                );
+                if can_rename {
+                    let pencil = ui
+                        .add(
+                            Button::new(RichText::new("✏").size(14.0).color(MUTED))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text(fl!("rename-hint"));
+                    if pencil.clicked() {
+                        self.renaming = true;
+                        self.rename_focus = true;
+                        self.rename_buf = name.to_string();
+                    }
+                }
+            });
+            return;
+        }
+        // Демон пропал посреди редактирования — тихо выходим из режима.
+        if !can_rename {
+            self.renaming = false;
+            return;
+        }
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                TextEdit::singleline(&mut self.rename_buf)
+                    .desired_width(200.0)
+                    .font(TextStyle::Body),
+            );
+            if self.rename_focus {
+                resp.request_focus();
+                self.rename_focus = false;
+            }
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let applied = primary_button(ui, &fl!("btn-apply"), true).clicked() || entered;
+            if ui.input(|i| i.key_pressed(Key::Escape)) {
+                self.renaming = false;
+            } else if applied {
+                match valid_pet_name(&self.rename_buf) {
+                    Some(new_name) => {
+                        self.renaming = false;
+                        self.action(
+                            ui,
+                            Request::Rename(new_name.to_string()),
+                            fl!("msg-renamed"),
+                            &self.pet_action,
+                        );
+                    }
+                    None => {
+                        *self.pet_action.lock().unwrap() = Some(fl!("msg-rename-empty"));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Карточка «Состояние»: видимые статы ухода (сытость/энергия/
+    /// настроение) с цветными барами. Здоровье — скрытый стат, в обычном
+    /// режиме не показывается (только в --debug).
+    fn condition_card(&mut self, ui: &mut egui::Ui, st: &PollState) {
+        card(ui, |ui| {
+            section_label(ui, &fl!("section-condition"));
+            ui.add_space(2.0);
+            match &st.info {
+                Some(i) => {
+                    let s = i.stats;
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let rows = [
+                        (fl!("stat-satiety"), s.satiety),
+                        (fl!("stat-energy"), s.energy),
+                        (fl!("stat-mood"), s.mood),
+                    ];
+                    for (label, v) in rows {
+                        stat_row(
+                            ui,
+                            &label,
+                            &format!("{:.0}/100", v),
+                            Some((v / 100.0, stat_bar_color(v))),
+                        );
+                    }
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                }
+                None => {
+                    ui.label(RichText::new(fl!("condition-unavailable")).color(MUTED));
+                }
+            }
+        });
+    }
+
     fn hero_card(&mut self, ui: &mut egui::Ui, st: &PollState) {
         let info = st.info.clone();
         card(ui, |ui| {
@@ -904,21 +1077,22 @@ impl SettingsApp {
                         .as_ref()
                         .map(|i| i.name.clone())
                         .unwrap_or_else(|| fl!("default-pet-name"));
-                    ui.label(
-                        RichText::new(name)
-                            .size(20.0)
-                            .family(semibold_family())
-                            .color(TEXT),
-                    );
+                    self.name_row(ui, st, &name);
                     ui.add_space(2.0);
-                    ui.horizontal(|ui| match (&st.checked, &st.up, &info) {
-                        (false, ..) => badge(ui, &fl!("badge-checking"), MUTED),
-                        (true, false, _) => badge(ui, &fl!("daemon-not-running"), DANGER),
-                        (true, true, Some(i)) => {
-                            let s = i.state.as_deref();
-                            badge(ui, &state_label(s), state_color(s));
+                    ui.horizontal(|ui| {
+                        match (&st.checked, &st.up, &info) {
+                            (false, ..) => badge(ui, &fl!("badge-checking"), MUTED),
+                            (true, false, _) => badge(ui, &fl!("daemon-not-running"), DANGER),
+                            (true, true, Some(i)) => {
+                                let s = i.state.as_deref();
+                                badge(ui, &state_label(s), state_color(s));
+                            }
+                            (true, true, None) => badge(ui, &fl!("badge-no-data"), MUTED),
                         }
-                        (true, true, None) => badge(ui, &fl!("badge-no-data"), MUTED),
+                        // Чип стадии роста — приглушённый, рядом с состоянием.
+                        if let (true, Some(i)) = (st.up, &info) {
+                            badge(ui, &stage_label(i.stage), MUTED);
+                        }
                     });
                     if st.up {
                         if let Some(i) = &info {
@@ -933,6 +1107,19 @@ impl SettingsApp {
                         }
                     }
                     ui.add_space(6.0);
+
+                    // Демон не запущен — подсказка и кнопка запуска (П-5).
+                    if st.checked && !st.up {
+                        ui.label(
+                            RichText::new(fl!("daemon-down-hint"))
+                                .size(12.5)
+                                .color(MUTED),
+                        );
+                        if primary_button(ui, &fl!("btn-start-daemon"), true).clicked() {
+                            self.start_daemon(ui.ctx(), &self.pet_action);
+                        }
+                        ui.add_space(4.0);
+                    }
 
                     let present = info.as_ref().is_some_and(|i| i.state.is_some());
                     ui.horizontal(|ui| {
@@ -952,6 +1139,34 @@ impl SettingsApp {
                                 fl!("msg-pet-dismissed"),
                                 &self.pet_action,
                             );
+                        }
+                    });
+                    // Уход: активен только когда демон жив и питомец на экране.
+                    // Ряд переносится, чтобы кнопки не резались краем карточки.
+                    let care = st.up && present;
+                    ui.horizontal_wrapped(|ui| {
+                        let buttons = [
+                            (
+                                fl!("btn-feed"),
+                                Request::Feed { treat: false },
+                                fl!("msg-fed"),
+                            ),
+                            (
+                                fl!("btn-treat"),
+                                Request::Feed { treat: true },
+                                fl!("msg-treat-given"),
+                            ),
+                            (fl!("btn-play"), Request::Play, fl!("msg-played")),
+                            (
+                                fl!("btn-sleep"),
+                                Request::PutToSleep,
+                                fl!("msg-put-to-sleep"),
+                            ),
+                        ];
+                        for (label, req, ok) in buttons {
+                            if outline_button(ui, &label, ACCENT_LIGHT, care).clicked() {
+                                self.action(ui, req, ok, &self.pet_action);
+                            }
                         }
                     });
                     if let Some(text) = &*self.pet_action.lock().unwrap() {
@@ -977,19 +1192,19 @@ impl SettingsApp {
                         ui,
                         &fl!("stat-speed"),
                         &fl!("stat-speed-value", value = format!("{:.0}", a.walk_speed)),
-                        Some(norm(a.walk_speed, 5.0, 400.0)),
+                        Some((norm(a.walk_speed, 5.0, 400.0), ACCENT)),
                     );
                     stat_row(
                         ui,
                         &fl!("stat-curiosity"),
                         &format!("{}/100", a.curiosity),
-                        Some(a.curiosity as f32 / 100.0),
+                        Some((a.curiosity as f32 / 100.0, ACCENT)),
                     );
                     stat_row(
                         ui,
                         &fl!("stat-sleepiness"),
                         &format!("{}/100", a.sleepiness),
-                        Some(a.sleepiness as f32 / 100.0),
+                        Some((a.sleepiness as f32 / 100.0, ACCENT)),
                     );
                     stat_row(
                         ui,
@@ -1036,6 +1251,8 @@ impl SettingsApp {
         page_title(ui, &fl!("nav-pet"));
         ui.add_space(4.0);
         self.hero_card(ui, &st);
+        ui.add_space(2.0);
+        self.condition_card(ui, &st);
         ui.add_space(2.0);
         self.stats_card(ui, &st);
     }
@@ -1093,6 +1310,11 @@ impl SettingsApp {
                 }
             });
             ui.add_space(2.0);
+
+            // Демон не запущен — основная кнопка запуска (П-5).
+            if checked && !up && primary_button(ui, &fl!("btn-start-daemon"), true).clicked() {
+                self.start_daemon(ui.ctx(), &self.daemon_action);
+            }
 
             // Подтверждение вторым кликом; взвод сбрасывается через 3 с.
             let now = ui.input(|i| i.time);
@@ -1198,6 +1420,50 @@ impl SettingsApp {
             if let Some(text) = &*self.debug_action.lock().unwrap() {
                 ui.label(RichText::new(text).size(12.5).color(MUTED));
             }
+        });
+        ui.add_space(2.0);
+
+        // Сырые статы, включая скрытое здоровье (в обычном UI его нет).
+        card(ui, |ui| {
+            section_label(ui, &fl!("section-raw-stats"));
+            ui.add_space(2.0);
+            let info = self.poll.lock().unwrap().info.clone();
+            match info {
+                Some(i) => {
+                    let s = i.stats;
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    let rows = [
+                        (fl!("stat-satiety"), s.satiety),
+                        (fl!("stat-energy"), s.energy),
+                        (fl!("stat-mood"), s.mood),
+                        (fl!("stat-health"), s.health),
+                    ];
+                    for (label, v) in rows {
+                        stat_row(
+                            ui,
+                            &label,
+                            &format!("{v:.1}/100"),
+                            Some((v / 100.0, stat_bar_color(v))),
+                        );
+                    }
+                    stat_row(
+                        ui,
+                        &fl!("stat-stage"),
+                        &format!("{} ({})", stage_label(i.stage), i.stage.as_str()),
+                        None,
+                    );
+                    ui.spacing_mut().item_spacing.y = 10.0;
+                }
+                None => {
+                    ui.label(RichText::new(fl!("raw-none")).color(MUTED));
+                }
+            }
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(fl!("debug-growth-hint"))
+                    .size(12.5)
+                    .color(MUTED),
+            );
         });
         ui.add_space(2.0);
 
@@ -1478,6 +1744,49 @@ mod tests {
         std::fs::write(&bin, b"").unwrap();
         assert_eq!(daemon_exec_in(Some(&dir)), bin.display().to_string());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Отображение стадий тотально и стабильно по именам ключей;
+    /// локализованная подпись совпадает с fl!-рендером (не зависит от
+    /// локали машины).
+    #[test]
+    fn stage_labels_map_to_expected_keys() {
+        assert_eq!(stage_key(Stage::Egg), "stage-egg");
+        assert_eq!(stage_key(Stage::Baby), "stage-baby");
+        assert_eq!(stage_key(Stage::Child), "stage-child");
+        assert_eq!(stage_key(Stage::Teen), "stage-teen");
+        assert_eq!(stage_key(Stage::Adult), "stage-adult");
+
+        assert_eq!(stage_label(Stage::Egg), fl!("stage-egg"));
+        assert_eq!(stage_label(Stage::Baby), fl!("stage-baby"));
+        assert_eq!(stage_label(Stage::Child), fl!("stage-child"));
+        assert_eq!(stage_label(Stage::Teen), fl!("stage-teen"));
+        assert_eq!(stage_label(Stage::Adult), fl!("stage-adult"));
+        // Разные стадии не схлопываются в одну подпись.
+        assert_ne!(stage_label(Stage::Egg), stage_label(Stage::Adult));
+    }
+
+    /// Пороги цвета баров ухода: >60 зелёный, 30..=60 янтарный, <30 красный.
+    #[test]
+    fn stat_bar_color_thresholds() {
+        assert_eq!(stat_bar_color(100.0), SUCCESS);
+        assert_eq!(stat_bar_color(60.1), SUCCESS);
+        assert_eq!(stat_bar_color(60.0), AMBER);
+        assert_eq!(stat_bar_color(45.0), AMBER);
+        assert_eq!(stat_bar_color(30.0), AMBER);
+        assert_eq!(stat_bar_color(29.9), DANGER);
+        assert_eq!(stat_bar_color(0.0), DANGER);
+    }
+
+    /// Валидация имени: пустое/пробельное — отказ, валидное — trim.
+    #[test]
+    fn pet_name_validation() {
+        assert_eq!(valid_pet_name(""), None);
+        assert_eq!(valid_pet_name("   "), None);
+        assert_eq!(valid_pet_name("\t\n"), None);
+        assert_eq!(valid_pet_name("Дрифт"), Some("Дрифт"));
+        assert_eq!(valid_pet_name("  Дрифт  "), Some("Дрифт"));
+        assert_eq!(valid_pet_name("a"), Some("a"));
     }
 
     #[test]

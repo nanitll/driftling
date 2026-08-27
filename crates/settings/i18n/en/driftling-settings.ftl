@@ -46,6 +46,36 @@ msg-pet-summoned = Pet summoned
 msg-pet-dismissed = Pet removed
 daemon-error = Daemon error: { $error }
 generic-error = Error: { $error }
+rename-hint = Rename
+msg-renamed = Pet renamed
+msg-rename-empty = The name cannot be empty
+btn-feed = Feed
+btn-treat = Treat
+btn-play = Play
+btn-sleep = Put to sleep
+msg-fed = The pet has been fed
+msg-treat-given = Treat given
+msg-played = You played with the pet
+msg-put-to-sleep = The pet was put to bed
+daemon-down-hint = The daemon is not running — start it to take care of the pet.
+btn-start-daemon = Start the daemon
+msg-daemon-starting = Starting the daemon…
+
+# --- Growth stage chip ---
+stage-egg = Egg
+stage-baby = Baby
+stage-child = Child
+stage-teen = Teen
+stage-adult = Adult
+
+# --- Condition card ---
+section-condition = Condition
+stat-satiety = Satiety
+stat-energy = Energy
+stat-mood = Mood
+stat-health = Health
+condition-unavailable = The daemon is not running — the pet's condition is unavailable.
+
 section-stats = Characteristics
 stat-speed = Speed
 stat-speed-value = { $value } px/s
@@ -86,5 +116,8 @@ debug-clamp-note = The daemon clamps values: restlessness + sleepiness ≤ 100, 
 btn-apply = Apply
 msg-applied = Applied and saved
 btn-reset = Reset to defaults
+section-raw-stats = Raw stats
+stat-stage = Stage
+debug-growth-hint = Accelerated growth testing: start the daemon with DRIFTLING_GROWTH_SCALE=1440 (one real minute = one in-game day).
 section-raw = Raw daemon response
 raw-none = No response from the daemon.

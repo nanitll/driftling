@@ -83,6 +83,12 @@ pub struct Pet {
     /// Точка нажатия, пока не решено «клик или drag» (ТД-24): кнопка зажата,
     /// но порог движения ещё не пройден. None — кнопка не зажата.
     pressed_at: Option<Vec2>,
+    /// «Только на земле» (фаза B6): машина поведения не входит в Walk.
+    /// Включается демоном на стадии яйца — яйцо не ходит.
+    grounded_only: bool,
+    /// Последний Release оказался кликом (нажатие без захвата, ТД-24);
+    /// снимается чтением [`Pet::take_click`].
+    clicked: bool,
 }
 
 /// Порог движения курсора, после которого нажатие становится захватом,
@@ -106,6 +112,8 @@ impl Pet {
             drag_offset: Vec2::default(),
             drag_history: [(0.0, Vec2::default()); 4],
             pressed_at: None,
+            grounded_only: false,
+            clicked: false,
         }
     }
 
@@ -118,6 +126,40 @@ impl Pet {
     pub fn apply_config(&mut self, cfg: BehaviorConfig, size: f32) {
         self.cfg = cfg;
         self.size = size;
+    }
+
+    /// Режим «только на земле» (фаза B6, стадия яйца): пока включён, машина
+    /// поведения никогда не входит в Walk — питомец стоит на месте (Idle/
+    /// Sleep). Уже идущая прогулка прерывается сразу. Падение и drag не
+    /// трогаем: физика (уронили яйцо — оно падает) важнее запрета ходьбы.
+    pub fn set_grounded_only(&mut self, grounded: bool) {
+        self.grounded_only = grounded;
+        if grounded && self.state == PetState::Walk {
+            self.enter(PetState::Idle);
+            self.state_left = self.roll(self.cfg.idle_range);
+        }
+    }
+
+    /// Принудительно уложить спать (уход, фаза B5: команда «Уложить спать»).
+    /// Питомец засыпает сразу на полную длительность `cfg.sleep_range.1`
+    /// (максимум из настроек сна — явная команда даёт самый долгий сон).
+    /// В Dragged/Falling не действует (сон в воздухе ломал бы физику) —
+    /// возвращает false. Повторный вызов во сне перевзводит таймер заново.
+    pub fn force_sleep(&mut self) -> bool {
+        if matches!(self.state, PetState::Dragged | PetState::Falling) {
+            return false;
+        }
+        self.state = PetState::Sleep;
+        self.state_time = 0.0;
+        self.state_left = self.cfg.sleep_range.1;
+        true
+    }
+
+    /// Был ли с прошлого вызова потреблённый клик по питомцу (нажатие и
+    /// отпускание без прохождения порога захвата, ТД-24)? Флаг снимается
+    /// чтением — демон превращает его в поглаживание (Petted, фаза B5).
+    pub fn take_click(&mut self) -> bool {
+        core::mem::take(&mut self.clicked)
     }
 
     /// Прямоугольник спрайта (для рендера и input region).
@@ -237,7 +279,9 @@ impl Pet {
             PointerEvent::Release(_) => {
                 let was_pressed = self.pressed_at.take().is_some();
                 if self.state != PetState::Dragged {
-                    // Клик без захвата: потребляем, реакция придёт в фазе B.
+                    // Клик без захвата: потребляем и запоминаем — демон
+                    // прочитает флаг через take_click (поглаживание, B5).
+                    self.clicked |= was_pressed;
                     return was_pressed;
                 }
                 // Скорость броска — по финальному «флику»: берём самую раннюю
@@ -260,13 +304,23 @@ impl Pet {
 
     fn advance_timer(&mut self) {
         if self.state_time >= self.state_left {
-            let (next, dur) = next_state_after(self.state, &self.cfg, &mut self.rng);
+            let (mut next, mut dur) = next_state_after(self.state, &self.cfg, &mut self.rng);
+            if self.grounded_only && next == PetState::Walk {
+                // Яйцо не ходит (B6): решение «гулять» заменяется на Idle.
+                next = PetState::Idle;
+                dur = self.roll(self.cfg.idle_range);
+            }
             if next == PetState::Walk && self.rng.bool() {
                 self.facing = self.facing.flip();
             }
             self.enter(next);
             self.state_left = dur;
         }
+    }
+
+    /// Случайная длительность из диапазона (lo, hi).
+    fn roll(&mut self, (lo, hi): (f32, f32)) -> f32 {
+        lo + (hi - lo) * self.rng.f32()
     }
 
     fn enter(&mut self, next: PetState) {
@@ -444,6 +498,80 @@ mod tests {
             coarse.pos.x,
             fine.pos.x
         );
+    }
+
+    /// B6: в режиме «только на земле» (стадия яйца) машина поведения
+    /// никогда не входит в Walk, а текущая прогулка прерывается сразу.
+    #[test]
+    fn grounded_only_never_walks() {
+        let w = world();
+        let mut p = pet();
+        p.set_grounded_only(true);
+        // Долгая жизнь с частым тиком: ни одного Walk за всё время.
+        for _ in 0..20_000 {
+            p.tick(&w, 1.0 / 30.0);
+            assert_ne!(p.state, PetState::Walk, "яйцо не ходит");
+        }
+        assert_eq!(p.pos.y, w.ground_y(), "и стоит на земле");
+
+        // Прогулка в момент включения режима прерывается немедленно.
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        p.state = PetState::Walk;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        p.set_grounded_only(true);
+        assert_eq!(p.state, PetState::Idle);
+        assert!(p.state_left.is_finite());
+    }
+
+    /// B5: force_sleep укладывает немедленно на максимум sleep_range,
+    /// но не действует в воздухе (Falling/Dragged).
+    #[test]
+    fn force_sleep_sleeps_now_for_cfg_max() {
+        let w = world();
+        let mut p = pet();
+        assert!(!p.force_sleep(), "в падении сон не форсируется");
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert!(p.force_sleep());
+        assert_eq!(p.state, PetState::Sleep);
+        assert_eq!(p.state_left, p.cfg.sleep_range.1);
+        assert_eq!(p.state_time, 0.0);
+
+        // Во время drag тоже не действует.
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(500.0, 300.0)), 0.1));
+        assert_eq!(p.state, PetState::Dragged);
+        assert!(!p.force_sleep());
+        assert_eq!(p.state, PetState::Dragged);
+    }
+
+    /// B5: клик (нажал-отпустил без захвата) взводит флаг take_click ровно
+    /// один раз; drag с броском флага не взводит.
+    #[test]
+    fn take_click_reports_click_once() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert!(!p.take_click(), "до клика флага нет");
+        let press = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(press), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Release(press), 0.1));
+        assert!(p.take_click(), "клик замечен");
+        assert!(!p.take_click(), "флаг снимается чтением");
+
+        // Полноценный drag кликом не считается.
+        assert!(p.pointer(&w, PointerEvent::Press(press), 0.2));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(500.0, 300.0)), 0.3));
+        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(500.0, 300.0)), 0.4));
+        assert!(!p.take_click(), "захват — не поглаживание");
     }
 
     #[test]

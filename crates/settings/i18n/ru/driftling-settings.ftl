@@ -51,6 +51,36 @@ msg-pet-summoned = Питомец призван
 msg-pet-dismissed = Питомец убран
 daemon-error = Ошибка демона: { $error }
 generic-error = Ошибка: { $error }
+rename-hint = Переименовать
+msg-renamed = Питомец переименован
+msg-rename-empty = Имя не может быть пустым
+btn-feed = Покормить
+btn-treat = Вкусняшка
+btn-play = Поиграть
+btn-sleep = Уложить
+msg-fed = Питомец покормлен
+msg-treat-given = Вкусняшка выдана
+msg-played = Поиграли с питомцем
+msg-put-to-sleep = Питомец уложен спать
+daemon-down-hint = Демон не запущен — запустите его, чтобы ухаживать за питомцем.
+btn-start-daemon = Запустить демона
+msg-daemon-starting = Запускаем демона…
+
+# --- Чип стадии роста ---
+stage-egg = Яйцо
+stage-baby = Малыш
+stage-child = Ребёнок
+stage-teen = Подросток
+stage-adult = Взрослый
+
+# --- Карточка «Состояние» ---
+section-condition = Состояние
+stat-satiety = Сытость
+stat-energy = Энергия
+stat-mood = Настроение
+stat-health = Здоровье
+condition-unavailable = Демон не запущен — состояние питомца недоступно.
+
 section-stats = Характеристики
 stat-speed = Скорость
 stat-speed-value = { $value } px/с
@@ -91,5 +121,8 @@ debug-clamp-note = Демон клампит значения: непоседл�
 btn-apply = Применить
 msg-applied = Применено и сохранено
 btn-reset = Сбросить к дефолту
+section-raw-stats = Сырые статы
+stat-stage = Стадия
+debug-growth-hint = Ускоренный тест роста: запустите демона с DRIFTLING_GROWTH_SCALE=1440 (минута реального времени = игровые сутки).
 section-raw = Сырой ответ демона
 raw-none = Нет ответа от демона.
