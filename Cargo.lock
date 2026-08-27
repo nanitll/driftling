@@ -991,6 +991,7 @@ dependencies = [
  "driftling-core",
  "driftling-ipc",
  "driftling-platform",
+ "driftling-worldsense",
  "env_logger",
  "i18n-embed",
  "i18n-embed-fl",
@@ -1051,6 +1052,18 @@ dependencies = [
  "log",
  "rust-embed",
  "serde_json",
+]
+
+[[package]]
+name = "driftling-worldsense"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "driftling-core",
+ "log",
+ "serde",
+ "serde_json",
+ "zbus",
 ]
 
 [[package]]

@@ -45,6 +45,20 @@
 //!   здоровается тем же пузырём при старте демона.
 //! - **Бюджет**: меню/пузырь/оверлеи поднимают темп ([`Pace::Active`])
 //!   только пока видимы; в покое лишних перерисовок и тиков нет.
+//!
+//! Фаза D, волна 1 — «окна-рельеф» (D1/D2 + демонная половина D4/D5):
+//! - **worldsense**: провайдер (`driftling_worldsense::detect`) создаётся в
+//!   [`run`] и отдаётся демону параметром — тесты DaemonApp подсовывают свой
+//!   или ничего (реальный провайдер грузил бы скрипт в живой KWin, ТД-26);
+//! - **опрос**: `latest()` — чтение мьютекса, зовём каждый тик при активном
+//!   питомце и при скрытии (fullscreen), иначе раз в [`SENSE_POLL_IDLE`];
+//! - **координаты**: KWin отдаёт окна в глобальном пространстве, мир питомца
+//!   локален выходу — переводим через `origin` из [`Event::OutputGeometry`];
+//! - **физика**: изменившийся снапшот кладётся в `World.platforms` (+ пол из
+//!   workArea) и объявляется питомцу через [`Pet::world_changed`];
+//! - **вежливость (D5)**: `fullscreen_active` прячет сцену (пустые спрайты и
+//!   input region), симуляция продолжает тикать «за кадром»; уход из
+//!   fullscreen возвращает питомца на место.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -53,6 +67,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use driftling_core::physics::Platform;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
     fold, growth, text, Config, DerivedPet, Direction, Event as JournalEvent, EventKind, FoldCfg,
@@ -61,6 +76,7 @@ use driftling_core::{
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
+use driftling_worldsense::WorldSense;
 
 use crate::i18n::fl;
 
@@ -92,6 +108,11 @@ const HELLO_HATCH_SECS: f64 = 4.0;
 const HELLO_START_SECS: f64 = 3.0;
 /// Минимальный засчитываемый сон, мин: короче — шум, Slept не пишем.
 const SLEPT_MIN_MINUTES: f32 = 0.5;
+/// Опрос worldsense при спокойном питомце (фаза D): снапшоты пушатся
+/// провайдером сами, `latest()` — только чтение мьютекса, но и его незачем
+/// дёргать чаще при Calm/Drowsy. Активный питомец и скрытый (fullscreen)
+/// опрашиваются каждый тик.
+const SENSE_POLL_IDLE: Duration = Duration::from_secs(2);
 
 /// Сообщение из IPC-потока: запрос + канал для ровно одного ответа.
 /// Тем же каналом пользуется поток трея (B7).
@@ -194,7 +215,10 @@ pub fn run() -> Result<()> {
     if let Some(scale) = growth_scale {
         log::warn!("DRIFTLING_GROWTH_SCALE={scale}: рост ускорен (дебаг-режим)");
     }
-    let app = DaemonApp::new(rx, data_dir, legacy_attrs, growth_scale);
+    // Восприятие мира (фаза D): KWin-провайдер на KDE, null-провайдер
+    // (пол = низ экрана) везде ещё; деградация штатная, демон работает всегда.
+    let sense = driftling_worldsense::detect();
+    let app = DaemonApp::new(rx, data_dir, legacy_attrs, growth_scale, Some(sense));
 
     // SIGTERM/SIGINT (ТД-20): флаг проверяется в tick -> graceful-выход.
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -472,6 +496,18 @@ struct DaemonApp {
     pet: Option<Pet>,
     /// Появляется с первым Event::OutputGeometry; до него сцена пустая.
     world: Option<World>,
+    /// Восприятие мира (фаза D): None — тестовый демон без провайдера.
+    sense: Option<Box<dyn WorldSense>>,
+    /// Глобальная логическая позиция выхода питомца (из OutputGeometry):
+    /// снапшоты worldsense приходят в глобальных координатах композитора.
+    screen_origin: Vec2,
+    /// Последний опрос sense.latest() — троттлинг при спокойном питомце.
+    last_sense_poll: Option<Instant>,
+    /// Интервал спокойного опроса; в тестах ужимается до нуля.
+    sense_poll_idle: Duration,
+    /// Вежливость (D5): на экране полноэкранное окно — сцена прячется
+    /// (пустые спрайты и input region), симуляция тикает дальше.
+    fullscreen_hidden: bool,
     /// Взводится по IPC Quit; бэкенд проверяет через wants_exit.
     exit: bool,
     /// Старт демона — для uptime в Status.
@@ -494,12 +530,15 @@ impl DaemonApp {
     /// Поднять демона из каталога данных: журнал -> свёртка -> спрайты
     /// под текущие характеристики и стадию. `legacy_attrs` — миграция
     /// старых секций config.toml, применяется только при рождении питомца;
-    /// `growth_scale` — дебаг-ускорение роста (DRIFTLING_GROWTH_SCALE).
+    /// `growth_scale` — дебаг-ускорение роста (DRIFTLING_GROWTH_SCALE);
+    /// `sense` — провайдер worldsense (фаза D), создаётся в run(): реальный
+    /// провайдер грузит скрипт в живой KWin, тестам такое нельзя (ТД-26).
     fn new(
         rx: Receiver<IpcMessage>,
         data_dir: PathBuf,
         legacy_attrs: Option<PetAttributes>,
         growth_scale: Option<f64>,
+        sense: Option<Box<dyn WorldSense>>,
     ) -> Self {
         let storage = load_storage(&data_dir, legacy_attrs);
         let mut fold_cfg = FoldCfg::default();
@@ -532,6 +571,11 @@ impl DaemonApp {
             sleep_since: None,
             pet: None,
             world: None,
+            sense,
+            screen_origin: Vec2::default(),
+            last_sense_poll: None,
+            sense_poll_idle: SENSE_POLL_IDLE,
+            fullscreen_hidden: false,
             exit: false,
             started: Instant::now(),
             last_now: None,
@@ -934,6 +978,102 @@ impl DaemonApp {
         }
         true
     }
+
+    /// Опрос worldsense (фаза D): свежий снапшот -> платформы и пол в World,
+    /// изменение объявляется питомцу (world_changed), флаг fullscreen
+    /// прячет/возвращает сцену. Зовётся из tick ПЕРЕД симуляцией — физика
+    /// этого же кадра ходит уже по новому рельефу.
+    ///
+    /// Троттлинг: активный питомец (Falling/Walk/Dragged) и скрытый режим
+    /// (ждём ухода fullscreen) — каждый тик; спокойный — раз в
+    /// `sense_poll_idle` (закрытое окно уронит питомца с опозданием ≤2 с).
+    fn poll_worldsense(&mut self) {
+        let Some(sense) = self.sense.as_mut() else {
+            return;
+        };
+        let busy = self.fullscreen_hidden
+            || self
+                .pet
+                .as_ref()
+                .is_some_and(|p| p.pace() == SimPace::Active);
+        if !busy {
+            if let Some(t) = self.last_sense_poll {
+                if t.elapsed() < self.sense_poll_idle {
+                    return;
+                }
+            }
+        }
+        self.last_sense_poll = Some(Instant::now());
+        let snap = sense.latest();
+        let Some(world) = &mut self.world else {
+            // До геометрии выхода некуда переводить координаты.
+            return;
+        };
+
+        // Снапшота нет (не-KDE, KWin умер) — штатная деградация: рельеф
+        // пустеет, пол возвращается к низу экрана.
+        let (platforms, ground_override, fullscreen) = match snap {
+            Some(s) => {
+                let o = self.screen_origin;
+                let platforms: Vec<Platform> = s
+                    .platforms
+                    .iter()
+                    .map(|p| Platform {
+                        rect: Rect::new(p.rect.x - o.x, p.rect.y - o.y, p.rect.w, p.rect.h),
+                        id: p.id,
+                    })
+                    .collect();
+                // Верх нижней панели -> пол; совпал с низом экрана или ушёл
+                // за экран (панель чужого выхода, D6) — оставляем низ экрана.
+                let ground = s
+                    .workspace_bottom
+                    .map(|y| y - o.y)
+                    .filter(|y| *y > world.screen.y && *y < world.screen.bottom());
+                (platforms, ground, s.fullscreen_active)
+            }
+            None => (Vec::new(), None, false),
+        };
+
+        if world.platforms != platforms || world.ground_y_override != ground_override {
+            world.platforms = platforms;
+            world.ground_y_override = ground_override;
+            log::debug!(
+                "мир: платформ {}, пол {:.0}{}",
+                world.platforms.len(),
+                world.ground_y(),
+                if world.ground_y_override.is_some() {
+                    " (панель)"
+                } else {
+                    " (низ экрана)"
+                }
+            );
+            if let Some(pet) = &mut self.pet {
+                let before = pet.state;
+                pet.world_changed(world);
+                if pet.state != before {
+                    // Обычно Sleep/Idle -> Falling: опору увезли/закрыли.
+                    log::debug!(
+                        "питомец: {:?} -> {:?} со сменой мира в ({:.0}, {:.0})",
+                        before,
+                        pet.state,
+                        pet.pos.x,
+                        pet.pos.y
+                    );
+                }
+            }
+        }
+
+        if fullscreen != self.fullscreen_hidden {
+            self.fullscreen_hidden = fullscreen;
+            if fullscreen {
+                log::info!("вежливость (D5): полноэкранное окно — питомец прячется");
+                // Меню без сцены осталось бы висеть невидимо-некликабельным.
+                self.menu = None;
+            } else {
+                log::info!("вежливость (D5): fullscreen закончился — питомец возвращается");
+            }
+        }
+    }
 }
 
 impl App for DaemonApp {
@@ -965,19 +1105,41 @@ impl App for DaemonApp {
         self.sync_visuals(now);
         self.expire_effects(now);
 
+        // Рельеф из worldsense (фаза D) — до симуляции: физика кадра
+        // ходит по свежим кромкам, world_changed роняет потерявших опору.
+        self.poll_worldsense();
+
         // dt с прошлого тика; кламп согласован с Pet::tick (ТД-3: при
         // адаптивном темпе Drowsy тики приходят ~раз в секунду).
         let dt = (now - self.last_now.unwrap_or(now)).clamp(0.0, 1.5) as f32;
         self.last_now = Some(now);
 
         if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
+            let before = pet.state;
             pet.tick(world, dt);
+            // Смены состояния с координатами — отладка физики фазы D
+            // («на какой кромке приземлился», «где сошёл с окна»).
+            if pet.state != before {
+                log::debug!(
+                    "питомец: {:?} -> {:?} в ({:.0}, {:.0})",
+                    before,
+                    pet.state,
+                    pet.pos.x,
+                    pet.pos.y
+                );
+            }
         }
 
         // Периоды сна: начало/конец (естественный или прерванный) — Slept.
         self.note_sleep(now);
 
         match (&self.pet, &self.world) {
+            // Вежливость (D5): под fullscreen-приложением сцена пустая —
+            // ни спрайтов, ни input region; симуляция уже оттикала выше.
+            (Some(_), Some(_)) if self.fullscreen_hidden => Scene {
+                sprites: Vec::new(),
+                input_rects: Vec::new(),
+            },
             (Some(pet), Some(world)) => {
                 let bounds = pet.bounds();
                 // Полный вид (B2/B5): настроение из статов; «радостное»
@@ -1042,12 +1204,25 @@ impl App for DaemonApp {
 
     fn event(&mut self, ev: Event, now: f64) -> bool {
         match ev {
-            Event::OutputGeometry { width, height } => {
-                log::info!("выход: {width:.0}x{height:.0}");
+            Event::OutputGeometry {
+                width,
+                height,
+                origin,
+            } => {
+                log::info!(
+                    "выход: {width:.0}x{height:.0} @ ({:.0}, {:.0})",
+                    origin.x,
+                    origin.y
+                );
                 let first = self.world.is_none();
-                self.world = Some(World {
-                    screen: Rect::new(0.0, 0.0, width, height),
-                });
+                self.screen_origin = origin;
+                let screen = Rect::new(0.0, 0.0, width, height);
+                match &mut self.world {
+                    // Экран поменялся — рельеф (платформы/пол) переживает:
+                    // ближайший poll_worldsense пересчитает его сам.
+                    Some(world) => world.screen = screen,
+                    None => self.world = Some(World::new(screen)),
+                }
                 // Демон стартует с питомцем на экране — но только если его
                 // не убирали до рестарта (ТД-17: dismissed в журнале).
                 if first && self.derived.summoned {
@@ -1147,10 +1322,11 @@ mod tests {
 
     /// DaemonApp без Wayland: ручной канал запросов; legacy-конфиг и
     /// growth_scale не подмешиваем — тесты не зависят от реального
-    /// config.toml и env (ТД-26).
+    /// config.toml и env (ТД-26). Worldsense-провайдера нет: настоящий
+    /// грузил бы KWin-скрипт в живой композитор (см. FakeSense).
     fn app_in(dir: &Path) -> (DaemonApp, Sender<IpcMessage>) {
         let (tx, rx) = mpsc::channel();
-        (DaemonApp::new(rx, dir.to_path_buf(), None, None), tx)
+        (DaemonApp::new(rx, dir.to_path_buf(), None, None, None), tx)
     }
 
     fn app(tag: &str) -> (DaemonApp, Sender<IpcMessage>, PathBuf) {
@@ -1203,6 +1379,7 @@ mod tests {
             Event::OutputGeometry {
                 width: 1920.0,
                 height: 1080.0,
+                origin: Vec2::default(),
             },
             0.0,
         ));
@@ -2007,5 +2184,204 @@ mod tests {
         let m = slept_minutes(0.0, 60.0).unwrap();
         assert!((m - 1.0).abs() < 1e-6);
         assert_eq!(slept_minutes(10.0, 5.0), None, "время назад — не сон");
+    }
+
+    // --- Фаза D: worldsense -> мир -> физика ------------------------------
+
+    use driftling_worldsense::{WindowPlatform, WorldSnapshot};
+
+    /// Управляемый провайдер: тест кладёт снапшот, демон его читает.
+    /// Настоящий провайдер в тестах запрещён — он грузит скрипт в живой KWin.
+    #[derive(Clone, Default)]
+    struct FakeSense(Arc<std::sync::Mutex<Option<WorldSnapshot>>>);
+
+    impl FakeSense {
+        fn set(&self, snap: Option<WorldSnapshot>) {
+            *self.0.lock().unwrap() = snap;
+        }
+    }
+
+    impl WorldSense for FakeSense {
+        fn latest(&mut self) -> Option<WorldSnapshot> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Демон с управляемым worldsense; троттлинг опроса снят (тесты не ждут).
+    fn sense_app(tag: &str) -> (DaemonApp, FakeSense, Sender<IpcMessage>, PathBuf) {
+        let dir = tmp_dir(tag);
+        let sense = FakeSense::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = DaemonApp::new(
+            rx,
+            dir.to_path_buf(),
+            None,
+            None,
+            Some(Box::new(sense.clone())),
+        );
+        app.sense_poll_idle = Duration::ZERO;
+        (app, sense, tx, dir)
+    }
+
+    /// Снапшот из окон (x, y, w, h в глобальных координатах), низа рабочей
+    /// области и флага fullscreen.
+    fn world_snap(
+        windows: &[(f32, f32, f32, f32)],
+        bottom: Option<f32>,
+        fullscreen: bool,
+    ) -> WorldSnapshot {
+        WorldSnapshot {
+            platforms: windows
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y, w, h))| WindowPlatform {
+                    rect: Rect::new(x, y, w, h),
+                    id: i as u64 + 1,
+                })
+                .collect(),
+            workspace_bottom: bottom,
+            fullscreen_active: fullscreen,
+        }
+    }
+
+    /// Снапшот в глобальных координатах композитора переводится в локальные
+    /// координаты выхода (origin из OutputGeometry), и питомец приземляется
+    /// на верхнюю кромку окна; низ workArea становится полом.
+    #[test]
+    fn worldsense_platforms_translated_and_landable() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-land");
+        // Выход — «правый монитор» в глобальной точке (1920, 0).
+        assert!(app.event(
+            Event::OutputGeometry {
+                width: 1920.0,
+                height: 1080.0,
+                origin: Vec2::new(1920.0, 0.0),
+            },
+            0.0,
+        ));
+        // Окно под точкой спавна (960 лок. = 2880 глоб.), верх кромки на 700.
+        sense.set(Some(world_snap(
+            &[(2660.0, 700.0, 600.0, 300.0)],
+            Some(1040.0),
+            false,
+        )));
+
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let world = app.world.as_ref().unwrap();
+        assert_eq!(world.platforms.len(), 1);
+        let r = world.platforms[0].rect;
+        assert_eq!((r.x, r.y, r.w, r.h), (740.0, 700.0, 600.0, 300.0));
+        assert_eq!(world.ground_y_override, Some(1040.0), "верх панели — пол");
+        let pet = app.pet.as_ref().unwrap();
+        assert_eq!(pet.pos.y, 700.0, "питомец стоит на кромке окна");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Окно закрыли под стоящим питомцем — он теряет опору, падает и долетает
+    /// до земли (демонная половина D4: снапшот -> world_changed).
+    #[test]
+    fn window_vanish_drops_standing_pet() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-vanish");
+        geometry(&mut app);
+        sense.set(Some(world_snap(
+            &[(660.0, 700.0, 600.0, 300.0)],
+            None,
+            false,
+        )));
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.pet.as_ref().unwrap().pos.y, 700.0);
+
+        sense.set(Some(world_snap(&[], None, false)));
+        now += 1.0 / 60.0;
+        app.tick(now);
+        assert!(app.world.as_ref().unwrap().platforms.is_empty());
+        assert_eq!(app.pet.as_ref().unwrap().state, PetState::Falling);
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.pet.as_ref().unwrap().pos.y, 1080.0, "долетел до земли");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Вежливость (D5): fullscreen прячет сцену целиком (ни спрайтов, ни
+    /// input region) и закрывает меню; симуляция живёт за кадром; конец
+    /// fullscreen возвращает питомца на место.
+    #[test]
+    fn fullscreen_hides_scene_and_restores() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-fs");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.tick(now).sprites.len(), 1);
+        // Открытое меню не должно пережить скрытие.
+        let p = app.pet.as_ref().unwrap().pos;
+        assert!(app.event(Event::PointerMenu(p), now));
+        assert!(app.menu.is_some());
+
+        sense.set(Some(world_snap(&[], None, true)));
+        now += 0.1;
+        let counts = {
+            let scene = app.tick(now);
+            (scene.sprites.len(), scene.input_rects.len())
+        };
+        assert!(app.fullscreen_hidden);
+        assert_eq!(counts, (0, 0), "сцена спрятана целиком");
+        assert!(app.menu.is_none(), "меню закрыто при скрытии");
+        assert!(app.pet.is_some(), "питомец живёт за кадром");
+
+        sense.set(Some(world_snap(&[], None, false)));
+        now += 0.1;
+        let sprites = app.tick(now).sprites.len();
+        assert!(!app.fullscreen_hidden);
+        assert_eq!(sprites, 1, "питомец вернулся");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Троттлинг опроса: спокойный питомец читает мир раз в sense_poll_idle;
+    /// обнуление интервала (= активный/скрытый режимы) — каждый тик.
+    #[test]
+    fn sense_poll_throttled_when_calm() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-throttle");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0); // осел, пейс Calm/Drowsy
+        assert_ne!(app.pet.as_ref().unwrap().pace(), SimPace::Active);
+
+        app.sense_poll_idle = Duration::from_secs(3600);
+        sense.set(Some(world_snap(&[], None, true)));
+        now += 1.0 / 60.0;
+        app.tick(now);
+        assert!(!app.fullscreen_hidden, "спокойный опрос затроттлен");
+
+        app.sense_poll_idle = Duration::ZERO;
+        now += 1.0 / 60.0;
+        app.tick(now);
+        assert!(app.fullscreen_hidden, "без троттлинга снапшот подхвачен");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Провайдер замолчал (None — рестарт KWin, не-KDE): рельеф пустеет, пол
+    /// возвращается к низу экрана — штатная деградация, питомец не зависает.
+    #[test]
+    fn sense_none_degrades_to_bare_ground() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-none");
+        geometry(&mut app);
+        sense.set(Some(world_snap(
+            &[(660.0, 700.0, 600.0, 300.0)],
+            Some(1040.0),
+            false,
+        )));
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.pet.as_ref().unwrap().pos.y, 700.0);
+
+        sense.set(None);
+        now += 1.0 / 60.0;
+        app.tick(now);
+        let world = app.world.as_ref().unwrap();
+        assert!(world.platforms.is_empty());
+        assert_eq!(world.ground_y_override, None);
+        assert_eq!(app.pet.as_ref().unwrap().state, PetState::Falling);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,19 +1,24 @@
-//! Wayland-бэкенд: слой-якорь 1x1 + wl_subsurface под питомца, wl_shm рендер.
+//! Wayland-бэкенд: прозрачный слой-якорь + wl_subsurface под питомца,
+//! wl_shm рендер.
 //!
 //! Архитектура после переработки энергобюджета (аудит ТД-3, ТД-4; модель
 //! доказана wl_shimeji, см. docs/RESEARCH.md; реализация clean-room):
 //!
-//! - **Якорь**: минимальный `Layer::Overlay`-surface, anchor TOP|LEFT,
-//!   размер 1x1, прозрачный 1x1-буфер, ПУСТОЙ input region. Коммитится один
-//!   раз при маппинге; дальше — только пустые коммиты, применяющие позицию
-//!   субповерхности. Никакого fullscreen-буфера больше нет.
+//! - **Якорь**: прозрачный `Layer::Overlay`-surface с ПУСТЫМ input region,
+//!   РАСТЯЖИМЫЙ (фаза D): пока питомец на экране — на весь выход (как у
+//!   wl_shimeji; полноэкранный слой держит композицию включённой — KWin при
+//!   прямом сканауте накрытого окном выхода не рисовал субповерхности
+//!   1x1-якоря и не слал им frame callback'и), при пустой сцене — 1x1
+//!   (сканаут возвращается композитору, D5). Пиксели якоря перерисовываются
+//!   только по configure; в остальном — пустые коммиты, применяющие позицию
+//!   субповерхности.
 //! - **Питомец**: `wl_subsurface` якоря в режиме desync со своим маленьким
 //!   буфером (границы спрайта * масштаб). Перемещение — дешёвая пара
 //!   `wl_subsurface.set_position(x, y)` + коммит якоря, без configure-циклов.
-//!   Субповерхность легально выходит за границы 1x1-родителя — это и есть
-//!   трюк wl_shimeji. Известный нюанс: Hyprland исторически клипует
-//!   субповерхности по родителю (питомца не будет видно); KDE и wlroots
-//!   рисуют честно. Лечится отдельным путём, не здесь.
+//!   Субповерхность легально выходит за границы 1x1-родителя в скрытом
+//!   режиме. Известный нюанс: Hyprland исторически клипует субповерхности
+//!   по родителю; при полноэкранном якоре это не мешает, а сжатый якорь
+//!   показывают без питомца — лечится в D3, не здесь.
 //! - **Dirty-check**: буфер перерисовывается только когда сменилось
 //!   содержимое кадра (указатель пикселей/размер/зеркало/масштаб — см.
 //!   [`ContentKey`]); чистое перемещение не рисует ни пикселя, а неподвижный
@@ -23,9 +28,10 @@
 //!   указателя будят таймер немедленно (сон → drag без секундной задержки).
 //!   Обратная сторона: IPC-очередь приложения дренируется в tick, поэтому в
 //!   Drowsy команда `ctl summon` может ждать до ~1 с — осознанный размен.
-//! - **Размер выхода**: 1x1-слой получает configure 1x1, поэтому геометрия
-//!   берётся из [`OutputState`] того выхода, куда композитор посадил якорь
-//!   (`surface_enter`), с фолбэком на текущий видеорежим / масштаб.
+//! - **Размер выхода**: configure слоя о выходе ничего не говорит в
+//!   1x1-режиме, поэтому геометрия всегда берётся из [`OutputState`] того
+//!   выхода, куда композитор посадил якорь (`surface_enter`), с фолбэком
+//!   на текущий видеорежим / масштаб.
 //! - **Ввод** (ТД-5, ТД-9, ТД-24): события приходят на поверхность питомца в
 //!   её локальных координатах и переводятся в логические экранные прибавлением
 //!   позиции субповерхности. Пока кнопка зажата, Motion доставляется даже вне
@@ -85,6 +91,15 @@ use smithay_client_toolkit::{
 use crate::{App, Event, Pace, Scene};
 
 /// Периоды адаптивного таймера симуляции (энергобюджет ТЗ §7).
+/// Страховка от голодания frame callback'ов: дросселирование перерисовок
+/// по callback'у экономит энергию, но KWin 6.3 на выходе, целиком накрытом
+/// максимизированным окном (режим прямого сканаута), может вообще не слать
+/// callback'и нашей overlay-субповерхности — содержимое замерзало бы на
+/// первом кадре навсегда (диагностировано живьём в фазе D: ровно один attach
+/// за минуты жизни). Если callback молчит дольше этого срока, рисуем без
+/// него: собственный damage заставляет композитор вернуться к композиции.
+const FRAME_CB_FALLBACK: Duration = Duration::from_millis(250);
+
 const ACTIVE_TICK: Duration = Duration::from_millis(33);
 const CALM_TICK: Duration = Duration::from_millis(200);
 const DROWSY_TICK: Duration = Duration::from_millis(1000);
@@ -257,15 +272,22 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
     );
     let shm = setup!(Shm::bind(&globals, &qh), "wl_shm недоступен");
 
-    // Якорь: 1x1 в левом верхнем углу выхода. exclusive_zone(-1) прижимает
-    // его к углу самого ВЫХОДА (не рабочей области), чтобы позиция
-    // субповерхности совпадала с логическими экранными координатами сцены.
+    // Якорь: прозрачная поверхность НА ВЕСЬ выход (модель wl_shimeji, см.
+    // RESEARCH.md). Полноэкранный якорь держит композицию выхода включённой,
+    // пока питомец на экране: KWin 6.3 при прямом сканауте целиком накрытого
+    // окном выхода не рисует субповерхности «точечного» 1x1-якоря и не шлёт
+    // им frame callback'и (питомец замерзал — диагностировано живьём в фазе
+    // D). Пустая сцена сжимает якорь до 1x1 (Renderer::set_anchor_full) —
+    // сканаут и его энергосбережение возвращаются композитору (D5).
+    // exclusive_zone(-1) растягивает слой по самому ВЫХОДУ (не рабочей
+    // области), чтобы позиция субповерхности совпадала с логическими
+    // экранными координатами сцены.
     // TODO(M3): мультивыход — по одному якорю на каждый wl_output.
     let surface = compositor.create_surface(&qh);
     let layer =
         layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("driftling"), None);
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-    layer.set_size(1, 1);
+    layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
+    layer.set_size(0, 0);
     layer.set_exclusive_zone(-1);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     // Якорь никогда не ловит мышь: пустой (не None!) input region.
@@ -323,8 +345,10 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
             pet_subsurface,
             scale: 1,
             parent_mapped: false,
+            anchor_full: true,
             visible: false,
             frame_done: true,
+            last_draw: None,
             last_content: None,
             last_pos: None,
             last_input: Vec::new(),
@@ -370,8 +394,9 @@ struct Backend {
 
     /// Выход, на который композитор посадил якорь (`surface_enter`).
     current_output: Option<wl_output::WlOutput>,
-    /// Последняя доставленная геометрия — дедупликация update_output.
-    last_geometry: Option<(f32, f32)>,
+    /// Последняя доставленная геометрия (размер + глобальная позиция
+    /// выхода) — дедупликация update_output.
+    last_geometry: Option<(f32, f32, i32, i32)>,
 
     /// Кнопка (BTN_LEFT) зажата — идёт implicit grab.
     pressed: bool,
@@ -397,12 +422,19 @@ struct Renderer {
     pet_subsurface: wl_subsurface::WlSubsurface,
     /// Целочисленный масштаб буфера (HiDPI). TODO(D6): дробный масштаб.
     scale: u32,
-    /// Якорь замаплен (configure получен, 1x1-буфер прикреплён).
+    /// Якорь замаплен (configure получен, прозрачный буфер прикреплён).
     parent_mapped: bool,
+    /// Режим якоря: true — на весь выход (питомец на экране, композиция
+    /// принудительно включена), false — 1x1 (сцена пуста, сканаут отдан
+    /// композитору). См. комментарий при создании слоя.
+    anchor_full: bool,
     /// У поверхности питомца есть буфер (сцена непустая).
     visible: bool,
     /// Прошлый кадр показан композитором — можно рисовать следующий.
     frame_done: bool,
+    /// Когда последний раз рисовали содержимое — страховка от голодания
+    /// frame callback'ов (см. FRAME_CB_FALLBACK).
+    last_draw: Option<Instant>,
     /// Содержимое последнего нарисованного буфера (dirty-check).
     last_content: Option<ContentKey>,
     /// Последняя выставленная позиция субповерхности (логические координаты).
@@ -412,19 +444,40 @@ struct Renderer {
 }
 
 impl Renderer {
-    /// Прикрепить к якорю его единственный буфер — 1x1 прозрачный пиксель.
-    fn map_parent(&mut self) -> Result<()> {
+    /// Ответ на configure якоря: прозрачный буфер назначенного размера
+    /// (полный выход или 1x1 — по текущему режиму). Каждый configure
+    /// (первый маппинг, смена режима, ресайз выхода) перепривязывает буфер.
+    fn anchor_configured(&mut self, (w, h): (u32, u32)) -> Result<()> {
+        let (w, h) = (w.max(1) as i32, h.max(1) as i32);
         let (buffer, canvas) = self
             .pool
-            .create_buffer(1, 1, 4, wl_shm::Format::Argb8888)
+            .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
             .context("shm-буфер якоря")?;
         canvas.fill(0);
         let surface = self.layer.wl_surface();
         buffer.attach_to(surface).context("attach буфера якоря")?;
-        surface.damage_buffer(0, 0, 1, 1);
+        surface.damage_buffer(0, 0, w, h);
         self.layer.commit();
         self.parent_mapped = true;
         Ok(())
+    }
+
+    /// Переключить режим якоря (весь выход <-> 1x1). Новый буфер придёт
+    /// со следующим configure (anchor_configured); вызов идемпотентен.
+    fn set_anchor_full(&mut self, full: bool) {
+        if self.anchor_full == full {
+            return;
+        }
+        self.anchor_full = full;
+        if full {
+            self.layer
+                .set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
+            self.layer.set_size(0, 0);
+        } else {
+            self.layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+            self.layer.set_size(1, 1);
+        }
+        self.layer.commit();
     }
 
     /// Привести поверхности в соответствие сцене: перерисовать содержимое
@@ -438,13 +491,21 @@ impl Renderer {
             self.hide();
             return;
         };
+        // Питомец на экране — якорь на весь выход (композиция включена).
+        self.set_anchor_full(true);
         let scale = self.scale.max(1);
         let key = content_key(scene, (bx, by), scale);
         let content_dirty = !self.visible || self.last_content.as_ref() != Some(&key);
         let mut commit_pet = false;
 
         let first_show = !self.visible;
-        if content_dirty && self.frame_done {
+        // Обычный такт задаёт callback композитора; его голодание (KWin
+        // при прямом сканауте) не должно замораживать питомца навсегда.
+        let may_draw = self.frame_done
+            || self
+                .last_draw
+                .is_none_or(|t| t.elapsed() >= FRAME_CB_FALLBACK);
+        if content_dirty && may_draw {
             let (pw, ph) = (bw * scale, bh * scale);
             match self.pool.create_buffer(
                 pw as i32,
@@ -457,13 +518,17 @@ impl Renderer {
                     self.pet_surface.set_buffer_scale(scale as i32);
                     self.pet_surface.damage_buffer(0, 0, pw as i32, ph as i32);
                     // Дросселирование: следующее содержимое — после показа
-                    // этого (frame callback). Пропущенная перерисовка не
-                    // теряется: dirty-check повторит её на следующем тике.
-                    self.pet_surface.frame(&self.qh, self.pet_surface.clone());
+                    // этого (frame callback). Запрашиваем на ЯКОРЕ: KWin не
+                    // шлёт callback'и субповерхностям (см. Backend::frame);
+                    // коммит якоря идёт следом в этом же sync. Пропущенная
+                    // перерисовка не теряется: dirty-check повторит её.
+                    let parent = self.layer.wl_surface();
+                    parent.frame(&self.qh, parent.clone());
                     if let Err(e) = buffer.attach_to(&self.pet_surface) {
                         log::error!("attach буфера питомца: {e}");
                     }
                     self.frame_done = false;
+                    self.last_draw = Some(Instant::now());
                     self.visible = true;
                     self.last_content = Some(key);
                     commit_pet = true;
@@ -509,17 +574,24 @@ impl Renderer {
 
         // Позиция субповерхности — состояние РОДИТЕЛЯ: set_position +
         // коммит якоря. Никаких пикселей и configure — самое частое действие
-        // (ходьба) стоит два крошечных запроса.
-        if self.last_pos != Some((bx, by)) {
+        // (ходьба) стоит два крошечных запроса. Коммит якоря нужен и без
+        // движения, когда рисовалось содержимое: он применяет frame-запрос
+        // на якоре (см. блок отрисовки выше).
+        let moved = self.last_pos != Some((bx, by));
+        if moved {
             self.pet_subsurface.set_position(bx, by);
-            self.layer.commit();
             self.last_pos = Some((bx, by));
+        }
+        if moved || commit_pet {
+            self.layer.commit();
         }
     }
 
     /// Спрятать питомца: null-буфер демапит поверхность, размаппленная
-    /// поверхность не ловит ввод — сцена «ничего нет» стоит ноль.
+    /// поверхность не ловит ввод — сцена «ничего нет» стоит ноль. Якорь
+    /// сжимается до 1x1: выход возвращается к прямому сканауту (D5).
     fn hide(&mut self) {
+        self.set_anchor_full(false);
         if !self.visible {
             return;
         }
@@ -636,16 +708,20 @@ impl Backend {
             log::warn!("выход без размера (ни logical_size, ни текущего режима)");
             return;
         };
-        if self.last_geometry == Some((w, h)) {
+        // Глобальное положение выхода (xdg-output): worldsense переводит
+        // глобальные координаты окон в локальные координаты этого выхода.
+        let (ox, oy) = info.logical_position.unwrap_or((0, 0));
+        if self.last_geometry == Some((w, h, ox, oy)) {
             return;
         }
-        self.last_geometry = Some((w, h));
-        log::info!("выход: {w:.0}x{h:.0} (логических)");
+        self.last_geometry = Some((w, h, ox, oy));
+        log::info!("выход: {w:.0}x{h:.0} (логических) в глобальной точке ({ox}, {oy})");
         // Если приложение в ответ призовёт питомца (ускорит темп), таймер
         // перевзведёт maybe_escalate внутри deliver — первый кадр не ждёт.
         self.deliver(Event::OutputGeometry {
             width: w,
             height: h,
+            origin: Vec2::new(ox as f32, oy as f32),
         });
     }
 }
@@ -846,8 +922,12 @@ impl CompositorHandler for Backend {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Композитор показал кадр питомца — можно рисовать следующий.
-        if *surface == self.renderer.pet_surface {
+        // Композитор показал кадр — можно рисовать следующий. Callback
+        // запрашивается на ЯКОРЕ: KWin 6.3 не шлёт frame callback'и
+        // субповерхностям layer-суфейсов вовсе (проверено живьём в фазе D —
+        // ноль done за минуты анимации), а слою — шлёт. Принимаем оба на
+        // случай других композиторов.
+        if *surface == self.renderer.pet_surface || surface == self.renderer.layer.wl_surface() {
             self.renderer.frame_done = true;
         }
     }
@@ -927,20 +1007,17 @@ impl LayerShellHandler for Backend {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
-        _configure: LayerSurfaceConfigure,
+        configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        // Размер из configure не интересен: якорю назначено 1x1, а размер
-        // экрана приходит из OutputState (см. push_geometry).
-        if self.renderer.parent_mapped {
-            // Повторный configure: SCTK уже ack'нул, применяем коммитом.
-            self.renderer.layer.commit();
-            return;
-        }
+        // Каждый configure (маппинг, смена режима якоря, ресайз выхода)
+        // получает прозрачный буфер назначенного размера. Размер ЭКРАНА
+        // по-прежнему приходит из OutputState (см. push_geometry): в режиме
+        // 1x1 configure о выходе ничего не говорит.
         // Первый кадр питомца придёт по цепочке surface_enter → геометрия →
         // maybe_escalate; отдельного пинка таймеру здесь не нужно (лишний
         // remove+insert только шумит стейл-токенами в логе calloop).
-        if let Err(e) = self.renderer.map_parent() {
+        if let Err(e) = self.renderer.anchor_configured(configure.new_size) {
             self.fail(e);
         }
     }

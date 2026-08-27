@@ -6,6 +6,7 @@ members = [
     "crates/ipc",
     "crates/driftling",
     "crates/settings",
+    "crates/worldsense",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ rust-version = "1.86"
 driftling-core = { path = "crates/core" }
 driftling-platform = { path = "crates/platform" }
 driftling-ipc = { path = "crates/ipc" }
+driftling-worldsense = { path = "crates/worldsense" }
 
 smithay-client-toolkit = "0.19"
 rustix = { version = "1", features = ["fs"] }
@@ -44,6 +46,10 @@ toml = "0.8"
 # eframe у настроек) паникует «no reactor running» без tokio-рантайма.
 # async-io — рантайм для zbus, общий с accesskit.
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+# D-Bus для worldsense (фаза D): приём снапшотов от KWin-скрипта. Тот же
+# режим, что у ksni: блокирующий API поверх async-io, фичу tokio НЕ включать
+# никогда — сломает a11y в eframe (см. предупреждение у ksni выше).
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # i18n (ТД-30): Fluent-локализация, локаль из ОС, en — полный фолбэк.
 i18n-embed = { version = "0.16", features = ["fluent-system", "desktop-requester"] }
 i18n-embed-fl = "0.10"

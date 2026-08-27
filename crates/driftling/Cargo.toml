@@ -10,6 +10,7 @@ repository.workspace = true
 driftling-core = { workspace = true }
 driftling-platform = { workspace = true }
 driftling-ipc = { workspace = true }
+driftling-worldsense = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

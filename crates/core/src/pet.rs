@@ -2,6 +2,7 @@
 
 use crate::behavior::{next_state_after, BehaviorConfig, PetState};
 use crate::geometry::{Rect, Vec2};
+use crate::physics::{support_below, Platform, STEP_SNAP, SUPPORT_TOL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -25,16 +26,32 @@ impl Direction {
     }
 }
 
-/// Мир M0: один экран, земля — нижняя кромка.
-/// В M1 сюда добавятся платформы из worldsense (кромки окон).
-#[derive(Debug, Clone)]
+/// Мир: один экран, земля — нижняя кромка (или верх панели, D5),
+/// плюс платформы из worldsense — верхние кромки окон (D4).
+/// Демон пересобирает `platforms` (и при необходимости
+/// `ground_y_override`) на каждый снапшот worldsense.
+#[derive(Debug, Clone, Default)]
 pub struct World {
     pub screen: Rect,
+    /// Верх панели (exclusive-зона): переопределяет землю.
+    pub ground_y_override: Option<f32>,
+    /// Верхние кромки окон, по которым можно ходить.
+    pub platforms: Vec<Platform>,
 }
 
 impl World {
+    /// Мир без платформ и без панели — как в M0.
+    pub fn new(screen: Rect) -> Self {
+        Self {
+            screen,
+            ground_y_override: None,
+            platforms: Vec::new(),
+        }
+    }
+
     pub fn ground_y(&self) -> f32 {
-        self.screen.bottom()
+        self.ground_y_override
+            .unwrap_or_else(|| self.screen.bottom())
     }
 }
 
@@ -203,11 +220,16 @@ impl Pet {
                 while left > 0.0 && self.state == PetState::Falling {
                     let step = left.min(0.05);
                     left -= step;
+                    // Опору ищем от ног ДО подшага: быстрый подшаг не должен
+                    // протыкать кромку окна насквозь. Кромки выше исходной
+                    // позиции не считаются — на окно садимся только сверху.
+                    let feet_before = self.pos.y;
                     self.vel.y += self.cfg.gravity * step;
                     self.pos = self.pos + self.vel * step;
                     self.clamp_horizontal(world);
-                    if self.pos.y >= world.ground_y() {
-                        self.pos.y = world.ground_y();
+                    let support = support_below(world, self.pos.x, feet_before);
+                    if self.pos.y >= support {
+                        self.pos.y = support;
                         let impact = self.vel.y;
                         self.vel = Vec2::default();
                         self.enter(if impact > self.cfg.hard_landing_speed {
@@ -233,11 +255,51 @@ impl Pet {
                     self.pos.x = world.screen.right() - self.size / 2.0;
                     self.facing = Direction::Left;
                 }
+                // Пол под ногами на новой позиции: перепад в пределах
+                // STEP_SNAP перешагиваем («ступеньки» окон), обрыв вниз
+                // больше порога — сошли с кромки, падаем.
+                let feet = self.pos.y;
+                let support = support_below(world, self.pos.x, feet - STEP_SNAP);
+                if support - feet > STEP_SNAP {
+                    self.vel = Vec2::new(self.cfg.walk_speed * self.facing.sign(), 0.0);
+                    self.enter(PetState::Falling);
+                    return;
+                }
+                self.pos.y = support;
                 self.advance_timer();
             }
             PetState::Idle | PetState::Sleep | PetState::Landing => {
                 self.advance_timer();
             }
+        }
+    }
+
+    /// Мир изменился (демон обновил платформы/панель по снапшоту worldsense).
+    /// Проверяем опору под ногами стоящего питомца (Idle/Walk/Sleep/Landing):
+    /// - опора уехала по вертикали не дальше [`SUPPORT_TOL`] — догоняем снапом
+    ///   (окно чуть сдвинули — питомец едет вместе с кромкой);
+    /// - опоры в пределах допуска больше нет (окно закрыли/свернули/увезли) —
+    ///   падаем, даже во сне: приземление выведет в Idle/Landing, т. е.
+    ///   Falling будит питомца.
+    ///
+    /// Falling и Dragged не трогаем: в воздухе опора не нужна, а позицию
+    /// в drag ведёт указатель (отпустили над окном — питомец упадёт на него
+    /// обычной физикой Falling).
+    ///
+    /// Вежливость к fullscreen (D5) — целиком на стороне демона: при
+    /// `fullscreen_active` он прячет сцену, продолжая тикать симуляцию;
+    /// ядру для этого ничего не нужно — `tick` работает и «за кадром».
+    pub fn world_changed(&mut self, world: &World) {
+        if matches!(self.state, PetState::Falling | PetState::Dragged) {
+            return;
+        }
+        let feet = self.pos.y;
+        let support = support_below(world, self.pos.x, feet - SUPPORT_TOL);
+        if (support - feet).abs() <= SUPPORT_TOL {
+            self.pos.y = support;
+        } else {
+            self.vel = Vec2::default();
+            self.enter(PetState::Falling);
         }
     }
 
@@ -343,9 +405,21 @@ mod tests {
     use super::*;
 
     fn world() -> World {
-        World {
-            screen: Rect::new(0.0, 0.0, 1920.0, 1080.0),
-        }
+        World::new(Rect::new(0.0, 0.0, 1920.0, 1080.0))
+    }
+
+    /// Мир с платформами-окнами (кромки задаются (x, top, ширина)).
+    fn world_with(edges: &[(f32, f32, f32)]) -> World {
+        let mut w = world();
+        w.platforms = edges
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, top, width))| Platform {
+                rect: Rect::new(x, top, width, 400.0),
+                id: i as u64,
+            })
+            .collect();
+        w
     }
 
     fn pet() -> Pet {
@@ -588,5 +662,242 @@ mod tests {
             p.state = state;
             assert_eq!(p.pace(), pace, "{state:?}");
         }
+    }
+
+    // ---- Фаза D: окна-рельеф -------------------------------------------
+
+    /// Падение заканчивается на верхней кромке окна, а не только на земле.
+    #[test]
+    fn falling_lands_on_window_top() {
+        // Кромка во всю ширину, чтобы питомец не ушёл с неё за время теста.
+        let w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.pos.y, 500.0, "стоит на кромке окна");
+        assert_ne!(p.state, PetState::Falling);
+    }
+
+    /// Сошёл с кромки при ходьбе — падает и приземляется на землю.
+    #[test]
+    fn walking_off_edge_falls() {
+        let w = world_with(&[(100.0, 500.0, 400.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(450.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Walk;
+        p.facing = Direction::Right;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        let mut fell = false;
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+            fell |= p.state == PetState::Falling;
+        }
+        assert!(fell, "за кромкой окна должен начаться Falling");
+        assert_eq!(p.pos.y, w.ground_y(), "долетел до земли");
+    }
+
+    /// Перепад кромок в пределах STEP_SNAP перешагивается — «ступеньки» окон.
+    #[test]
+    fn small_step_up_is_snapped_while_walking() {
+        let w = world_with(&[(100.0, 500.0, 200.0), (300.0, 492.0, 400.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(250.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Walk;
+        p.facing = Direction::Right;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        for _ in 0..180 {
+            p.tick(&w, 1.0 / 60.0);
+            assert_ne!(p.state, PetState::Falling, "ступенька в 8px — не обрыв");
+        }
+        assert!(p.pos.x > 300.0, "дошёл до второго окна");
+        assert_eq!(p.pos.y, 492.0, "поднялся на ступеньку");
+        assert_eq!(p.state, PetState::Walk);
+    }
+
+    /// Ступенька вниз больше STEP_SNAP — падение с приземлением на нижнюю кромку.
+    #[test]
+    fn big_step_down_falls_onto_lower_edge() {
+        let w = world_with(&[(100.0, 492.0, 200.0), (300.0, 522.0, 600.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(250.0, 492.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Walk;
+        p.facing = Direction::Right;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        let mut fell = false;
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+            fell |= p.state == PetState::Falling;
+            if fell && p.state != PetState::Falling {
+                // Проверяем сразу в момент приземления: дальше питомец
+                // может снова уйти гулять и свалиться с узкой кромки.
+                break;
+            }
+        }
+        assert!(fell, "перепад в 30px — обрыв");
+        assert_eq!(p.pos.y, 522.0, "приземлился на нижнюю кромку");
+    }
+
+    /// Окно закрыли под стоящим питомцем — world_changed роняет его на землю.
+    #[test]
+    fn window_vanish_under_idle_pet_falls() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(960.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Idle;
+        p.state_time = 0.0;
+        p.state_left = 1000.0;
+        w.platforms.clear();
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Falling);
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.pos.y, w.ground_y());
+    }
+
+    /// Окно закрыли под спящим — падает даже во сне, и падение его будит.
+    #[test]
+    fn window_vanish_wakes_sleeping_pet() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(960.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Sleep;
+        p.state_time = 0.0;
+        p.state_left = 1000.0;
+        w.platforms.clear();
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Falling, "сон прерван падением");
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.pos.y, w.ground_y());
+        assert_ne!(p.state, PetState::Sleep, "после падения не спит");
+    }
+
+    /// Окно чуть сдвинули по вертикали (≤ SUPPORT_TOL) — питомец едет
+    /// вместе с кромкой, не просыпаясь.
+    #[test]
+    fn small_window_move_snaps_without_waking() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(960.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Sleep;
+        p.state_time = 3.0;
+        p.state_left = 1000.0;
+        w.platforms[0].rect.y = 503.0;
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Sleep, "снап не будит");
+        assert_eq!(p.pos.y, 503.0, "ноги догнали кромку");
+        assert_eq!(p.state_time, 3.0, "таймер состояния не сброшен");
+    }
+
+    /// Окно резко уехало вверх — опоры под ногами больше нет, падаем.
+    #[test]
+    fn window_moved_far_up_drops_pet() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(960.0, 500.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Idle;
+        p.state_time = 0.0;
+        p.state_left = 1000.0;
+        w.platforms[0].rect.y = 470.0;
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Falling);
+    }
+
+    /// Верх панели (D5, exclusive-зона) — пол: падение заканчивается на нём.
+    #[test]
+    fn panel_override_acts_as_ground() {
+        let mut w = world();
+        w.ground_y_override = Some(1040.0);
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.pos.y, 1040.0, "земля — верх панели");
+    }
+
+    /// Питомца на земле окна ВЫШЕ него не касаются: появление окна над
+    /// головой ничего не меняет.
+    #[test]
+    fn ground_pet_unaffected_by_windows_above() {
+        let mut w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let (state, y) = (p.state, p.pos.y);
+        assert_eq!(y, w.ground_y());
+        w.platforms = vec![Platform {
+            rect: Rect::new(0.0, 500.0, 1920.0, 400.0),
+            id: 7,
+        }];
+        p.world_changed(&w);
+        assert_eq!(p.state, state, "окно над головой не меняет состояние");
+        assert_eq!(p.pos.y, y, "и не двигает питомца");
+        for _ in 0..120 {
+            p.tick(&w, 1.0 / 60.0);
+            assert_eq!(p.pos.y, w.ground_y(), "ходьба остаётся на земле");
+        }
+    }
+
+    /// Отпустили питомца над окном — он падает и приземляется на кромку.
+    #[test]
+    fn release_over_window_lands_on_it() {
+        let w = world_with(&[(300.0, 500.0, 600.0)]);
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        // На всякий случай вернём на землю (мог приземлиться и на кромку).
+        p.pos = Vec2::new(960.0, w.ground_y());
+        p.state = PetState::Idle;
+        p.state_left = 1000.0;
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        // Захват и перенос над окно; последние точки совпадают — без флика.
+        assert!(p.pointer(
+            &w,
+            PointerEvent::Motion(Vec2::new(grab.x + 5.0, grab.y)),
+            0.05
+        ));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(600.0, 300.0)), 0.1));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(600.0, 300.0)), 0.3));
+        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(600.0, 300.0)), 0.3));
+        assert_eq!(p.state, PetState::Falling);
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.pos.y, 500.0, "упал на кромку окна под точкой отпускания");
+    }
+
+    /// Dragged не трогается world_changed: позицию ведёт указатель.
+    #[test]
+    fn dragged_ignores_world_changes() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(600.0, 300.0)), 0.1));
+        assert_eq!(p.state, PetState::Dragged);
+        let pos = p.pos;
+        w.platforms.clear();
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Dragged);
+        assert_eq!((p.pos.x, p.pos.y), (pos.x, pos.y));
     }
 }
