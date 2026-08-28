@@ -18,7 +18,10 @@ mod i18n;
 use i18n::fl;
 
 use driftling_core::sprite::{placeholder_colored, Frame};
-use driftling_core::{palette, PetAttributes, PetStats, Stage, DEFAULT_PET_COLOR, PET_PRESETS};
+use driftling_core::{
+    palette, Config, PetAttributes, PetStats, Stage, SyncConfig, SyncMode, DEFAULT_PET_COLOR,
+    PET_PRESETS,
+};
 use driftling_ipc::{call, Request, Response};
 use eframe::egui::{
     self, Align2, Button, CollapsingHeader, Color32, CornerRadius, DragValue, FontData,
@@ -369,6 +372,20 @@ struct PetSnapshot {
     uptime_secs: u64,
 }
 
+/// Снимок статуса синка от демона (фаза E, карточка «Синхронизация»).
+#[derive(Clone)]
+struct SyncSnapshot {
+    /// Машинный режим демона: "off" | "server" | "folder".
+    mode: String,
+    last_push_secs: Option<u64>,
+    last_pull_secs: Option<u64>,
+    devices: u32,
+    events: u64,
+    holding: bool,
+    holder: Option<String>,
+    last_error: Option<String>,
+}
+
 /// Последнее известное состояние демона (пишут фоновые потоки, читает UI).
 #[derive(Default)]
 struct PollState {
@@ -377,6 +394,8 @@ struct PollState {
     /// Демон ответил на последний запрос.
     up: bool,
     info: Option<PetSnapshot>,
+    /// Статус синка (фаза E); None — демон лежит или не ответил.
+    sync: Option<SyncSnapshot>,
     /// Сырой PetInfo (pretty JSON) для дебаг-панели.
     raw: Option<String>,
 }
@@ -419,6 +438,33 @@ fn poll_once(slot: &Arc<Mutex<PollState>>) {
             color,
             uptime_secs,
         });
+    }
+    // Статус синка (фаза E) — вторым запросом; демон без поддержки или
+    // лежащий просто оставляет None.
+    if next.up {
+        if let Ok(Response::SyncStatus {
+            mode,
+            last_push_secs,
+            last_pull_secs,
+            devices,
+            events,
+            holding,
+            holder,
+            last_error,
+            ..
+        }) = call(&Request::SyncStatus)
+        {
+            next.sync = Some(SyncSnapshot {
+                mode,
+                last_push_secs,
+                last_pull_secs,
+                devices,
+                events,
+                holding,
+                holder,
+                last_error,
+            });
+        }
     }
     *slot.lock().unwrap() = next;
 }
@@ -880,6 +926,13 @@ struct SettingsApp {
     pet_action: Arc<Mutex<Option<String>>>,
     /// Результат остановки демона (страница «Приложение»).
     daemon_action: Arc<Mutex<Option<String>>>,
+    /// Результат применения настроек синка (фаза E).
+    sync_action: Arc<Mutex<Option<String>>>,
+    /// Форма секции [sync] config.toml (фаза E); читается на старте.
+    sync_mode: SyncMode,
+    sync_address: String,
+    sync_token: String,
+    sync_folder: String,
     /// Результат применения характеристик (дебаг).
     debug_action: Arc<Mutex<Option<String>>>,
     autostart: bool,
@@ -916,6 +969,10 @@ impl SettingsApp {
         let poll = Arc::new(Mutex::new(PollState::default()));
         spawn_poller(Arc::clone(&poll), cc.egui_ctx.clone());
 
+        // Форма синка (фаза E) — из config.toml; битый/отсутствующий
+        // конфиг даёт дефолт (синк выключен).
+        let sync = Config::load().map(|c| c.sync).unwrap_or_default();
+
         Self {
             // С флагом --debug открываемся сразу на админ-панели.
             page: if debug_enabled {
@@ -928,6 +985,11 @@ impl SettingsApp {
             poll,
             pet_action: Arc::new(Mutex::new(None)),
             daemon_action: Arc::new(Mutex::new(None)),
+            sync_action: Arc::new(Mutex::new(None)),
+            sync_mode: sync.mode,
+            sync_address: sync.address,
+            sync_token: sync.token,
+            sync_folder: sync.folder,
             debug_action: Arc::new(Mutex::new(None)),
             autostart: autostart_enabled(),
             autostart_result: None,
@@ -1433,6 +1495,7 @@ impl SettingsApp {
                 checked: guard.checked,
                 up: guard.up,
                 info: guard.info.clone(),
+                sync: None,
                 raw: None,
             }
         };
@@ -1542,12 +1605,167 @@ impl SettingsApp {
         });
         ui.add_space(2.0);
 
+        self.sync_card(ui);
+        ui.add_space(2.0);
+
         card(ui, |ui| {
             section_label(ui, &fl!("section-about"));
             ui.add_space(2.0);
             ui.label(format!("Driftling {}", env!("CARGO_PKG_VERSION")));
             ui.label(RichText::new(fl!("about-desc")).size(12.5).color(MUTED));
         });
+    }
+
+    /// Карточка «Синхронизация» (фаза E, ТЗ §3.5): режим (выкл / свой
+    /// сервер / папка), адрес+токен или путь папки, живой статус демона.
+    /// «Применить» пишет [sync] в config.toml и просит демона перечитать
+    /// его (Reload) — воркер синка переключается на лету.
+    fn sync_card(&mut self, ui: &mut egui::Ui) {
+        let sync_now = self.poll.lock().unwrap().sync.clone();
+        card(ui, |ui| {
+            section_label(ui, &fl!("section-sync"));
+            ui.add_space(2.0);
+
+            ui.horizontal(|ui| {
+                for (mode, label) in [
+                    (SyncMode::Off, fl!("sync-mode-off")),
+                    (SyncMode::Server, fl!("sync-mode-server")),
+                    (SyncMode::Folder, fl!("sync-mode-folder")),
+                ] {
+                    ui.selectable_value(&mut self.sync_mode, mode, label);
+                }
+            });
+            ui.add_space(2.0);
+
+            match self.sync_mode {
+                SyncMode::Off => {
+                    ui.label(RichText::new(fl!("sync-off-hint")).size(12.5).color(MUTED));
+                }
+                SyncMode::Server => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(fl!("sync-address-label")).color(MUTED));
+                        ui.add(
+                            TextEdit::singleline(&mut self.sync_address)
+                                .desired_width(260.0)
+                                .hint_text("http://host:8787"),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(fl!("sync-token-label")).color(MUTED));
+                        // Токен — секрет: поле в стиле пароля.
+                        ui.add(
+                            TextEdit::singleline(&mut self.sync_token)
+                                .desired_width(260.0)
+                                .password(true),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(fl!("sync-address-hint"))
+                            .size(12.5)
+                            .color(MUTED),
+                    );
+                }
+                SyncMode::Folder => {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(fl!("sync-folder-label")).color(MUTED));
+                        ui.add(
+                            TextEdit::singleline(&mut self.sync_folder)
+                                .desired_width(300.0)
+                                .hint_text("~/Sync/driftling"),
+                        );
+                    });
+                    ui.label(
+                        RichText::new(fl!("sync-folder-hint"))
+                            .size(12.5)
+                            .color(MUTED),
+                    );
+                }
+            }
+            ui.add_space(2.0);
+
+            // Живой статус от демона (что он думает прямо сейчас).
+            if let Some(s) = &sync_now {
+                if s.mode != "off" {
+                    let ago = |secs: Option<u64>| match secs {
+                        Some(v) => fl!("sync-status-ago", secs = v),
+                        None => fl!("sync-status-never"),
+                    };
+                    let mut line = format!(
+                        "{} · {}",
+                        fl!(
+                            "sync-status-line",
+                            push = ago(s.last_push_secs),
+                            pull = ago(s.last_pull_secs)
+                        ),
+                        fl!(
+                            "sync-status-journal",
+                            events = s.events,
+                            devices = s.devices
+                        )
+                    );
+                    if s.mode == "server" {
+                        let lease = if s.holding {
+                            fl!("sync-status-lease-ours")
+                        } else {
+                            match s.holder.as_deref() {
+                                Some(h) if !h.is_empty() => {
+                                    fl!("sync-status-lease-other", holder = h)
+                                }
+                                _ => String::new(),
+                            }
+                        };
+                        if !lease.is_empty() {
+                            line = format!("{line} · {lease}");
+                        }
+                    }
+                    ui.label(RichText::new(line).size(12.5).color(MUTED));
+                    if let Some(e) = &s.last_error {
+                        ui.label(
+                            RichText::new(fl!("sync-status-error", error = e.clone()))
+                                .size(12.5)
+                                .color(AMBER),
+                        );
+                    }
+                }
+            }
+
+            ui.add_space(2.0);
+            if primary_button(ui, &fl!("btn-apply"), true, self.accent).clicked() {
+                self.apply_sync(ui);
+            }
+            if let Some(text) = &*self.sync_action.lock().unwrap() {
+                ui.label(RichText::new(text).size(12.5).color(MUTED));
+            }
+        });
+    }
+
+    /// Записать форму синка в config.toml и попросить демона перечитать.
+    fn apply_sync(&mut self, ui: &egui::Ui) {
+        let mut cfg = Config::load().unwrap_or_default();
+        cfg.sync = SyncConfig {
+            mode: self.sync_mode,
+            address: self.sync_address.trim().to_string(),
+            token: self.sync_token.trim().to_string(),
+            folder: self.sync_folder.trim().to_string(),
+        };
+        match cfg.save() {
+            Ok(()) => {
+                let daemon_up = self.poll.lock().unwrap().up;
+                if daemon_up {
+                    self.action(
+                        ui,
+                        Request::Reload,
+                        fl!("msg-sync-applied"),
+                        &self.sync_action,
+                    );
+                } else {
+                    *self.sync_action.lock().unwrap() = Some(fl!("msg-sync-saved-daemon-down"));
+                }
+            }
+            Err(e) => {
+                *self.sync_action.lock().unwrap() = Some(fl!("generic-error", error = e));
+            }
+        }
     }
 
     // -- Страница «Отладка» ---------------------------------------------------

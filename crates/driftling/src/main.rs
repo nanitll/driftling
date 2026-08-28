@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 
 mod daemon;
 mod i18n;
+mod sync;
 mod tray;
 
 use i18n::fl;
@@ -65,12 +66,25 @@ enum CtlAction {
     // Перечитать конфиг и применить на лету.
     #[command(about = fl!("cli-about-reload"))]
     Reload,
+    // Синхронизация между устройствами (фаза E).
+    #[command(about = fl!("cli-about-sync"))]
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
     // Остановить демон.
     #[command(about = fl!("cli-about-quit"))]
     Quit,
     // Диагностика: окружение, сокет, файлы, автозапуск (работает без демона).
     #[command(about = fl!("cli-about-doctor"))]
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    // Статус синка: режим, последние push/pull, курсоры, lease.
+    #[command(about = fl!("cli-about-sync-status"))]
+    Status,
 }
 
 fn main() -> Result<()> {
@@ -115,6 +129,9 @@ fn main() -> Result<()> {
                     None => anyhow::bail!(fl!("ctl-recolor-bad-hex", value = color)),
                 },
                 CtlAction::Reload => driftling_ipc::Request::Reload,
+                CtlAction::Sync {
+                    action: SyncAction::Status,
+                } => driftling_ipc::Request::SyncStatus,
                 CtlAction::Quit => driftling_ipc::Request::Quit,
                 CtlAction::Doctor => return doctor(),
             };
@@ -180,10 +197,95 @@ fn main() -> Result<()> {
                         )
                     );
                 }
+                driftling_ipc::Response::SyncStatus {
+                    mode,
+                    address,
+                    folder,
+                    last_push_secs,
+                    last_pull_secs,
+                    devices,
+                    events,
+                    holding,
+                    holder,
+                    last_error,
+                } => print_sync_status(
+                    &mode,
+                    address.as_deref(),
+                    folder.as_deref(),
+                    last_push_secs,
+                    last_pull_secs,
+                    devices,
+                    events,
+                    holding,
+                    holder.as_deref(),
+                    last_error.as_deref(),
+                ),
                 driftling_ipc::Response::Error(e) => anyhow::bail!(e),
             }
             Ok(())
         }
+    }
+}
+
+/// Человекочитаемый вывод `ctl sync status` (машинные значения демона
+/// локализуются здесь, ТД-30).
+#[allow(clippy::too_many_arguments)]
+fn print_sync_status(
+    mode: &str,
+    address: Option<&str>,
+    folder: Option<&str>,
+    last_push_secs: Option<u64>,
+    last_pull_secs: Option<u64>,
+    devices: u32,
+    events: u64,
+    holding: bool,
+    holder: Option<&str>,
+    last_error: Option<&str>,
+) {
+    let mode_name = match mode {
+        "off" => fl!("sync-mode-off"),
+        "server" => fl!("sync-mode-server"),
+        "folder" => fl!("sync-mode-folder"),
+        other => other.to_string(),
+    };
+    let target = address.or(folder).unwrap_or_default();
+    if target.is_empty() {
+        println!("{}", fl!("ctl-sync-mode", mode = mode_name));
+    } else {
+        println!(
+            "{}",
+            fl!("ctl-sync-mode-target", mode = mode_name, target = target)
+        );
+    }
+    if mode == "off" {
+        return;
+    }
+    let ago = |secs: Option<u64>| match secs {
+        Some(s) => fl!("ctl-sync-ago", secs = s),
+        None => fl!("ctl-sync-never"),
+    };
+    println!(
+        "{}",
+        fl!(
+            "ctl-sync-transfers",
+            push = ago(last_push_secs),
+            pull = ago(last_pull_secs)
+        )
+    );
+    println!(
+        "{}",
+        fl!("ctl-sync-journal", events = events, devices = devices)
+    );
+    if mode == "server" {
+        let line = match (holding, holder) {
+            (true, _) => fl!("ctl-sync-lease-ours"),
+            (false, Some(h)) if !h.is_empty() => fl!("ctl-sync-lease-holder", holder = h),
+            _ => fl!("ctl-sync-lease-unknown"),
+        };
+        println!("{line}");
+    }
+    if let Some(e) = last_error {
+        println!("{}", fl!("ctl-sync-error", error = e));
     }
 }
 
@@ -295,45 +397,59 @@ fn doctor() -> Result<()> {
         ),
     }
 
+    // Конфиг читается один раз: печать в п.4 и секция [sync] для
+    // каталога журналов (режим «папки») и проверок синка в п.5.
+    let cfg_path = driftling_core::config::path();
+    let cfg_loaded = driftling_core::Config::load();
+    let sync_cfg = cfg_loaded
+        .as_ref()
+        .map(|c| c.sync.clone())
+        .unwrap_or_default();
+
     // 3. pet.json (v3: только device_id) + журнал событий — источник
     // истины о питомце. Имя берём свёрткой журнала. load() при v1/v2
     // сам мигрирует содержимое в журнал — то же сделал бы демон при
     // старте, операция идемпотентна (ТД-15).
     let pet_path = driftling_core::attributes::record_path();
+    let data_dir = driftling_core::attributes::data_dir();
+    // Каталог журналов — как его увидит демон (sync.folder в режиме папки).
+    let folder = sync_cfg.folder.trim();
+    let journal_dir = if sync_cfg.mode == driftling_core::SyncMode::Folder && !folder.is_empty() {
+        std::path::PathBuf::from(folder)
+    } else {
+        data_dir.clone()
+    };
     match driftling_core::PetRecord::load() {
-        Ok(Some(_rec)) => {
-            let data_dir = driftling_core::attributes::data_dir();
-            match driftling_core::Journal::open(&data_dir) {
-                Ok((events, warnings)) => {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
-                    let pet =
-                        driftling_core::fold(&events, now_ms, &driftling_core::FoldCfg::default());
-                    check(
-                        true,
-                        &fl!(
-                            "doctor-pet-ok",
-                            name = pet.name,
-                            path = pet_path.display().to_string()
-                        ),
-                    );
-                    check(
-                        warnings == 0,
-                        &fl!(
-                            "doctor-journal",
-                            events = (events.len() as u64),
-                            warnings = warnings,
-                            path = driftling_core::journal_path_in(&data_dir)
-                                .display()
-                                .to_string()
-                        ),
-                    );
-                }
-                Err(e) => check(false, &fl!("doctor-journal-unreadable", error = e)),
+        Ok(Some(rec)) => match driftling_core::Journal::open(&journal_dir) {
+            Ok((events, warnings)) => {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let pet =
+                    driftling_core::fold(&events, now_ms, &driftling_core::FoldCfg::default());
+                check(
+                    true,
+                    &fl!(
+                        "doctor-pet-ok",
+                        name = pet.name,
+                        path = pet_path.display().to_string()
+                    ),
+                );
+                check(
+                    warnings == 0,
+                    &fl!(
+                        "doctor-journal",
+                        events = (events.len() as u64),
+                        warnings = warnings,
+                        path = driftling_core::device_journal_path_in(&journal_dir, &rec.device_id)
+                            .display()
+                            .to_string()
+                    ),
+                );
             }
-        }
+            Err(e) => check(false, &fl!("doctor-journal-unreadable", error = e)),
+        },
         Ok(None) => check(
             false,
             &fl!("doctor-pet-missing", path = pet_path.display().to_string()),
@@ -349,9 +465,8 @@ fn doctor() -> Result<()> {
     }
 
     // 4. config.toml.
-    let cfg_path = driftling_core::config::path();
     if cfg_path.exists() {
-        match driftling_core::Config::load() {
+        match &cfg_loaded {
             Ok(_) => check(
                 true,
                 &fl!("doctor-config-ok", path = cfg_path.display().to_string()),
@@ -361,7 +476,7 @@ fn doctor() -> Result<()> {
                 &fl!(
                     "doctor-config-broken",
                     path = cfg_path.display().to_string(),
-                    error = e
+                    error = e.clone()
                 ),
             ),
         }
@@ -374,6 +489,10 @@ fn doctor() -> Result<()> {
             ),
         );
     }
+
+    // 5. Синхронизация (фаза E): достижимость сервера и токен либо
+    // доступность папки — по конфигу, без демона.
+    doctor_sync(&sync_cfg, &journal_dir);
 
     // 5. Автозапуск: systemd user unit или .desktop в autostart.
     let unit_enabled = std::process::Command::new("systemctl")
@@ -415,6 +534,120 @@ fn doctor() -> Result<()> {
         println!("{}", fl!("doctor-verdict-not-running"));
     }
     Ok(())
+}
+
+/// Секция синка в `ctl doctor` (фаза E): сервер — health + проверка токена
+/// пустым push (ничего не пишет), папка — существование и права записи.
+fn doctor_sync(sync: &driftling_core::SyncConfig, journal_dir: &std::path::Path) {
+    use driftling_core::SyncMode;
+    match sync.mode {
+        SyncMode::Off => check(true, &fl!("doctor-sync-off")),
+        SyncMode::Server => {
+            for w in sync.warnings() {
+                check(false, &w);
+            }
+            let address = sync.address.trim().trim_end_matches('/');
+            if address.is_empty() {
+                return;
+            }
+            match minreq::get(format!("{address}/v1/health"))
+                .with_timeout(5)
+                .send()
+            {
+                Ok(resp) if resp.status_code == 200 => {
+                    check(true, &fl!("doctor-sync-server-ok", address = address));
+                    if sync.token.trim().is_empty() {
+                        return;
+                    }
+                    // Пустой push — валидная и «сухая» проверка токена:
+                    // сервер ничего не сохраняет, отвечает accepted: 0.
+                    let auth = minreq::post(format!("{address}/v1/push"))
+                        .with_header("Authorization", format!("Bearer {}", sync.token.trim()))
+                        .with_header("Content-Type", "application/json")
+                        .with_timeout(5)
+                        .with_body(r#"{"device":"doctor","events":[]}"#)
+                        .send();
+                    match auth {
+                        Ok(resp) if resp.status_code == 200 => {
+                            check(true, &fl!("doctor-sync-token-ok"))
+                        }
+                        Ok(resp) if resp.status_code == 401 => {
+                            check(false, &fl!("doctor-sync-token-bad"))
+                        }
+                        Ok(resp) => check(
+                            false,
+                            &fl!(
+                                "doctor-sync-server-odd",
+                                status = i64::from(resp.status_code)
+                            ),
+                        ),
+                        Err(e) => check(
+                            false,
+                            &fl!(
+                                "doctor-sync-server-unreachable",
+                                address = address,
+                                error = e.to_string()
+                            ),
+                        ),
+                    }
+                }
+                Ok(resp) => check(
+                    false,
+                    &fl!(
+                        "doctor-sync-server-odd",
+                        status = i64::from(resp.status_code)
+                    ),
+                ),
+                Err(e) => check(
+                    false,
+                    &fl!(
+                        "doctor-sync-server-unreachable",
+                        address = address,
+                        error = e.to_string()
+                    ),
+                ),
+            }
+        }
+        SyncMode::Folder => {
+            for w in sync.warnings() {
+                check(true, &w); // рекомендация, не провал
+            }
+            if !journal_dir.is_dir() {
+                check(
+                    false,
+                    &fl!(
+                        "doctor-sync-folder-missing",
+                        path = journal_dir.display().to_string()
+                    ),
+                );
+                return;
+            }
+            let writable = rustix::fs::access(journal_dir, rustix::fs::Access::WRITE_OK).is_ok();
+            let files = std::fs::read_dir(journal_dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| n.starts_with("journal.") && n.ends_with(".jsonl"))
+                        })
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            check(
+                writable,
+                &fl!(
+                    "doctor-sync-folder-ok",
+                    path = journal_dir.display().to_string(),
+                    files = files
+                ),
+            );
+            if !writable {
+                check(false, &fl!("doctor-sync-folder-readonly"));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

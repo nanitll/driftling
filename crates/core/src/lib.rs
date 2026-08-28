@@ -25,18 +25,20 @@ pub mod pet;
 pub mod physics;
 pub mod sprite;
 pub mod stats;
+pub mod sync;
 pub mod text;
 
 pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, PetState};
-pub use config::Config;
+pub use config::{Config, SyncConfig, SyncMode};
 pub use geometry::{Rect, Vec2};
 pub use growth::Stage;
+#[cfg(not(target_arch = "wasm32"))]
+pub use journal::{device_journal_path_in, journal_path_in, Journal};
 pub use journal::{
     fold, merge, random_device_id, DerivedPet, Event, EventKind, FoldCfg, Hlc, HlcClock,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use journal::{journal_path_in, Journal};
 pub use palette::{DEFAULT_PET_COLOR, PET_PRESETS};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
 pub use stats::PetStats;
+pub use sync::{apply_remote, cursors_of, events_after, Cursors};

@@ -16,6 +16,8 @@ cli-about-sleep = Put the pet to sleep
 cli-about-rename = Rename the pet
 cli-about-recolor = Recolor the pet (hex color #rrggbb, e.g. e8944a)
 cli-about-reload = Re-read the config and apply it on the fly
+cli-about-sync = Multi-device sync (phase E)
+cli-about-sync-status = Sync status: mode, last push/pull, journal cursors, presence lease
 cli-about-quit = Stop the daemon
 cli-about-doctor = Diagnostics: environment, socket, files, autostart (works without the daemon)
 
@@ -62,6 +64,43 @@ doctor-autostart-none = autostart is not configured (neither a systemd unit nor 
 doctor-verdict-ok = Verdict: all good — the daemon is running and answering.
 doctor-verdict-should-run = Verdict: the daemon should be running, but is not answering. Start `driftling` (or `systemctl --user restart driftling`).
 doctor-verdict-not-running = Verdict: the daemon is not running, autostart is not configured. Start `driftling`.
+
+# --- sync (ctl sync status, phase E) ---
+sync-mode-off = off
+sync-mode-server = own server
+sync-mode-folder = synced folder
+ctl-sync-mode = sync: { $mode }
+ctl-sync-mode-target = sync: { $mode } — { $target }
+ctl-sync-ago = { $secs } s ago
+ctl-sync-never = never
+ctl-sync-transfers = push: { $push } · pull: { $pull }
+ctl-sync-journal =
+    journal: { $events ->
+        [one] { $events } event
+       *[other] { $events } events
+    } from { $devices ->
+        [one] { $devices } device
+       *[other] { $devices } devices
+    }
+ctl-sync-lease-ours = presence: the pet is on this device (lease is ours)
+ctl-sync-lease-holder = presence: the pet is on "{ $holder }"
+ctl-sync-lease-unknown = presence: lease holder not known yet
+ctl-sync-error = last sync error: { $error }
+
+# --- doctor: sync section ---
+doctor-sync-off = sync is off ([sync] mode = "off")
+doctor-sync-server-ok = sync server is reachable ({ $address })
+doctor-sync-server-unreachable = sync server is unreachable ({ $address }): { $error }
+doctor-sync-server-odd = sync server answered unexpectedly (HTTP { $status })
+doctor-sync-token-ok = sync token is accepted
+doctor-sync-token-bad = sync token is rejected (401) — check sync.token in config.toml
+doctor-sync-folder-missing = sync folder does not exist: { $path }
+doctor-sync-folder-ok =
+    sync folder: { $path } ({ $files ->
+        [one] { $files } journal file
+       *[other] { $files } journal files
+    })
+doctor-sync-folder-readonly = the sync folder is not writable — the pet cannot journal there
 
 # --- daemon IPC error responses (shown by ctl and the settings window) ---
 daemon-shutting-down = the daemon is shutting down

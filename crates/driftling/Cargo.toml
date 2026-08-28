@@ -21,3 +21,13 @@ ksni = { workspace = true }
 i18n-embed = { workspace = true }
 i18n-embed-fl = { workspace = true }
 rust-embed = { workspace = true }
+# Синк (фаза E): sync-state.json воркера и JSON-тела HTTP API v1.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Крошечный БЛОКИРУЮЩИЙ HTTP-клиент для синк-воркера (ТЗ §3.5). В демоне
+# tokio запрещён (фичи zbus/ksni! см. workspace Cargo.toml); дефолтные
+# фичи minreq = ноль зависимостей и только plain http — TLS терминирует
+# reverse-proxy на стороне сервера, клиент ходит по LAN/VPN/localhost.
+minreq = "3"
+# Проверка прав каталога папочного синка в ctl doctor (access W_OK).
+rustix = { workspace = true }

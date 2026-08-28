@@ -1,0 +1,39 @@
+# Системный юнит driftling-server (установка без Docker).
+# Бинарь: /usr/local/bin/driftling-server
+# Конфиг: /etc/driftling-server.toml (db = "/var/lib/driftling-server/…")
+#
+#   sudo cp driftling-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now driftling-server
+
+[Unit]
+Description=Driftling sync server (journal push/pull + presence lease)
+Documentation=https://github.com/nanitll/driftling
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/driftling-server --config /etc/driftling-server.toml serve
+Restart=on-failure
+RestartSec=2
+
+# Отдельный динамический пользователь + своё состояние в /var/lib.
+DynamicUser=yes
+StateDirectory=driftling-server
+
+# Песочница: серверу нужны только сеть и свой каталог состояния.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -62,26 +62,28 @@
 //!   input region), симуляция продолжает тикать «за кадром»; уход из
 //!   fullscreen возвращает питомца на место.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use driftling_core::palette;
 use driftling_core::physics::Platform;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
-    fold, growth, text, Config, DerivedPet, Direction, Event as JournalEvent, EventKind, FoldCfg,
-    HlcClock, Journal, Pet, PetAttributes, PetRecord, PetState, PointerEvent, Rect, SimPace, Stage,
-    Vec2, World,
+    apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
+    Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Pet, PetAttributes,
+    PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, SyncConfig, SyncMode, Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
 use driftling_worldsense::WorldSense;
 
 use crate::i18n::fl;
+use crate::sync::{self, SyncCmd, SyncHandle, SyncNote};
 
 /// Сколько IPC-поток ждёт ответа от цикла приложения, прежде чем сдаться.
 const IPC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -119,6 +121,15 @@ const SLEPT_MIN_MINUTES: f32 = 0.5;
 /// дёргать чаще при Calm/Drowsy. Активный питомец и скрытый (fullscreen)
 /// опрашиваются каждый тик.
 const SENSE_POLL_IDLE: Duration = Duration::from_secs(2);
+/// Режим «папки» (фаза E): период проверки mtime чужих journal.*.jsonl.
+const FOLDER_POLL: Duration = Duration::from_secs(10);
+/// Скорость пробежки присутствия («убежал/прибежал», фаза E), лог. px/с —
+/// заметно быстрее любой прогулки: питомец именно УБЕГАЕТ за край.
+const PRESENCE_RUN_SPEED: f32 = 420.0;
+/// Куда прибегает питомец при run-in: доля ширины экрана от края входа.
+const PRESENCE_RUN_IN_DEPTH: f32 = 0.3;
+/// Троттлинг lease-claim от пользовательских взаимодействий.
+const CLAIM_THROTTLE: Duration = Duration::from_secs(2);
 
 /// Сообщение из IPC-потока: запрос + канал для ровно одного ответа.
 /// Тем же каналом пользуется поток трея (B7).
@@ -239,10 +250,26 @@ pub fn run() -> Result<()> {
     if let Some(scale) = growth_scale {
         log::warn!("DRIFTLING_GROWTH_SCALE={scale}: рост ускорен (дебаг-режим)");
     }
+    // Синк (фаза E): секция [sync] config.toml; битый конфиг не роняет
+    // демона — просто работаем без синка (и говорим об этом).
+    let sync_cfg = match Config::load() {
+        Ok(cfg) => cfg.sync,
+        Err(e) => {
+            log::warn!("config.toml не прочитан ({e}) — синк выключен");
+            driftling_core::SyncConfig::default()
+        }
+    };
     // Восприятие мира (фаза D): KWin-провайдер на KDE, null-провайдер
     // (пол = низ экрана) везде ещё; деградация штатная, демон работает всегда.
     let sense = driftling_worldsense::detect();
-    let app = DaemonApp::new(rx, data_dir, legacy_attrs, growth_scale, Some(sense));
+    let app = DaemonApp::new(
+        rx,
+        data_dir,
+        legacy_attrs,
+        growth_scale,
+        Some(sense),
+        sync_cfg,
+    );
 
     // SIGTERM/SIGINT (ТД-20): флаг проверяется в tick -> graceful-выход.
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -270,6 +297,80 @@ struct PetStorage {
     /// нашей версии, бэкап битого файла не удался). Работаем в памяти:
     /// уход действует до рестарта, на диск не пишем ничего.
     writable: bool,
+    /// Каталог журналов: `data_dir`, либо `sync.folder` (режим «папки»).
+    journal_dir: PathBuf,
+}
+
+/// Каталог журналов по конфигу синка (фаза E): режим «папки» с указанным
+/// путём уводит журналы в синкаемый каталог; pet.json (device_id!) и
+/// sync-state.json ВСЕГДА остаются локальными в `data_dir`.
+fn resolve_journal_dir(data_dir: &Path, sync: &SyncConfig) -> PathBuf {
+    let folder = sync.folder.trim();
+    if sync.mode == SyncMode::Folder && !folder.is_empty() {
+        PathBuf::from(folder)
+    } else {
+        data_dir.to_path_buf()
+    }
+}
+
+/// Подписи ЧУЖИХ журнальных файлов каталога (режим «папки»): имя ->
+/// (длина, mtime). Свой файл исключён — его меняем мы сами; легаси
+/// `journal.jsonl` считается чужим (мог принести синкер).
+fn folder_signature(dir: &Path, own_device: &str) -> BTreeMap<String, (u64, Option<SystemTime>)> {
+    let own_name = format!("journal.{own_device}.jsonl");
+    let mut out = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_journal = name == "journal.jsonl"
+            || (name.len() > "journal..jsonl".len()
+                && name.starts_with("journal.")
+                && name.ends_with(".jsonl"));
+        if !is_journal || name == own_name {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        out.insert(name.to_string(), (meta.len(), meta.modified().ok()));
+    }
+    out
+}
+
+/// Привести файл СВОЕГО устройства в целевой каталог журналов: среди
+/// кандидатов (локальный каталог данных и настроенная папка) выбирается
+/// самая длинная копия `journal.<device>.jsonl` — файл append-only и
+/// single-writer, поэтому все копии — префиксы истинного лога, и «длиннее»
+/// = «полнее». Так переживаются включение папочного режима (файл уезжает
+/// в папку), его выключение (возврат в data_dir) и смена самой папки.
+fn adopt_own_journal(candidates: &[&Path], journal_dir: &Path, device: &str) {
+    let target = device_journal_path_in(journal_dir, device);
+    let len_of = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let target_len = len_of(&target);
+    let best = candidates
+        .iter()
+        .filter(|dir| ***dir != *journal_dir)
+        .map(|dir| device_journal_path_in(dir, device))
+        .filter(|p| p.is_file())
+        .max_by_key(|p| len_of(p))
+        .filter(|p| len_of(p) > target_len);
+    let Some(best) = best else { return };
+    if let Err(e) = std::fs::create_dir_all(journal_dir) {
+        log::warn!("каталог журналов {} не создан: {e}", journal_dir.display());
+        return;
+    }
+    match std::fs::copy(&best, &target) {
+        Ok(_) => log::info!(
+            "синк: журнал устройства перенесён {} -> {}",
+            best.display(),
+            target.display()
+        ),
+        Err(e) => log::warn!("синк: журнал устройства не скопирован ({e})"),
+    }
 }
 
 /// Загрузить журнал и pet.json (schema v3) из `data_dir`.
@@ -282,7 +383,15 @@ struct PetStorage {
 ///   Egg (вылупление и онбординг — B6). Имя локализуется ровно один раз —
 ///   оно данные журнала и смену локали переживает (ТД-30); характеристики
 ///   берутся из `legacy_attrs` (миграция старых секций config.toml).
-fn load_storage(data_dir: &Path, legacy_attrs: Option<PetAttributes>) -> PetStorage {
+///
+/// Фаза E: `sync` определяет КАТАЛОГ журналов (режим «папки» уводит их в
+/// синкаемую папку); pet.json и sync-state.json всегда в `data_dir`, файл
+/// своего устройства при смене каталога догоняется [`adopt_own_journal`].
+fn load_storage(
+    data_dir: &Path,
+    sync: &SyncConfig,
+    legacy_attrs: Option<PetAttributes>,
+) -> PetStorage {
     let (record, mut writable) = match PetRecord::load_in(data_dir) {
         Ok(Some(rec)) => (rec, true),
         Ok(None) => {
@@ -300,7 +409,30 @@ fn load_storage(data_dir: &Path, legacy_attrs: Option<PetAttributes>) -> PetStor
         }
     };
 
-    let (mut events, warnings) = match Journal::open(data_dir) {
+    let journal_dir = resolve_journal_dir(data_dir, sync);
+    if journal_dir != data_dir {
+        log::info!("синк: журналы в папке {}", journal_dir.display());
+        // Легаси-файл data_dir (до фазы E) сперва уводится в файл своего
+        // устройства — open_dir целевого каталога его бы не увидел.
+        if driftling_core::journal_path_in(data_dir).exists() {
+            if let Err(e) = Journal::open_dir(data_dir, &record.device_id) {
+                log::warn!("миграция легаси-журнала: {e}");
+            }
+        }
+    }
+    // Свой файл догоняет смену каталога (вкл/выкл/смена папки): побеждает
+    // самая длинная копия — префикс-свойство append-only делает это точным.
+    let folder = PathBuf::from(sync.folder.trim());
+    let mut candidates: Vec<&Path> = vec![data_dir];
+    if !sync.folder.trim().is_empty() {
+        candidates.push(&folder);
+    }
+    adopt_own_journal(&candidates, &journal_dir, &record.device_id);
+
+    // E-core: журнал пер-девайсный (ТЗ §3.5) — open_dir мигрирует
+    // одиночный journal.jsonl в journal.<device_id>.jsonl и сливает
+    // файлы всех устройств (чужие — read-only входы).
+    let (mut events, warnings) = match Journal::open_dir(&journal_dir, &record.device_id) {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("журнал не прочитан ({e}) — деградация: работаем в памяти без записи");
@@ -334,7 +466,8 @@ fn load_storage(data_dir: &Path, legacy_attrs: Option<PetAttributes>) -> PetStor
             },
         };
         if writable {
-            if let Err(e) = Journal::append(data_dir, &ev) {
+            // E-core: запись только в файл своего устройства.
+            if let Err(e) = Journal::append(&journal_dir, clock.device(), &ev) {
                 log::warn!("Genesis не записан в журнал: {e}");
             }
         }
@@ -346,6 +479,7 @@ fn load_storage(data_dir: &Path, legacy_attrs: Option<PetAttributes>) -> PetStor
         events,
         clock,
         writable,
+        journal_dir,
     }
 }
 
@@ -506,6 +640,24 @@ fn spawn_settings_detached() {
     }
 }
 
+/// Сценарная пробежка присутствия (фаза E, фирменный UX ТЗ §3.5): демон
+/// ведёт питомца за руку мимо машины поведения — быстрый бег к краю
+/// («убежал на другое устройство») или от края («прибежал»). Пока анимация
+/// активна, обычный `Pet::tick` не зовётся и хит-области нет (убегающего
+/// не поймать).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PresenceAnim {
+    /// Бег к краю: dir = -1.0 (влево) | +1.0 (вправо); за краем питомец
+    /// снимается БЕЗ события журнала (присутствие — не уход).
+    RunOff { dir: f32 },
+    /// Бег от края внутрь до `target_x`, дальше — обычное поведение.
+    RunIn { dir: f32, target_x: f32 },
+}
+
+/// Подписи чужих журнальных файлов для горячей перечитки режима «папки»:
+/// имя -> (длина, mtime). Смена подписи = синкер что-то принёс.
+type FolderSeen = BTreeMap<String, (u64, Option<SystemTime>)>;
+
 /// Состояние демона между кадрами. Владеет SpriteSet: Scene заимствует
 /// кадры из него, поэтому tick возвращает Scene<'_> с временем жизни self.
 struct DaemonApp {
@@ -570,8 +722,29 @@ struct DaemonApp {
     /// ответ клиенту — ctl quit изредка получал EOF вместо «ok».
     quit_via_ipc: Arc<AtomicBool>,
     rx: Receiver<IpcMessage>,
-    /// Каталог данных (журнал + pet.json) — DI вместо env-переменных (ТД-26).
+    /// Каталог данных (pet.json, sync-state.json) — DI вместо env (ТД-26).
     data_dir: PathBuf,
+    /// Каталог журналов: data_dir либо sync.folder (режим «папки», фаза E).
+    journal_dir: PathBuf,
+    /// Конфиг синка (фаза E); перечитывается `ctl reload`.
+    sync_cfg: SyncConfig,
+    /// Воркер синка (mode = server); None — off/folder. Дроп ручки
+    /// завершает поток воркера.
+    sync: Option<SyncHandle>,
+    /// Питомец скрыт lease-ом («перебежал» на другое устройство). Это НЕ
+    /// dismiss: события журнала нет, derived.summoned остаётся true.
+    lease_hidden: bool,
+    /// Активная пробежка присутствия (run-off/run-in).
+    presence_anim: Option<PresenceAnim>,
+    /// Троттлинг lease-claim от пользовательских взаимодействий.
+    last_claim: Option<Instant>,
+    /// Режим «папки»: последняя проверка чужих файлов и их подписи.
+    folder_poll_at: Option<Instant>,
+    folder_seen: FolderSeen,
+    /// Интервал опроса папки; тесты ужимают до нуля (ТД-26).
+    folder_poll: Duration,
+    /// Последнее успешное вливание чужих файлов (статус синка папки).
+    folder_merged_at: Option<Instant>,
     /// Взводится обработчиком SIGTERM/SIGINT; tick превращает в exit.
     sig_exit: Arc<AtomicBool>,
 }
@@ -582,15 +755,21 @@ impl DaemonApp {
     /// старых секций config.toml, применяется только при рождении питомца;
     /// `growth_scale` — дебаг-ускорение роста (DRIFTLING_GROWTH_SCALE);
     /// `sense` — провайдер worldsense (фаза D), создаётся в run(): реальный
-    /// провайдер грузит скрипт в живой KWin, тестам такое нельзя (ТД-26).
+    /// провайдер грузит скрипт в живой KWin, тестам такое нельзя (ТД-26);
+    /// `sync_cfg` — секция [sync] config.toml (фаза E), тесты дают дефолт
+    /// (off) — сеть и потоки воркера им не нужны.
     fn new(
         rx: Receiver<IpcMessage>,
         data_dir: PathBuf,
         legacy_attrs: Option<PetAttributes>,
         growth_scale: Option<f64>,
         sense: Option<Box<dyn WorldSense>>,
+        sync_cfg: SyncConfig,
     ) -> Self {
-        let storage = load_storage(&data_dir, legacy_attrs);
+        for w in sync_cfg.warnings() {
+            log::warn!("конфиг синка: {w}");
+        }
+        let storage = load_storage(&data_dir, &sync_cfg, legacy_attrs);
         let mut fold_cfg = FoldCfg::default();
         if let Some(scale) = growth_scale {
             fold_cfg.growth_scale = scale;
@@ -602,6 +781,24 @@ impl DaemonApp {
             derived.stage.as_str(),
             storage.events.len()
         );
+        // Воркер синка (фаза E, режим «свой сервер»): push/pull + lease.
+        let sync = (sync_cfg.mode == SyncMode::Server).then(|| {
+            sync::spawn(
+                &sync_cfg,
+                &data_dir,
+                &storage.journal_dir,
+                storage.clock.device(),
+                derived.summoned,
+                sync::Tuning::default(),
+            )
+        });
+        // Режим «папки»: стартовая подпись чужих файлов, чтобы первый
+        // опрос не перечитывал каталог зря.
+        let folder_seen = if sync_cfg.mode == SyncMode::Folder {
+            folder_signature(&storage.journal_dir, storage.clock.device())
+        } else {
+            FolderSeen::default()
+        };
         let size = derived.attributes.clamped().size;
         let stage = derived.stage;
         let color = derived.color;
@@ -634,6 +831,16 @@ impl DaemonApp {
             quit_via_ipc: Arc::new(AtomicBool::new(false)),
             rx,
             data_dir,
+            journal_dir: storage.journal_dir,
+            sync_cfg,
+            sync,
+            lease_hidden: false,
+            presence_anim: None,
+            last_claim: None,
+            folder_poll_at: None,
+            folder_seen,
+            folder_poll: FOLDER_POLL,
+            folder_merged_at: None,
             sig_exit: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -654,12 +861,17 @@ impl DaemonApp {
             kind,
         };
         if self.journal_writable {
-            Journal::append(&self.data_dir, &ev)?;
+            // E-core: запись только в файл своего устройства (ТЗ §3.5).
+            Journal::append(&self.journal_dir, self.clock.device(), &ev)?;
         }
         // Часы подтянуты под журнал при старте: новый id строго больше
         // всех прежних, сортировка сохраняется без пересортировки.
         self.events.push(ev);
         self.refold();
+        // Фаза E: локальное событие — повод синкнуться немедленно.
+        if let Some(sync) = &self.sync {
+            sync.send(SyncCmd::Wake);
+        }
         Ok(())
     }
 
@@ -731,9 +943,17 @@ impl DaemonApp {
 
     /// Убрать питомца с экрана (IPC, меню, трей): закрыть период сна,
     /// снять визуальные эффекты, записать Dismissed (ТД-17).
+    /// Явный dismiss — воля пользователя: он же отпускает lease
+    /// присутствия и снимает lease-скрытие (фаза E).
     fn dismiss(&mut self, now: f64) -> Response {
         self.close_sleep(now);
         self.clear_effects();
+        self.presence_anim = None;
+        self.lease_hidden = false;
+        if let Some(sync) = &self.sync {
+            sync.send(SyncCmd::SetSummoned(false));
+            sync.send(SyncCmd::Release);
+        }
         if self.pet.take().is_some() {
             log::info!("dismiss: питомец убран с экрана");
         }
@@ -956,11 +1176,290 @@ impl DaemonApp {
         Response::Ok
     }
 
+    // -- Присутствие (фаза E, ТЗ §3.5): lease + «убежал/прибежал» ------------
+
+    /// Призыв по воле пользователя (IPC/трей): после lease-скрытия питомец
+    /// ПРИБЕГАЕТ от края (фирменный UX), иначе — обычный summon. В любом
+    /// случае забираем lease: питомец теперь здесь. Локально-первично:
+    /// питомец появляется сразу, не дожидаясь сервера (оффлайн — штатно).
+    fn summon_requested(&mut self, now: f64) -> Response {
+        let run_in = self.lease_hidden && self.pet.is_none() && self.derived.stage != Stage::Egg;
+        let resp = if run_in {
+            self.summon_run_in(now)
+        } else {
+            self.summon(now)
+        };
+        if resp == Response::Ok {
+            self.lease_hidden = false;
+            if let Some(sync) = &self.sync {
+                sync.send(SyncCmd::SetSummoned(true));
+                sync.send(SyncCmd::Claim);
+            }
+        }
+        resp
+    }
+
+    /// Появление с пробежкой от края (возврат после «убежал»). Питомец
+    /// ставится за левым краем на уровне пола и бежит внутрь экрана.
+    fn summon_run_in(&mut self, now: f64) -> Response {
+        let Some(world) = &self.world else {
+            return Response::Error(fl!("daemon-output-not-ready"));
+        };
+        if self.pet.is_none() {
+            let size = self.sprites.size as f32;
+            let start = Vec2::new(world.screen.x - size, world.ground_y());
+            let mut pet = Pet::new(
+                start,
+                size,
+                self.derived.attributes.behavior_config(),
+                now.to_bits(),
+            );
+            pet.state = PetState::Walk;
+            pet.vel = Vec2::default();
+            pet.facing = Direction::Right;
+            self.pet = Some(pet);
+            self.presence_anim = Some(PresenceAnim::RunIn {
+                dir: 1.0,
+                target_x: world.screen.x + world.screen.w * PRESENCE_RUN_IN_DEPTH,
+            });
+            log::info!("присутствие: питомец прибегает (run-in)");
+        }
+        Response::Ok
+    }
+
+    /// Lease забрало другое устройство: «питомец перебегает» — быстрый бег
+    /// к ближайшему краю и снятие с экрана БЕЗ события журнала (присутствие
+    /// — не уход, ТЗ §3.5). Яйцо бегать не умеет — исчезает сразу; за
+    /// fullscreen анимацию всё равно не видно.
+    fn presence_lost(&mut self, holder: &str, now: f64) {
+        if !self.derived.summoned && self.pet.is_none() {
+            return;
+        }
+        log::info!("присутствие: lease у {holder} — питомец перебегает");
+        self.lease_hidden = true;
+        self.menu = None;
+        let Some(pet) = &mut self.pet else { return };
+        let instant = self.derived.stage == Stage::Egg || self.fullscreen_hidden;
+        if instant {
+            self.pet = None;
+            self.presence_anim = None;
+            self.clear_effects();
+            self.close_sleep(now);
+            log::info!("присутствие: питомец скрыт (без пробежки)");
+            return;
+        }
+        let Some(world) = &self.world else {
+            self.pet = None;
+            return;
+        };
+        // Ближайший край; спящего пробежка будит (Slept закроет note_sleep).
+        let dir = if pet.pos.x - world.screen.x <= world.screen.right() - pet.pos.x {
+            -1.0
+        } else {
+            1.0
+        };
+        pet.state = PetState::Walk;
+        pet.state_time = 0.0;
+        pet.vel = Vec2::default();
+        self.presence_anim = Some(PresenceAnim::RunOff { dir });
+    }
+
+    /// Claim удался: если питомец был lease-скрыт, а журнал считает его
+    /// призванным — вернуть с пробежкой (гонки claim/summon идемпотентны).
+    fn presence_gained(&mut self, now: f64) {
+        if self.lease_hidden && self.pet.is_none() && self.derived.summoned {
+            let resp = if self.derived.stage == Stage::Egg {
+                self.summon(now)
+            } else {
+                self.summon_run_in(now)
+            };
+            if resp == Response::Ok {
+                self.lease_hidden = false;
+            }
+        }
+    }
+
+    /// Пользователь взаимодействует с питомцем (нажатие/меню) — питомец
+    /// теперь на этом устройстве: забрать lease (с троттлингом).
+    fn user_claim(&mut self) {
+        let Some(sync) = &self.sync else { return };
+        let due = self
+            .last_claim
+            .is_none_or(|t| t.elapsed() >= CLAIM_THROTTLE);
+        if due {
+            self.last_claim = Some(Instant::now());
+            sync.send(SyncCmd::Claim);
+        }
+    }
+
+    /// Разобрать заметки синк-воркера (фаза E): чужие события — в память
+    /// и свёртку, потеря/возврат lease — в анимации присутствия.
+    fn drain_sync_notes(&mut self, now: f64) {
+        let mut remote: Vec<JournalEvent> = Vec::new();
+        let mut lost: Option<String> = None;
+        let mut gained = false;
+        if let Some(sync) = &self.sync {
+            while let Ok(note) = sync.notes.try_recv() {
+                match note {
+                    SyncNote::Remote(events) => remote.extend(events),
+                    SyncNote::LeaseLost { holder } => lost = Some(holder),
+                    SyncNote::LeaseGained => gained = true,
+                }
+            }
+        }
+        if !remote.is_empty() {
+            // Часы подтягиваются под чужие метки (и под свои, вернувшиеся
+            // с сервера после потери локального журнала) — повторная
+            // выдача уже занятых id исключена.
+            for ev in &remote {
+                self.clock.catch_up(&ev.id);
+            }
+            let added = apply_remote(&mut self.events, &remote);
+            if added > 0 {
+                log::info!("синк: влито чужих событий: {added}");
+                self.refold();
+                // Имя/цвет/статы/стадия обновляются вживую.
+                self.sync_visuals(now);
+            }
+        }
+        if let Some(holder) = lost {
+            self.presence_lost(&holder, now);
+        }
+        if gained {
+            self.presence_gained(now);
+        }
+    }
+
+    /// Тик сценарной пробежки присутствия (вместо обычного Pet::tick).
+    fn presence_anim_tick(&mut self, dt: f32, now: f64) {
+        let Some(anim) = self.presence_anim else {
+            return;
+        };
+        let (Some(pet), Some(world)) = (&mut self.pet, &self.world) else {
+            self.presence_anim = None;
+            return;
+        };
+        // Ручное ведение: машина поведения выключена, вид — быстрый шаг.
+        pet.state = PetState::Walk;
+        pet.state_time += dt;
+        pet.vel = Vec2::default();
+        match anim {
+            PresenceAnim::RunOff { dir } => {
+                pet.facing = if dir < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                };
+                pet.pos.x += dir * PRESENCE_RUN_SPEED * dt;
+                let b = pet.bounds();
+                let gone = b.right() < world.screen.x || b.x > world.screen.right();
+                if gone {
+                    self.pet = None;
+                    self.presence_anim = None;
+                    self.clear_effects();
+                    self.close_sleep(now);
+                    log::info!("присутствие: питомец убежал за край (журнал не тронут)");
+                }
+            }
+            PresenceAnim::RunIn { dir, target_x } => {
+                pet.facing = if dir < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                };
+                pet.pos.x += dir * PRESENCE_RUN_SPEED * dt;
+                let arrived =
+                    (dir > 0.0 && pet.pos.x >= target_x) || (dir < 0.0 && pet.pos.x <= target_x);
+                if arrived {
+                    pet.pos.x = target_x;
+                    // Дальше решает обычная машина поведения (сразу).
+                    pet.state_left = 0.0;
+                    self.presence_anim = None;
+                    log::info!("присутствие: питомец прибежал");
+                }
+            }
+        }
+    }
+
+    /// Горячая перечитка чужих журналов в режиме «папки» (фаза E):
+    /// раз в `folder_poll` сверяем подписи (len+mtime) чужих
+    /// journal.*.jsonl; изменились — перечитываем каталог и вливаем новое.
+    fn poll_folder(&mut self, now: f64) {
+        if self.sync_cfg.mode != SyncMode::Folder {
+            return;
+        }
+        if self
+            .folder_poll_at
+            .is_some_and(|t| t.elapsed() < self.folder_poll)
+        {
+            return;
+        }
+        self.folder_poll_at = Some(Instant::now());
+        let seen = folder_signature(&self.journal_dir, self.clock.device());
+        if seen == self.folder_seen {
+            return;
+        }
+        self.folder_seen = seen;
+        match Journal::open(&self.journal_dir) {
+            Ok((events, warnings)) => {
+                if warnings > 0 {
+                    log::warn!("папка: пропущено битых строк: {warnings}");
+                }
+                for ev in &events {
+                    self.clock.catch_up(&ev.id);
+                }
+                let added = apply_remote(&mut self.events, &events);
+                if added > 0 {
+                    log::info!("папка: синкер принёс событий: {added}");
+                    self.refold();
+                    self.sync_visuals(now);
+                }
+                self.folder_merged_at = Some(Instant::now());
+            }
+            Err(e) => log::warn!("папка: журналы не перечитаны: {e}"),
+        }
+    }
+
+    /// Ответ на `ctl sync status` (фаза E).
+    fn sync_status(&self) -> Response {
+        let cursors = cursors_of(&self.events);
+        let mode = self.sync_cfg.mode;
+        let (last_push, last_pull, holding, holder, last_error) = match (&self.sync, mode) {
+            (Some(sync), _) => {
+                let sh = sync.shared.lock().unwrap();
+                (
+                    sh.last_push,
+                    sh.last_pull,
+                    sh.holding,
+                    sh.holder.clone(),
+                    sh.last_error.clone(),
+                )
+            }
+            // Папка: push = наши append-ы в свой файл (мгновенно, синкер
+            // заберёт сам), pull = последняя перечитка чужих файлов.
+            (None, SyncMode::Folder) => (None, self.folder_merged_at, false, None, None),
+            (None, _) => (None, None, false, None, None),
+        };
+        Response::SyncStatus {
+            mode: mode.as_str().to_string(),
+            address: (mode == SyncMode::Server && !self.sync_cfg.address.trim().is_empty())
+                .then(|| self.sync_cfg.address.trim().to_string()),
+            folder: (mode == SyncMode::Folder).then(|| self.journal_dir.display().to_string()),
+            last_push_secs: last_push.map(|t| t.elapsed().as_secs()),
+            last_pull_secs: last_pull.map(|t| t.elapsed().as_secs()),
+            devices: cursors.0.len() as u32,
+            events: self.events.len() as u64,
+            holding,
+            holder,
+            last_error,
+        }
+    }
+
     /// Обработать один IPC-запрос. Каждый запрос получает ровно один ответ.
     fn handle(&mut self, req: Request, now: f64) -> Response {
         match req {
             Request::Summon => {
-                let resp = self.summon(now);
+                let resp = self.summon_requested(now);
                 // Призванность переживает рестарт (ТД-17) — событием журнала.
                 if resp == Response::Ok && !self.derived.summoned {
                     return self.care(EventKind::Summoned);
@@ -968,6 +1467,7 @@ impl DaemonApp {
                 resp
             }
             Request::Dismiss => self.dismiss(now),
+            Request::SyncStatus => self.sync_status(),
             Request::Status => Response::Status {
                 pets: u32::from(self.pet.is_some()),
                 state: match &self.pet {
@@ -1038,14 +1538,72 @@ impl DaemonApp {
 
     /// Перечитать config.toml (настройки приложения). Характеристики питомца
     /// сюда больше не входят — они меняются только через SetAttributes.
+    /// Секция [sync] применяется на лету (фаза E): воркер пересоздаётся,
+    /// смена каталога журналов переоткрывает хранилище.
     fn reload(&mut self) -> Response {
         match Config::load() {
-            Ok(_cfg) => {
+            Ok(cfg) => {
                 log::info!("reload: настройки приложения перечитаны");
+                self.apply_sync_config(cfg.sync);
                 Response::Ok
             }
             Err(e) => Response::Error(fl!("daemon-config-unreadable", error = e)),
         }
+    }
+
+    /// Применить новую секцию [sync] (фаза E). Старый воркер завершается
+    /// дропом ручки; смена каталога журналов переоткрывает хранилище
+    /// (свой файл догоняет каталог, см. adopt_own_journal) — кроме
+    /// деградации без записи, там менять каталог опасно (память ≠ диск).
+    fn apply_sync_config(&mut self, cfg: SyncConfig) {
+        if cfg == self.sync_cfg {
+            log::debug!("reload: [sync] без изменений");
+            return;
+        }
+        for w in cfg.warnings() {
+            log::warn!("конфиг синка: {w}");
+        }
+        self.sync = None; // дроп cmd_tx: воркер увидит и завершится
+        let new_dir = resolve_journal_dir(&self.data_dir, &cfg);
+        if new_dir != self.journal_dir {
+            if self.journal_writable {
+                log::info!(
+                    "reload: каталог журналов {} -> {}",
+                    self.journal_dir.display(),
+                    new_dir.display()
+                );
+                // Старый каталог знает только демон (нового конфига в нём
+                // нет) — свой файл догоняет смену отсюда, дальше
+                // load_storage добавит кандидатов из самого конфига.
+                adopt_own_journal(&[self.journal_dir.as_path()], &new_dir, self.clock.device());
+                let storage = load_storage(&self.data_dir, &cfg, None);
+                self.events = storage.events;
+                self.clock = storage.clock;
+                self.journal_writable = storage.writable;
+                self.journal_dir = storage.journal_dir;
+                self.refold();
+            } else {
+                log::warn!("reload: журнал в деградации (память без записи) — каталог не меняю");
+            }
+        }
+        self.sync_cfg = cfg;
+        if self.sync_cfg.mode == SyncMode::Server {
+            self.sync = Some(sync::spawn(
+                &self.sync_cfg,
+                &self.data_dir,
+                &self.journal_dir,
+                self.clock.device(),
+                self.derived.summoned,
+                sync::Tuning::default(),
+            ));
+        }
+        if self.sync_cfg.mode == SyncMode::Folder {
+            self.folder_seen = folder_signature(&self.journal_dir, self.clock.device());
+            self.folder_poll_at = None;
+        }
+        // Lease-скрытие принадлежит старому режиму.
+        self.lease_hidden = false;
+        log::info!("reload: синк в режиме {}", self.sync_cfg.mode.as_str());
     }
 
     /// Пробросить событие указателя в питомца. Для платформы событие всегда
@@ -1178,6 +1736,11 @@ impl App for DaemonApp {
             let _ = reply.send(resp);
         }
 
+        // Синк (фаза E): заметки воркера (чужие события, lease) и горячая
+        // перечитка папки — до свёртки и симуляции кадра.
+        self.drain_sync_notes(now);
+        self.poll_folder(now);
+
         // Ленивый декей: свёртка раз в минуту; гейт вылупления (B6) не
         // ждёт минутного таймера — egg_gate_due дешёвый.
         if self.last_fold.elapsed() >= REFOLD_INTERVAL || self.egg_gate_due() {
@@ -1198,7 +1761,10 @@ impl App for DaemonApp {
         let dt = (now - self.last_now.unwrap_or(now)).clamp(0.0, 1.5) as f32;
         self.last_now = Some(now);
 
-        if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
+        if self.presence_anim.is_some() {
+            // Пробежка присутствия (фаза E): демон ведёт питомца сам.
+            self.presence_anim_tick(dt, now);
+        } else if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
             let before = pet.state;
             pet.tick(world, dt);
             // Смены состояния с координатами — отладка физики фазы D
@@ -1249,7 +1815,13 @@ impl App for DaemonApp {
                     origin: Vec2::new(bounds.x, bounds.y),
                     mirror: pet.facing == Direction::Left,
                 }];
-                let mut input_rects = vec![bounds];
+                // Пробегающего мимо (run-off/run-in, фаза E) не поймать:
+                // хит-области нет, указатель проходит насквозь.
+                let mut input_rects = if self.presence_anim.is_some() {
+                    Vec::new()
+                } else {
+                    vec![bounds]
+                };
                 // Пузырь — над питомцем, в пределах экрана, без хит-области.
                 if let Some(bubble) = self.bubble.as_ref().filter(|b| now >= b.from) {
                     let (bw, bh) = (bubble.frame.w as f32, bubble.frame.h as f32);
@@ -1316,6 +1888,14 @@ impl App for DaemonApp {
                     if greeted && self.derived.stage != Stage::Egg {
                         self.bubble = Some(hello_bubble(now, HELLO_START_SECS));
                     }
+                    // Присутствие (фаза E): запуск демона = активность на
+                    // этом устройстве, питомец перебегает сюда.
+                    if greeted {
+                        if let Some(sync) = &self.sync {
+                            sync.send(SyncCmd::SetSummoned(true));
+                            sync.send(SyncCmd::Claim);
+                        }
+                    }
                 }
                 true
             }
@@ -1323,6 +1903,9 @@ impl App for DaemonApp {
             // выбор строки/закрытие, движение — подсветка; питомцу эти
             // события не отдаются (клик по меню — не drag и не гладь).
             Event::PointerPress(p) => {
+                // Нажатие по нашей поверхности = живой пользователь ЗДЕСЬ:
+                // питомец принадлежит этому устройству (lease, фаза E).
+                self.user_claim();
                 if self.menu.is_some() {
                     self.menu_press(p, now);
                     return true;
@@ -1344,6 +1927,7 @@ impl App for DaemonApp {
             }
             // ПКМ по питомцу — открыть меню (B3); повторный ПКМ закрывает.
             Event::PointerMenu(p) => {
+                self.user_claim();
                 if self.menu.take().is_none() {
                     self.open_menu(p);
                 }
@@ -1367,13 +1951,15 @@ impl App for DaemonApp {
 
     /// Темп для адаптивного таймера бэкенда (ТД-3): спрашиваем у питомца;
     /// нет питомца или выхода — рисовать нечего, спим (~1 Гц). Меню,
-    /// оверлеи и пузыри держат Active только пока видимы/анимируются —
-    /// expire_effects в tick снимает их, и темп деэскалирует сам.
+    /// оверлеи, пузыри и пробежки присутствия держат Active только пока
+    /// видимы/анимируются — expire_effects и presence_anim_tick снимают
+    /// их, и темп деэскалирует сам.
     fn pace(&self) -> Pace {
         let effects_active = self.menu.is_some()
             || self.overlay.is_some()
             || self.bubble.is_some()
-            || self.happy_until.is_some();
+            || self.happy_until.is_some()
+            || self.presence_anim.is_some();
         match (&self.pet, &self.world) {
             (Some(pet), Some(_)) => {
                 if effects_active {
@@ -1407,10 +1993,45 @@ mod tests {
     /// DaemonApp без Wayland: ручной канал запросов; legacy-конфиг и
     /// growth_scale не подмешиваем — тесты не зависят от реального
     /// config.toml и env (ТД-26). Worldsense-провайдера нет: настоящий
-    /// грузил бы KWin-скрипт в живой композитор (см. FakeSense).
+    /// грузил бы KWin-скрипт в живой композитор (см. FakeSense); синк
+    /// выключен (SyncConfig::default) — ни сети, ни воркера.
     fn app_in(dir: &Path) -> (DaemonApp, Sender<IpcMessage>) {
         let (tx, rx) = mpsc::channel();
-        (DaemonApp::new(rx, dir.to_path_buf(), None, None, None), tx)
+        (
+            DaemonApp::new(
+                rx,
+                dir.to_path_buf(),
+                None,
+                None,
+                None,
+                SyncConfig::default(),
+            ),
+            tx,
+        )
+    }
+
+    /// Демон со «включённым» серверным синком, но БЕЗ настоящего воркера:
+    /// ручные каналы вместо потока — тест сам играет за воркера (шлёт
+    /// заметки) и подглядывает команды демона (ТД-26).
+    fn sync_app_in(
+        dir: &Path,
+    ) -> (
+        DaemonApp,
+        Sender<IpcMessage>,
+        Sender<SyncNote>,
+        mpsc::Receiver<SyncCmd>,
+    ) {
+        let (app_base, tx) = app_in(dir);
+        let mut app = app_base;
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (note_tx, notes) = mpsc::channel();
+        app.sync_cfg.mode = driftling_core::SyncMode::Server;
+        app.sync = Some(SyncHandle {
+            cmd_tx,
+            notes,
+            shared: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
+        });
+        (app, tx, note_tx, cmd_rx)
     }
 
     fn app(tag: &str) -> (DaemonApp, Sender<IpcMessage>, PathBuf) {
@@ -2374,6 +2995,7 @@ mod tests {
             None,
             None,
             Some(Box::new(sense.clone())),
+            SyncConfig::default(),
         );
         app.sense_poll_idle = Duration::ZERO;
         (app, sense, tx, dir)
@@ -2538,6 +3160,267 @@ mod tests {
         assert!(world.platforms.is_empty());
         assert_eq!(world.ground_y_override, None);
         assert_eq!(app.pet.as_ref().unwrap().state, PetState::Falling);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Синк и присутствие (фаза E) ----
+
+    /// Слить накопленные команды воркеру (ручной приёмник тестов).
+    fn drain_cmds(rx: &mpsc::Receiver<SyncCmd>) -> Vec<SyncCmd> {
+        let mut out = Vec::new();
+        while let Ok(cmd) = rx.try_recv() {
+            out.push(cmd);
+        }
+        out
+    }
+
+    /// Каждое локальное событие ухода будит воркер (Wake), а призыв на
+    /// старте берёт lease (SetSummoned + Claim).
+    #[test]
+    fn care_append_wakes_sync_worker() {
+        let dir = tmp_dir("sync-wake");
+        let (mut app, tx, _notes, cmd_rx) = sync_app_in(&dir);
+        geometry(&mut app);
+        let boot = drain_cmds(&cmd_rx);
+        assert!(boot.contains(&SyncCmd::SetSummoned(true)), "{boot:?}");
+        assert!(boot.contains(&SyncCmd::Claim), "старт = активность здесь");
+
+        let reply = send(&tx, Request::Feed { treat: false });
+        app.tick(0.1);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(
+            drain_cmds(&cmd_rx).contains(&SyncCmd::Wake),
+            "append -> немедленный синк"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Потеря lease: питомец УБЕГАЕТ за ближайший край (без хит-области),
+    /// исчезает БЕЗ событий журнала; явный Summon возвращает его пробежкой
+    /// от края и снова клеймит lease. Весь цикл не добавляет в журнал ни
+    /// одного события — присутствие не уход (ТЗ §3.5).
+    #[test]
+    fn lease_loss_runs_pet_off_and_summon_runs_back_in() {
+        let dir = tmp_dir("lease-runoff");
+        std::fs::write(
+            dir.join("pet.json"),
+            r#"{"schema_version":2,"name":"Бегун","attributes":{},"summoned":true}"#,
+        )
+        .unwrap();
+        let (mut app, tx, notes, cmd_rx) = sync_app_in(&dir);
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.0); // приземлился и живёт
+        let kinds_before = journal_kinds(&dir);
+        drain_cmds(&cmd_rx);
+
+        notes
+            .send(SyncNote::LeaseLost {
+                holder: "работа".into(),
+            })
+            .unwrap();
+        now += 1.0 / 60.0;
+        let no_hit = app.tick(now).input_rects.is_empty();
+        assert!(no_hit, "убегающего не поймать (хит-области нет)");
+        assert!(
+            matches!(app.presence_anim, Some(PresenceAnim::RunOff { .. })),
+            "началась пробежка к краю"
+        );
+        assert_eq!(app.pet.as_ref().unwrap().state, PetState::Walk);
+
+        // Добегает до края и исчезает; журнал не тронут.
+        settle(&mut app, &mut now, 6.0);
+        assert!(app.pet.is_none(), "питомец убежал за край");
+        assert!(app.lease_hidden);
+        assert!(app.presence_anim.is_none());
+        assert_eq!(
+            journal_kinds(&dir),
+            kinds_before,
+            "run-off не пишет событий (присутствие != уход)"
+        );
+        assert!(app.tick(now + 0.01).sprites.is_empty());
+
+        // Возврат: пользователь призывает — питомец прибегает от края.
+        let reply = send(&tx, Request::Summon);
+        now += 1.0 / 60.0;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(
+            matches!(app.presence_anim, Some(PresenceAnim::RunIn { .. })),
+            "возврат — пробежка от края"
+        );
+        let pet = app.pet.as_ref().unwrap();
+        assert!(
+            pet.bounds().right() <= 1.0,
+            "старт из-за левого края: {:?}",
+            pet.pos
+        );
+        assert!(!app.lease_hidden);
+        let cmds = drain_cmds(&cmd_rx);
+        assert!(cmds.contains(&SyncCmd::Claim), "возврат клеймит lease");
+        assert!(cmds.contains(&SyncCmd::SetSummoned(true)));
+
+        settle(&mut app, &mut now, 4.0);
+        assert!(app.presence_anim.is_none(), "прибежал и живёт сам");
+        let pet = app.pet.as_ref().unwrap();
+        assert!(pet.pos.x > 100.0, "внутри экрана: {:?}", pet.pos);
+        assert_eq!(
+            journal_kinds(&dir),
+            kinds_before,
+            "полный цикл присутствия не пишет в журнал"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Яйцо бегать не умеет: потеря lease прячет его мгновенно.
+    #[test]
+    fn egg_lease_loss_hides_instantly() {
+        let dir = tmp_dir("lease-egg");
+        let (mut app, _tx, notes, _cmd_rx) = sync_app_in(&dir);
+        geometry(&mut app);
+        app.tick(0.0);
+        assert!(app.pet.is_some());
+        let kinds_before = journal_kinds(&dir);
+
+        notes
+            .send(SyncNote::LeaseLost {
+                holder: "дом".into(),
+            })
+            .unwrap();
+        let empty_scene = app.tick(0.1).sprites.is_empty();
+        assert!(empty_scene);
+        assert!(app.pet.is_none(), "яйцо скрыто сразу, без пробежки");
+        assert!(app.lease_hidden);
+        assert_eq!(journal_kinds(&dir), kinds_before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Чужие события от воркера вливаются вживую: имя и свёртка обновляются
+    /// без рестарта (refold + sync_visuals в том же тике).
+    #[test]
+    fn remote_note_updates_derived_live() {
+        let dir = tmp_dir("remote-note");
+        let (mut app, _tx, notes, _cmd_rx) = sync_app_in(&dir);
+        geometry(&mut app);
+        let ev = JournalEvent {
+            id: driftling_core::Hlc {
+                wall_ms: wall_now_ms(),
+                counter: 9,
+                device: "другое-устройство".into(),
+            },
+            kind: EventKind::Renamed {
+                name: "Пришелец".into(),
+            },
+        };
+        notes.send(SyncNote::Remote(vec![ev])).unwrap();
+        app.tick(0.1);
+        assert_eq!(app.derived.name, "Пришелец", "чужое событие применено");
+        // Повтор той же заметки идемпотентен.
+        let events_len = app.events.len();
+        app.tick(0.2);
+        assert_eq!(app.events.len(), events_len);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Режим «папки»: чужой journal.*.jsonl, принесённый «синкером»,
+    /// подхватывается горячо — без рестарта демона.
+    #[test]
+    fn folder_mode_hot_reloads_foreign_files() {
+        let dir = tmp_dir("folder-hot");
+        let (tx, rx) = mpsc::channel();
+        let _ = tx; // канал IPC не нужен
+        let cfg = SyncConfig {
+            mode: driftling_core::SyncMode::Folder,
+            ..SyncConfig::default()
+        };
+        let mut app = DaemonApp::new(rx, dir.to_path_buf(), None, None, None, cfg);
+        app.folder_poll = Duration::ZERO;
+        geometry(&mut app);
+        app.tick(0.0);
+        assert_ne!(app.derived.name, "Гость");
+
+        // «Синкер принёс» файл чужого устройства.
+        let ev = JournalEvent {
+            id: driftling_core::Hlc {
+                wall_ms: wall_now_ms(),
+                counter: 0,
+                device: "ghost".into(),
+            },
+            kind: EventKind::Renamed {
+                name: "Гость".into(),
+            },
+        };
+        Journal::append_remote(&dir, &[ev]).unwrap();
+        app.tick(0.1);
+        assert_eq!(app.derived.name, "Гость", "горячая перечитка папки");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Смена каталога журналов на лету (reload [sync]): файл своего
+    /// устройства следует за конфигом (побеждает самая длинная копия),
+    /// история не теряется в обе стороны.
+    #[test]
+    fn apply_sync_config_moves_journal_dir_both_ways() {
+        let dir = tmp_dir("switch-dir");
+        let folder = dir.join("synced");
+        let (mut app, tx, _dir2) = {
+            let (app, tx) = app_in(&dir);
+            (app, tx, ())
+        };
+        geometry(&mut app);
+        // Немного истории в data_dir.
+        let reply = send(&tx, Request::Feed { treat: false });
+        app.tick(0.1);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        let events_before = app.events.len();
+
+        // Включаем папку: журнал уезжает, события целы.
+        app.apply_sync_config(SyncConfig {
+            mode: driftling_core::SyncMode::Folder,
+            folder: folder.display().to_string(),
+            ..SyncConfig::default()
+        });
+        assert_eq!(app.journal_dir, folder);
+        assert_eq!(app.events.len(), events_before, "история переехала");
+        // Новое событие пишется уже в папку.
+        let reply = send(&tx, Request::Play);
+        app.tick(0.2);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        let (in_folder, _) = Journal::open(&folder).unwrap();
+        assert_eq!(in_folder.len(), events_before + 1);
+
+        // Выключаем: журнал возвращается в data_dir, длинная копия побеждает.
+        app.apply_sync_config(SyncConfig::default());
+        assert_eq!(app.journal_dir, dir);
+        assert_eq!(
+            app.events.len(),
+            events_before + 1,
+            "возврат не теряет события, дописанные в папке"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ctl sync status` отвечает и в выключенном режиме.
+    #[test]
+    fn sync_status_answers_when_off() {
+        let (mut app, tx, dir) = app("sync-status");
+        let reply = send(&tx, Request::SyncStatus);
+        app.tick(0.0);
+        match reply.recv().unwrap() {
+            Response::SyncStatus {
+                mode,
+                devices,
+                events,
+                holding,
+                ..
+            } => {
+                assert_eq!(mode, "off");
+                assert_eq!(devices, 1, "своё устройство в курсорах");
+                assert!(events >= 1, "Genesis в журнале");
+                assert!(!holding);
+            }
+            other => panic!("неожиданный ответ: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -116,6 +116,27 @@ msg-daemon-stopped = Daemon stopped
 section-about = About
 about-desc = A pet for the Wayland desktop. It lives on the bottom edge of the screen, walks, sleeps and falls into your hands.
 
+# --- Sync card (phase E) ---
+section-sync = Sync
+sync-mode-off = Off
+sync-mode-server = My server
+sync-mode-folder = Folder
+sync-off-hint = The pet lives only on this device.
+sync-address-label = Server address
+sync-address-hint = driftling-server over plain http — keep it on LAN/VPN or behind a local proxy; the token comes from `driftling-server account add`.
+sync-token-label = Token
+sync-folder-label = Journal folder
+sync-folder-hint = A folder synced by Syncthing/Nextcloud: journals move there, one file per device. pet.json always stays local.
+msg-sync-applied = Saved — the daemon has reloaded the sync settings
+msg-sync-saved-daemon-down = Saved; it will apply when the daemon starts
+sync-status-line = push: { $push } · pull: { $pull }
+sync-status-ago = { $secs } s ago
+sync-status-never = never
+sync-status-journal = { $events } events · { $devices } devices
+sync-status-lease-ours = the pet is here
+sync-status-lease-other = the pet is on "{ $holder }"
+sync-status-error = sync error: { $error }
+
 # --- Debug page ---
 debug-warning = Admin panel. Direct editing of characteristics is for debugging; in the game they will grow through caring for the pet.
 section-pet-attrs = Pet characteristics

@@ -10,8 +10,105 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
-    // Зарезервировано под настройки приложения (мониторы, синк — M3,
+    // Зарезервировано под остальные настройки приложения (мониторы,
     // выбор пака — M4). Автозапуск управляется .desktop-файлом напрямую.
+    /// Синхронизация между устройствами (фаза E, ТЗ §3.5).
+    pub sync: SyncConfig,
+}
+
+/// Режим синка (ТЗ §3.5): одна настройка переключает всё.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncMode {
+    /// Standalone: без сети, как раньше.
+    #[default]
+    Off,
+    /// Свой `driftling-server`: HTTP push/pull журнала + lease присутствия.
+    Server,
+    /// «Дешёвый уровень»: каталог журналов синкает Syncthing/Nextcloud,
+    /// демон только горячо перечитывает чужие файлы.
+    Folder,
+}
+
+impl SyncMode {
+    /// Машинное имя режима — для статуса ctl и логов (UI локализует сам).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SyncMode::Off => "off",
+            SyncMode::Server => "server",
+            SyncMode::Folder => "folder",
+        }
+    }
+}
+
+/// Секция `[sync]` config.toml. Все поля с дефолтами: старые конфиги без
+/// секции читаются как «синк выключен».
+///
+/// ```toml
+/// [sync]
+/// mode = "server"                  # off | server | folder
+/// address = "http://vps:8787"      # server: адрес driftling-server
+/// token = "…"                      # server: Bearer-токен аккаунта
+/// folder = "/home/u/Sync/driftling" # folder: каталог journal.*.jsonl
+/// ```
+///
+/// Режим `folder` без `folder` наблюдает собственный каталог данных
+/// (тогда синкер должен переносить ТОЛЬКО `journal.*.jsonl` — pet.json
+/// хранит device_id и синкаться не должен). С указанным `folder` журнал
+/// живёт в нём (pet.json и sync-state остаются локальными) — рекомендуемый
+/// вариант.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub mode: SyncMode,
+    /// Адрес driftling-server, `http://host:port`. TLS в демоне нет —
+    /// селфхост ходит по LAN/VPN или локальному reverse-proxy.
+    pub address: String,
+    /// Bearer-токен аккаунта (выдаёт `driftling-server account add`).
+    pub token: String,
+    /// Каталог журналов для режима `folder`; пусто = каталог данных.
+    pub folder: String,
+}
+
+impl SyncConfig {
+    /// Синк вообще включён?
+    pub fn enabled(&self) -> bool {
+        self.mode != SyncMode::Off
+    }
+
+    /// Проблемы конфигурации, о которых стоит предупредить (не ошибки:
+    /// демон работает дальше, синк просто не стартует/деградирует).
+    /// Технические строки — по-английски, как все ошибки ядра (ТД-30).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        match self.mode {
+            SyncMode::Off => {}
+            SyncMode::Server => {
+                if self.address.trim().is_empty() {
+                    out.push("sync.mode = \"server\" but sync.address is empty".to_string());
+                } else if self.address.trim().starts_with("https://") {
+                    out.push(
+                        "sync.address uses https:// — the daemon speaks plain http \
+                         (terminate TLS on a local proxy or use LAN/VPN)"
+                            .to_string(),
+                    );
+                }
+                if self.token.trim().is_empty() {
+                    out.push("sync.mode = \"server\" but sync.token is empty".to_string());
+                }
+            }
+            SyncMode::Folder => {
+                if self.folder.trim().is_empty() {
+                    out.push(
+                        "sync.mode = \"folder\" without sync.folder: watching the data dir \
+                         (sync ONLY journal.*.jsonl there, never pet.json)"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Достать из legacy-конфига (до переезда характеристик в pet.json)
@@ -113,6 +210,79 @@ mod tests {
         let cfg: Config = toml::from_str("[pet]\nsize = 90\n[behavior]\nwalk_speed = 400.0\n")
             .unwrap_or_default();
         assert_eq!(cfg, Config::default());
+        assert_eq!(
+            cfg.sync.mode,
+            SyncMode::Off,
+            "старый конфиг = синк выключен"
+        );
+    }
+
+    #[test]
+    fn sync_section_parses_and_roundtrips() {
+        let cfg: Config = toml::from_str(
+            "[sync]\nmode = \"server\"\naddress = \"http://vps:8787\"\ntoken = \"secret\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.sync.mode, SyncMode::Server);
+        assert_eq!(cfg.sync.address, "http://vps:8787");
+        assert_eq!(cfg.sync.token, "secret");
+        assert_eq!(cfg.sync.folder, "");
+        assert!(cfg.sync.enabled());
+
+        // Раундтрип: save-формат читается обратно без потерь.
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back, cfg);
+
+        let cfg: Config =
+            toml::from_str("[sync]\nmode = \"folder\"\nfolder = \"/sync/drl\"\n").unwrap();
+        assert_eq!(cfg.sync.mode, SyncMode::Folder);
+        assert_eq!(cfg.sync.folder, "/sync/drl");
+    }
+
+    #[test]
+    fn sync_mode_unknown_value_is_a_readable_error() {
+        // Кривое значение mode — ошибка текстом (политика Config::load),
+        // а не тихий каприз.
+        let err = toml::from_str::<Config>("[sync]\nmode = \"cloud\"\n").unwrap_err();
+        assert!(err.to_string().contains("cloud") || !err.to_string().is_empty());
+    }
+
+    #[test]
+    fn sync_warnings_catch_misconfig() {
+        let mut sync = SyncConfig {
+            mode: SyncMode::Server,
+            ..SyncConfig::default()
+        };
+        let w = sync.warnings();
+        assert_eq!(w.len(), 2, "пустые address и token: {w:?}");
+
+        sync.address = "https://vps".into();
+        sync.token = "t".into();
+        let w = sync.warnings();
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("https"), "{w:?}");
+
+        sync.address = "http://vps:8787".into();
+        assert!(sync.warnings().is_empty());
+
+        let folder = SyncConfig {
+            mode: SyncMode::Folder,
+            ..SyncConfig::default()
+        };
+        assert_eq!(
+            folder.warnings().len(),
+            1,
+            "папка не указана — предупреждаем"
+        );
+        assert!(SyncConfig::default().warnings().is_empty(), "off молчит");
+    }
+
+    #[test]
+    fn sync_mode_names_are_stable() {
+        assert_eq!(SyncMode::Off.as_str(), "off");
+        assert_eq!(SyncMode::Server.as_str(), "server");
+        assert_eq!(SyncMode::Folder.as_str(), "folder");
     }
 
     #[test]

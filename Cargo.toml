@@ -7,6 +7,9 @@ members = [
     "crates/driftling",
     "crates/settings",
     "crates/worldsense",
+    # Синк-сервер (фаза E, ТЗ §3.5): отдельный бинарь, ЕДИНСТВЕННЫЙ крейт
+    # с tokio/axum — на фичи zbus/ksni не влияет (не зависит от них).
+    "crates/server",
 ]
 
 [workspace.package]

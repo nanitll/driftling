@@ -121,6 +121,27 @@ msg-daemon-stopped = Демон остановлен
 section-about = О программе
 about-desc = Питомец для рабочего стола Wayland. Живёт на нижней кромке экрана, гуляет, спит и падает в руки.
 
+# --- Карточка «Синхронизация» (фаза E) ---
+section-sync = Синхронизация
+sync-mode-off = Выкл
+sync-mode-server = Свой сервер
+sync-mode-folder = Папка
+sync-off-hint = Питомец живёт только на этом устройстве.
+sync-address-label = Адрес сервера
+sync-address-hint = driftling-server по plain http — держите его в LAN/VPN или за локальным прокси; токен выдаёт `driftling-server account add`.
+sync-token-label = Токен
+sync-folder-label = Папка журналов
+sync-folder-hint = Папка, которую синкает Syncthing/Nextcloud: журналы переезжают туда, по файлу на устройство. pet.json всегда остаётся локальным.
+msg-sync-applied = Сохранено — демон перечитал настройки синка
+msg-sync-saved-daemon-down = Сохранено; применится при запуске демона
+sync-status-line = push: { $push } · pull: { $pull }
+sync-status-ago = { $secs } с назад
+sync-status-never = ещё не было
+sync-status-journal = событий: { $events } · устройств: { $devices }
+sync-status-lease-ours = питомец здесь
+sync-status-lease-other = питомец на «{ $holder }»
+sync-status-error = ошибка синка: { $error }
+
 # --- Страница «Отладка» ---
 debug-warning = Админ-панель. Прямое редактирование характеристик — для отладки; в игре они будут расти через уход за питомцем.
 section-pet-attrs = Характеристики питомца

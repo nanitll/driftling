@@ -1,0 +1,23 @@
+# Пример selfhost-развёртывания driftling-server в Docker.
+#   docker compose -f docker-compose.example.yml up -d
+#   docker compose -f docker-compose.example.yml exec server \
+#       driftling-server --config /etc/driftling-server.toml account add home
+#
+# Порт публикуется только на localhost: наружу сервер выставляет
+# reverse-proxy с TLS (пример для Caddy — в README.md рядом).
+
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: dist/server/Dockerfile
+    # Или готовый образ вместо build, когда появится registry:
+    # image: ghcr.io/nanitll/driftling-server:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - driftling-data:/data
+
+volumes:
+  driftling-data:

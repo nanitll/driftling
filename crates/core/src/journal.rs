@@ -12,16 +12,24 @@
 //! время приходит параметрами (`wall_ms`, `now_ms`); файловое хранилище
 //! отгорожено `cfg(not(target_arch = "wasm32"))`.
 //!
-//! # API для интеграции (демон/настройки, волна 2)
+//! # API для интеграции (демон/настройки/сервер, фаза E)
 //!
-//! - [`Journal::open`]`(dir)` — прочитать `<dir>/journal.jsonl`,
-//!   вернуть `(события отсортированы, счётчик битых строк)`;
-//! - [`Journal::append`]`(dir, event)` — дописать событие (create +
-//!   append + flush + fsync);
+//! Хранилище пер-девайсное (ТЗ §3.5, «синк через папку»): каждое
+//! устройство дописывает ТОЛЬКО свой `journal.<device_id>.jsonl`,
+//! чужие файлы — read-only входы слияния.
+//!
+//! - [`Journal::open_dir`]`(dir, own_device)` — миграция легаси-файла
+//!   `journal.jsonl` (rename в файл своего устройства) + слияние журналов
+//!   всех устройств: `(события отсортированы, счётчик битых строк)`;
+//! - [`Journal::append`]`(dir, own_device, event)` — дописать событие в
+//!   файл своего устройства (create + append + flush + fsync);
+//! - [`Journal::open`]`(dir)` — read-only слияние без миграции (doctor,
+//!   внешние читатели);
 //! - [`HlcClock`] — выдача HLC-меток: `next(now_ms)`; после старта —
 //!   [`HlcClock::catch_up`] по каждому id журнала, чтобы новые метки были
 //!   строго больше уже записанных даже при откате настенных часов;
-//! - [`merge`] — слияние журналов (синк, фаза E);
+//! - [`merge`] — слияние журналов; курсоры и выборка недостающего для
+//!   транспорта — модуль [`crate::sync`];
 //! - [`fold`]`(events, now_ms, cfg)` — свёртка в [`DerivedPet`];
 //! - [`FoldCfg::default`] — игровые константы (decay, кормление, рост);
 //! - [`random_device_id`] — идентификатор устройства для pet.json v3.
@@ -99,6 +107,12 @@ impl HlcClock {
         self.last.wall_ms = wall;
         self.last.counter = counter;
         self.last.clone()
+    }
+
+    /// Идентификатор устройства этих часов — он же владелец файла
+    /// `journal.<device>.jsonl` (контракт single-writer, ТЗ §3.5).
+    pub fn device(&self) -> &str {
+        &self.last.device
     }
 
     /// Подтянуть часы под уже виденную метку (свою из журнала при старте
@@ -518,7 +532,7 @@ pub fn fold(events: &[Event], now_ms: u64, cfg: &FoldCfg) -> DerivedPet {
 }
 
 // ---------------------------------------------------------------------------
-// Хранилище: journal.jsonl (append-only, по событию на строку)
+// Хранилище: journal.<device_id>.jsonl (append-only файл на устройство)
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -527,82 +541,281 @@ mod fs {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
 
-    /// journal.jsonl внутри произвольного каталога данных (DI для тестов,
-    /// ТД-26; штатный каталог — `attributes::data_dir()`).
+    /// Легаси-путь одиночного журнала (формат до фазы E). Оставлен ради
+    /// миграции и внешних читателей; [`Journal::open_dir`] уводит этот
+    /// файл в журнал своего устройства.
     pub fn journal_path_in(dir: &Path) -> PathBuf {
         dir.join("journal.jsonl")
     }
 
-    /// Файловый журнал: `<data_dir>/journal.jsonl`, по JSON-событию на
-    /// строку. Single-writer append-only — формат уровня «синк через
-    /// папку» (ТЗ §3.5) закладывается уже здесь.
+    /// Журнал конкретного устройства: `journal.<device_id>.jsonl` внутри
+    /// произвольного каталога данных (DI для тестов, ТД-26; штатный
+    /// каталог — `attributes::data_dir()`).
+    ///
+    /// Контракт синка (ТЗ §3.5): устройство дописывает ТОЛЬКО свой файл
+    /// (single-writer — конфликты файлового синка недостижимы по
+    /// построению), чужие файлы — read-only входы слияния при чтении.
+    pub fn device_journal_path_in(dir: &Path, device: &str) -> PathBuf {
+        dir.join(format!("journal.{device}.jsonl"))
+    }
+
+    /// CRC32 (IEEE, как в gzip/png), побитово и без таблиц: строки журнала
+    /// короткие, скорость роли не играет — важен ноль зависимостей.
+    pub(super) fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// Строка журнала на диске: `<JSON события>\t#<crc32 hex8>`.
+    /// serde_json экранирует управляющие символы, поэтому сырой TAB в
+    /// строке может быть только нашим разделителем суффикса.
+    pub(super) fn encode_line(ev: &Event) -> Result<String, String> {
+        let json = serde_json::to_string(ev).map_err(|e| e.to_string())?;
+        let crc = crc32(json.as_bytes());
+        Ok(format!("{json}\t#{crc:08x}"))
+    }
+
+    /// Разбор строки журнала. CRC-суффикс ОПЦИОНАЛЕН: строки старого
+    /// формата (без суффикса) остаются валидными; при наличии суффикса
+    /// чексумма проверяется — несовпадение или кривой суффикс = битая
+    /// строка (`None` -> предупреждение у читателя). Это защита от
+    /// «рваного хвоста» и тихой порчи при снапшоте файловым синкером.
+    pub(super) fn decode_line(line: &str) -> Option<Event> {
+        let payload = match line.rsplit_once('\t') {
+            None => line,
+            Some((payload, tail)) => {
+                let hex = tail.strip_prefix('#')?;
+                if hex.len() != 8 {
+                    return None;
+                }
+                let stored = u32::from_str_radix(hex, 16).ok()?;
+                if crc32(payload.as_bytes()) != stored {
+                    return None;
+                }
+                payload
+            }
+        };
+        serde_json::from_str(payload).ok()
+    }
+
+    /// Все журнальные файлы каталога — легаси `journal.jsonl` и
+    /// `journal.<device>.jsonl`, отсортированы по имени: порядок чтения
+    /// (а значит и результат слияния при равных id) детерминирован.
+    fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("journal dir read failed: {e}")),
+        };
+        let mut files = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("journal dir read failed: {e}"))?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let is_device = name.len() > "journal..jsonl".len()
+                && name.starts_with("journal.")
+                && name.ends_with(".jsonl");
+            if (name == "journal.jsonl" || is_device) && entry.path().is_file() {
+                files.push(entry.path());
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+
+    /// Прочитать один файл журнала в общий аккумулятор: битые строки
+    /// пропускаются и считаются (`warnings`), пустые игнорируются.
+    fn read_into(path: &Path, events: &mut Vec<Event>, warnings: &mut u32) -> Result<(), String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            // Файл могли убрать между листингом и чтением (файловый
+            // синкер, параллельная миграция) — не ошибка.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("journal read failed ({}): {e}", path.display())),
+        };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match decode_line(line) {
+                Some(ev) => events.push(ev),
+                None => *warnings += 1,
+            }
+        }
+        Ok(())
+    }
+
+    /// Дозаписать строки в файл одним write (+ flush + fsync). Если
+    /// предыдущая запись оборвана без перевода строки, блок начинается
+    /// с '\n' — битым остаётся только старый хвост.
+    fn append_lines(path: &Path, lines: &[String]) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(path)
+            .map_err(|e| format!("journal open failed: {e}"))?;
+        let mut block = String::new();
+        let len = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+        if len > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+            file.read_exact(&mut last).map_err(|e| e.to_string())?;
+            if last != *b"\n" {
+                block.push('\n');
+            }
+        }
+        for line in lines {
+            block.push_str(line);
+            block.push('\n');
+        }
+        file.write_all(block.as_bytes())
+            .map_err(|e| format!("journal append failed: {e}"))?;
+        file.flush().map_err(|e| e.to_string())?;
+        file.sync_data().map_err(|e| e.to_string())
+    }
+
+    /// Миграция одиночного `journal.jsonl` в файл своего устройства.
+    ///
+    /// Обычный путь — атомарный rename. Если файл устройства уже
+    /// существует (каталог склеен из бэкапов), строки легаси-файла
+    /// дописываются в него байт-в-байт и легаси удаляется: дубли схлопнет
+    /// чтение (журнал — множество по id), строки без чексумм остаются
+    /// валидными. Краш между append и remove не теряет данных — оба файла
+    /// читаются при каждом открытии.
+    fn migrate_legacy(dir: &Path, own_device: &str) -> Result<(), String> {
+        let legacy = journal_path_in(dir);
+        if !legacy.exists() {
+            return Ok(());
+        }
+        let own = device_journal_path_in(dir, own_device);
+        if !own.exists() {
+            return std::fs::rename(&legacy, &own)
+                .map_err(|e| format!("journal migration failed: {e}"));
+        }
+        let text = std::fs::read_to_string(&legacy)
+            .map_err(|e| format!("journal migration failed: {e}"))?;
+        let lines: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !lines.is_empty() {
+            append_lines(&own, &lines)?;
+        }
+        std::fs::remove_file(&legacy).map_err(|e| format!("journal migration failed: {e}"))
+    }
+
+    /// Файловый журнал: append-only файл **на устройство**
+    /// (`journal.<device_id>.jsonl`), по событию на строку с опциональной
+    /// CRC32-чексуммой. Свой файл только дописывается, чужие (принесённые
+    /// Syncthing/Nextcloud) читаются как read-only входы слияния — уровень
+    /// «синк через папку» из ТЗ §3.5 работает без сервера.
     pub struct Journal;
 
     impl Journal {
-        /// Прочитать журнал: `(события, счётчик пропущенных битых строк)`.
+        /// Read-only слияние всех журнальных файлов каталога (легаси
+        /// `journal.jsonl` + все `journal.*.jsonl`): `(события по id без
+        /// дублей, счётчик пропущенных битых строк)`. Ничего не пишет и не
+        /// мигрирует — путь читателей (ctl doctor); демон и миграция
+        /// pet.json открывают журнал через [`Journal::open_dir`].
         ///
-        /// Битая строка (оборванный хвост после краша/снапшота синкера) —
-        /// не повод терять журнал: строка пропускается и считается в
-        /// предупреждениях, остальное читается. Нет файла — пустой журнал.
-        /// События возвращаются отсортированными по `id` без дублей.
+        /// Битая строка (рваный хвост, несошедшаяся чексумма) — не повод
+        /// терять журнал: она пропускается и считается, остальное
+        /// читается. Нет каталога/файлов — пустой журнал.
         pub fn open(dir: &Path) -> Result<(Vec<Event>, u32), String> {
-            let path = journal_path_in(dir);
-            let text = match std::fs::read_to_string(&path) {
-                Ok(text) => text,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
-                Err(e) => return Err(format!("journal read failed: {e}")),
-            };
             let mut events = Vec::new();
             let mut warnings = 0u32;
-            for line in text.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Event>(line) {
-                    Ok(ev) => events.push(ev),
-                    Err(_) => warnings += 1,
-                }
+            for path in journal_files(dir)? {
+                read_into(&path, &mut events, &mut warnings)?;
             }
+            // Стабильная сортировка поверх чтения файлов по имени:
+            // слияние детерминировано, дубль id схлопывается.
             events.sort_by(|a, b| a.id.cmp(&b.id));
             events.dedup_by(|a, b| a.id == b.id);
             Ok((events, warnings))
         }
 
-        /// Дописать событие: создать при необходимости, append, flush и
-        /// fsync — краш не теряет уже подтверждённое событие (ТЗ §7).
-        /// Если предыдущая запись оборвана без перевода строки, новая
-        /// начинается с '\n' — битым остаётся только старый хвост.
-        pub fn append(dir: &Path, ev: &Event) -> Result<(), String> {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(journal_path_in(dir))
-                .map_err(|e| format!("journal open failed: {e}"))?;
-            let mut line = String::new();
-            let len = file.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-            if len > 0 {
-                let mut last = [0u8; 1];
-                file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
-                file.read_exact(&mut last).map_err(|e| e.to_string())?;
-                if last != *b"\n" {
-                    line.push('\n');
-                }
+        /// Открыть журнал устройством `own_device`: миграция легаси-файла
+        /// в `journal.<own_device>.jsonl`, затем слияние всех файлов
+        /// каталога как в [`Journal::open`].
+        pub fn open_dir(dir: &Path, own_device: &str) -> Result<(Vec<Event>, u32), String> {
+            migrate_legacy(dir, own_device)?;
+            Self::open(dir)
+        }
+
+        /// Дописать событие в файл СВОЕГО устройства: создать при
+        /// необходимости, append + flush + fsync — краш не теряет уже
+        /// подтверждённое событие (ТЗ §7). Строка получает CRC32-суффикс
+        /// (`\t#hex8`).
+        ///
+        /// Контракт single-writer: `ev.id.device` обязан совпадать с
+        /// `own_device` — чужие события в свой файл не пишутся никогда
+        /// (их доставляет транспорт синка, фаза E).
+        pub fn append(dir: &Path, own_device: &str, ev: &Event) -> Result<(), String> {
+            if ev.id.device != own_device {
+                return Err(format!(
+                    "journal append refused: event device {:?} != own device {own_device:?} \
+                     (single-writer contract)",
+                    ev.id.device
+                ));
             }
-            line.push_str(&serde_json::to_string(ev).map_err(|e| e.to_string())?);
-            line.push('\n');
-            file.write_all(line.as_bytes())
-                .map_err(|e| format!("journal append failed: {e}"))?;
-            file.flush().map_err(|e| e.to_string())?;
-            file.sync_data().map_err(|e| e.to_string())
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let line = encode_line(ev)?;
+            append_lines(&device_journal_path_in(dir, own_device), &[line])
+        }
+
+        /// Материализовать на диске события, ПРИВЕЗЁННЫЕ транспортом синка
+        /// (pull с сервера, фаза E): каждое дописывается в файл СВОЕГО
+        /// устройства-автора (`journal.<ev.id.device>.jsonl`), с теми же
+        /// CRC32-суффиксами и fsync, что и [`Journal::append`].
+        ///
+        /// Это НЕ нарушение single-writer (ТЗ §3.5): правило «устройство
+        /// дописывает только свой файл» действует на уровне транспорта
+        /// файлового синка — локальная реплика чужого append-only лога,
+        /// пополняемая pull-ом, и есть тот самый read-only вход слияния,
+        /// просто доставленный HTTP, а не Syncthing. В режиме «папки»
+        /// демон этот метод не зовёт — там чужие файлы приносит синкер.
+        ///
+        /// Дедупликацию гарантирует вызывающий (передаёт только события,
+        /// которых нет в каталоге): чтение схлопнуло бы дубли строк, но
+        /// файлы росли бы зря. События группируются по устройству — один
+        /// append-блок (и fsync) на файл.
+        pub fn append_remote(dir: &Path, events: &[Event]) -> Result<(), String> {
+            if events.is_empty() {
+                return Ok(());
+            }
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let mut per_device: std::collections::BTreeMap<&str, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for ev in events {
+                if ev.id.device.is_empty() {
+                    return Err("journal append_remote refused: empty device id".to_string());
+                }
+                per_device
+                    .entry(ev.id.device.as_str())
+                    .or_default()
+                    .push(encode_line(ev)?);
+            }
+            for (device, lines) in per_device {
+                append_lines(&device_journal_path_in(dir, device), &lines)?;
+            }
+            Ok(())
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use fs::{journal_path_in, Journal};
+pub use fs::{device_journal_path_in, journal_path_in, Journal};
 
 // ---------------------------------------------------------------------------
 // Тесты
@@ -1196,7 +1409,10 @@ mod tests {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod fs_tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    /// «Своё» устройство тестов.
+    const DEV: &str = "disk";
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -1206,47 +1422,238 @@ mod fs_tests {
         dir
     }
 
-    fn sample(t: u64, kind: EventKind) -> Event {
+    fn sample_on(device: &str, t: u64, kind: EventKind) -> Event {
         Event {
             id: Hlc {
                 wall_ms: t,
                 counter: 0,
-                device: "disk".into(),
+                device: device.into(),
             },
             kind,
         }
     }
 
+    fn sample(t: u64, kind: EventKind) -> Event {
+        sample_on(DEV, t, kind)
+    }
+
+    /// Записать файл журнала «как есть»: старый формат без чексумм
+    /// (легаси-файл или файл чужого устройства, принесённый синкером).
+    fn write_raw(path: &Path, events: &[Event]) {
+        let mut text = String::new();
+        for ev in events {
+            text.push_str(&serde_json::to_string(ev).unwrap());
+            text.push('\n');
+        }
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn crc32_matches_known_vector() {
+        // Классический проверочный вектор CRC-32/ISO-HDLC.
+        assert_eq!(fs::crc32(b"123456789"), 0xcbf4_3926);
+    }
+
     #[test]
     fn append_then_open_roundtrips_sorted() {
         let dir = tmp_dir("roundtrip");
-        assert_eq!(Journal::open(&dir).unwrap(), (vec![], 0), "файла ещё нет");
+        assert_eq!(Journal::open(&dir).unwrap(), (vec![], 0), "файлов ещё нет");
         let events = [
             sample(2, EventKind::Petted),
             sample(1, EventKind::Fed { treat: false }),
             sample(3, EventKind::Slept { minutes: 5.5 }),
         ];
         for ev in &events {
-            Journal::append(&dir, ev).unwrap();
+            Journal::append(&dir, DEV, ev).unwrap();
         }
+        // Запись ушла в файл своего устройства, легаси-файл не создан.
+        assert!(device_journal_path_in(&dir, DEV).is_file());
+        assert!(!journal_path_in(&dir).exists());
         let (back, warnings) = Journal::open(&dir).unwrap();
         assert_eq!(warnings, 0);
         let ids: Vec<u64> = back.iter().map(|e| e.id.wall_ms).collect();
         assert_eq!(ids, vec![1, 2, 3], "open сортирует по id");
-        assert_eq!(back.len(), 3);
+        assert_eq!(
+            Journal::open_dir(&dir, DEV).unwrap(),
+            (back, 0),
+            "open_dir без легаси-файла эквивалентен open"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_writes_crc_suffix_on_every_line() {
+        let dir = tmp_dir("crc-write");
+        Journal::append(&dir, DEV, &sample(1, EventKind::Petted)).unwrap();
+        Journal::append(&dir, DEV, &sample(2, EventKind::Played)).unwrap();
+        let text = std::fs::read_to_string(device_journal_path_in(&dir, DEV)).unwrap();
+        for line in text.lines() {
+            let (_, tail) = line.rsplit_once("\t#").expect("суффикс на месте");
+            assert_eq!(tail.len(), 8, "hex8: {line}");
+            assert!(tail.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!((events.len(), warnings), (2, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ключевой сценарий чексуммы: порча байта в середине файла, при
+    /// которой JSON остаётся валидным, — парсер бы проглотил, CRC ловит.
+    #[test]
+    fn crc_detects_corruption_mid_file() {
+        let dir = tmp_dir("crc-corrupt");
+        for t in 1..=3u64 {
+            Journal::append(&dir, DEV, &sample(t, EventKind::Petted)).unwrap();
+        }
+        let path = device_journal_path_in(&dir, DEV);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mangled = text.replace("\"wall_ms\":2", "\"wall_ms\":8");
+        assert_ne!(mangled, text, "порча попала в среднюю строку");
+        std::fs::write(&path, mangled).unwrap();
+
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!(warnings, 1, "битая строка посчитана");
+        let ids: Vec<u64> = events.iter().map(|e| e.id.wall_ms).collect();
+        assert_eq!(ids, vec![1, 3], "строка пропущена, соседи целы");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broken_crc_suffix_is_a_warning() {
+        let dir = tmp_dir("crc-broken");
+        Journal::append(&dir, DEV, &sample(1, EventKind::Petted)).unwrap();
+        let path = device_journal_path_in(&dir, DEV);
+        // Суффикс из 9 hex-символов — кривой формат, строка бита.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\t#", "\t#f");
+        std::fs::write(&path, text).unwrap();
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!((events.len(), warnings), (0, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_lines_without_crc_stay_valid() {
+        let dir = tmp_dir("no-crc");
+        // Старый формат: строки без чексуммы читаются без предупреждений...
+        write_raw(
+            &device_journal_path_in(&dir, DEV),
+            &[sample(1, EventKind::Petted), sample(2, EventKind::Played)],
+        );
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!((events.len(), warnings), (2, 0));
+        // ...и смешанный файл (дозапись нового формата) тоже.
+        Journal::append(&dir, DEV, &sample(3, EventKind::Summoned)).unwrap();
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!((events.len(), warnings), (3, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_journal_migrates_by_rename() {
+        let dir = tmp_dir("legacy-rename");
+        write_raw(
+            &journal_path_in(&dir),
+            &[sample(1, EventKind::Petted), sample(2, EventKind::Played)],
+        );
+        let (events, warnings) = Journal::open_dir(&dir, DEV).unwrap();
+        assert_eq!((events.len(), warnings), (2, 0));
+        assert!(!journal_path_in(&dir).exists(), "легаси-файл переименован");
+        assert!(device_journal_path_in(&dir, DEV).is_file());
+        // Повторное открытие идемпотентно, append продолжает тот же файл.
+        Journal::append(&dir, DEV, &sample(3, EventKind::Summoned)).unwrap();
+        let (events, warnings) = Journal::open_dir(&dir, DEV).unwrap();
+        assert_eq!((events.len(), warnings), (3, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Каталог, склеенный из бэкапов: и легаси-файл, и файл устройства.
+    /// Миграция дописывает легаси-строки в свой файл и убирает легаси;
+    /// дубль id схлопывается чтением.
+    #[test]
+    fn legacy_merges_into_existing_own_file() {
+        let dir = tmp_dir("legacy-merge");
+        Journal::append(&dir, DEV, &sample(1, EventKind::Petted)).unwrap();
+        write_raw(
+            &journal_path_in(&dir),
+            &[sample(1, EventKind::Petted), sample(2, EventKind::Played)],
+        );
+        let (events, warnings) = Journal::open_dir(&dir, DEV).unwrap();
+        assert_eq!((events.len(), warnings), (2, 0), "дубль схлопнут");
+        assert!(!journal_path_in(&dir).exists(), "легаси-файл убран");
+        let (again, warnings) = Journal::open_dir(&dir, DEV).unwrap();
+        assert_eq!((again, warnings), (events, 0), "повтор стабилен");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Файл чужого устройства (принесён Syncthing/Nextcloud): читается и
+    /// сливается, но не переписывается — read-only вход (ТЗ §3.5).
+    #[test]
+    fn foreign_device_files_merge_read_only() {
+        let dir = tmp_dir("foreign");
+        Journal::append(&dir, DEV, &sample(5, EventKind::Played)).unwrap();
+        let foreign = device_journal_path_in(&dir, "phone");
+        write_raw(
+            &foreign,
+            &[
+                sample_on("phone", 3, EventKind::Fed { treat: false }),
+                sample_on("phone", 7, EventKind::Petted),
+            ],
+        );
+        let before = std::fs::read(&foreign).unwrap();
+        let (events, warnings) = Journal::open_dir(&dir, DEV).unwrap();
+        assert_eq!(warnings, 0);
+        let ids: Vec<u64> = events.iter().map(|e| e.id.wall_ms).collect();
+        assert_eq!(ids, vec![3, 5, 7], "слияние сортирует по id");
+        assert_eq!(
+            std::fs::read(&foreign).unwrap(),
+            before,
+            "чужой файл не тронут"
+        );
+        // Детерминизм слияния: повторное чтение даёт бит-в-бит то же.
+        assert_eq!(Journal::open_dir(&dir, DEV).unwrap().0, events);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_refuses_foreign_device_event() {
+        let dir = tmp_dir("refuse");
+        let err = Journal::append(&dir, DEV, &sample_on("phone", 1, EventKind::Petted))
+            .expect_err("чужое событие в свой файл — нарушение single-writer");
+        assert!(err.contains("phone"), "ошибка называет виновника: {err}");
+        assert!(!device_journal_path_in(&dir, "phone").exists());
+        assert!(!device_journal_path_in(&dir, DEV).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_is_read_only_and_does_not_migrate() {
+        let dir = tmp_dir("open-ro");
+        write_raw(&journal_path_in(&dir), &[sample(1, EventKind::Petted)]);
+        write_raw(
+            &device_journal_path_in(&dir, "phone"),
+            &[sample_on("phone", 2, EventKind::Played)],
+        );
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!((events.len(), warnings), (2, 0), "видит все файлы");
+        assert!(
+            journal_path_in(&dir).exists(),
+            "open ничего не переименовывает"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn torn_tail_is_skipped_with_warning_not_error() {
         let dir = tmp_dir("torn");
-        Journal::append(&dir, &sample(1, EventKind::Petted)).unwrap();
-        Journal::append(&dir, &sample(2, EventKind::Played)).unwrap();
+        Journal::append(&dir, DEV, &sample(1, EventKind::Petted)).unwrap();
+        Journal::append(&dir, DEV, &sample(2, EventKind::Played)).unwrap();
         // Краш посреди записи: оборванный хвост без перевода строки.
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
-            .open(journal_path_in(&dir))
+            .open(device_journal_path_in(&dir, DEV))
             .unwrap();
         file.write_all(br#"{"id":{"wall_ms":3,"cou"#).unwrap();
         drop(file);
@@ -1256,7 +1663,7 @@ mod fs_tests {
         assert_eq!(warnings, 1, "битая строка посчитана");
 
         // Следующий append не приклеивается к оборванному хвосту.
-        Journal::append(&dir, &sample(4, EventKind::Summoned)).unwrap();
+        Journal::append(&dir, DEV, &sample(4, EventKind::Summoned)).unwrap();
         let (events, warnings) = Journal::open(&dir).unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(warnings, 1);
@@ -1267,7 +1674,7 @@ mod fs_tests {
     fn blank_lines_are_not_warnings() {
         let dir = tmp_dir("blank");
         let line = serde_json::to_string(&sample(1, EventKind::Petted)).unwrap();
-        std::fs::write(journal_path_in(&dir), format!("\n{line}\n\n")).unwrap();
+        std::fs::write(device_journal_path_in(&dir, DEV), format!("\n{line}\n\n")).unwrap();
         let (events, warnings) = Journal::open(&dir).unwrap();
         assert_eq!((events.len(), warnings), (1, 0));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1277,10 +1684,52 @@ mod fs_tests {
     fn duplicate_ids_on_disk_collapse_on_open() {
         let dir = tmp_dir("dup");
         let ev = sample(1, EventKind::Petted);
-        Journal::append(&dir, &ev).unwrap();
-        Journal::append(&dir, &ev).unwrap();
+        Journal::append(&dir, DEV, &ev).unwrap();
+        Journal::append(&dir, DEV, &ev).unwrap();
         let (events, _) = Journal::open(&dir).unwrap();
         assert_eq!(events.len(), 1, "журнал — множество событий по id");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// append_remote (транспорт синка, фаза E): привезённые pull-ом события
+    /// раскладываются по файлам своих устройств-авторов, читаются обратно
+    /// в общее слияние и защищены теми же чексуммами.
+    #[test]
+    fn append_remote_materializes_per_author_files() {
+        let dir = tmp_dir("remote");
+        Journal::append(&dir, DEV, &sample(5, EventKind::Petted)).unwrap();
+        let remote = vec![
+            sample_on("laptop", 1, EventKind::Played),
+            sample_on("desktop", 2, EventKind::Petted),
+            sample_on("laptop", 3, EventKind::Petted),
+        ];
+        Journal::append_remote(&dir, &remote).unwrap();
+
+        assert!(device_journal_path_in(&dir, "laptop").is_file());
+        assert!(device_journal_path_in(&dir, "desktop").is_file());
+        // Строки чужих файлов — с CRC-суффиксом, как у своих.
+        let text = std::fs::read_to_string(device_journal_path_in(&dir, "laptop")).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.lines().all(|l| l.contains("\t#")), "{text}");
+
+        let (events, warnings) = Journal::open(&dir).unwrap();
+        assert_eq!(warnings, 0);
+        let ids: Vec<(u64, String)> = events
+            .iter()
+            .map(|e| (e.id.wall_ms, e.id.device.clone()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                (1, "laptop".into()),
+                (2, "desktop".into()),
+                (3, "laptop".into()),
+                (5, DEV.into())
+            ]
+        );
+        // Пустой батч — no-op без ошибок и новых файлов.
+        Journal::append_remote(&dir, &[]).unwrap();
+        assert!(Journal::append_remote(&dir, &[sample_on("", 9, EventKind::Petted)]).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

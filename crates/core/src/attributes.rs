@@ -197,7 +197,9 @@ mod fs {
     /// миграции), события не дублируются.
     fn migrate_legacy(dir: &Path, legacy: LegacyRecord) -> Result<PetRecord, String> {
         let device_id = random_device_id();
-        let (existing, _warnings) = Journal::open(dir)?;
+        // Пер-девайс журнал (фаза E): open_dir заодно уведёт одиночный
+        // journal.jsonl (если он остался) в файл этого устройства.
+        let (existing, _warnings) = Journal::open_dir(dir, &device_id)?;
         let has_genesis = existing
             .iter()
             .any(|e| matches!(e.kind, EventKind::Genesis { .. }));
@@ -209,6 +211,7 @@ mod fs {
             let now_ms = wall_now_ms();
             Journal::append(
                 dir,
+                &device_id,
                 &Event {
                     id: clock.next(now_ms),
                     kind: EventKind::Genesis {
@@ -221,6 +224,7 @@ mod fs {
             if !legacy.summoned {
                 Journal::append(
                     dir,
+                    &device_id,
                     &Event {
                         id: clock.next(now_ms),
                         kind: EventKind::Dismissed,

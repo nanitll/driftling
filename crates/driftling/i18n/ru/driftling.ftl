@@ -15,6 +15,8 @@ cli-about-sleep = Уложить питомца спать
 cli-about-rename = Переименовать питомца
 cli-about-recolor = Перекрасить питомца (hex-цвет #rrggbb, например e8944a)
 cli-about-reload = Перечитать конфиг и применить на лету
+cli-about-sync = Синхронизация между устройствами (фаза E)
+cli-about-sync-status = Статус синка: режим, последние push/pull, курсоры журнала, lease присутствия
 cli-about-quit = Остановить демон
 cli-about-doctor = Диагностика: окружение, сокет, файлы, автозапуск (работает без демона)
 
@@ -61,6 +63,45 @@ doctor-autostart-none = автозапуск не настроен (ни systemd
 doctor-verdict-ok = Вердикт: всё в порядке — демон работает и отвечает.
 doctor-verdict-should-run = Вердикт: демон должен работать, но не отвечает. Запустите `driftling` (или `systemctl --user restart driftling`).
 doctor-verdict-not-running = Вердикт: демон не запущен, автозапуск не настроен. Запустите `driftling`.
+
+# --- Синк (ctl sync status, фаза E) ---
+sync-mode-off = выключен
+sync-mode-server = свой сервер
+sync-mode-folder = синкаемая папка
+ctl-sync-mode = синк: { $mode }
+ctl-sync-mode-target = синк: { $mode } — { $target }
+ctl-sync-ago = { $secs } с назад
+ctl-sync-never = ещё не было
+ctl-sync-transfers = push: { $push } · pull: { $pull }
+ctl-sync-journal =
+    журнал: { $events ->
+        [one] { $events } событие
+        [few] { $events } события
+       *[many] { $events } событий
+    } с { $devices ->
+        [one] { $devices } устройства
+       *[other] { $devices } устройств
+    }
+ctl-sync-lease-ours = присутствие: питомец на этом устройстве (lease наш)
+ctl-sync-lease-holder = присутствие: питомец на «{ $holder }»
+ctl-sync-lease-unknown = присутствие: держатель lease пока неизвестен
+ctl-sync-error = последняя ошибка синка: { $error }
+
+# --- doctor: секция синка ---
+doctor-sync-off = синк выключен ([sync] mode = "off")
+doctor-sync-server-ok = сервер синка отвечает ({ $address })
+doctor-sync-server-unreachable = сервер синка недоступен ({ $address }): { $error }
+doctor-sync-server-odd = сервер синка ответил неожиданно (HTTP { $status })
+doctor-sync-token-ok = токен синка принят
+doctor-sync-token-bad = токен синка отвергнут (401) — проверьте sync.token в config.toml
+doctor-sync-folder-missing = папка синка не существует: { $path }
+doctor-sync-folder-ok =
+    папка синка: { $path } ({ $files ->
+        [one] { $files } файл журнала
+        [few] { $files } файла журнала
+       *[many] { $files } файлов журнала
+    })
+doctor-sync-folder-readonly = папка синка недоступна на запись — журнал туда не пишется
 
 # --- IPC-ошибки демона (видны в ctl и окне настроек) ---
 daemon-shutting-down = демон завершается

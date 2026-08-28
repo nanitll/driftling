@@ -1,0 +1,4 @@
+# Конфиг для Docker-образа: слушаем все интерфейсы КОНТЕЙНЕРА (наружу
+# порт открывает docker/compose), база — на волюме /data.
+listen = "0.0.0.0:8787"
+db = "/data/driftling-server.sqlite3"
