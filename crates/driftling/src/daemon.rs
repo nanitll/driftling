@@ -176,6 +176,25 @@ pub fn run() -> Result<()> {
 
     let (tx, rx) = mpsc::channel::<IpcMessage>();
 
+    // Повторный запуск при живом демоне (клик по иконке в меню приложений) —
+    // не ошибка, а «позови питомца»: призываем в работающем демоне и тихо
+    // выходим. Bind идёт ДО запуска трея, чтобы второй процесс не успел
+    // зарегистрировать дублирующую SNI-иконку.
+    let server = match Server::bind() {
+        Ok(server) => server,
+        Err(bind_err) => {
+            return match driftling_ipc::call(&Request::Summon) {
+                Ok(_) => {
+                    log::info!("демон уже работает — питомец призван, второй экземпляр выходит");
+                    Ok(())
+                }
+                // Демон не отвечает — значит, дело не во втором экземпляре:
+                // отдаём исходную ошибку bind.
+                Err(_) => Err(bind_err),
+            };
+        }
+    };
+
     // Трей (B7): свой поток, тот же канал запросов, что и у IPC. Нет
     // SNI-вотчера (GNOME без расширения) — просто работаем без трея.
     let tray_tx = tx.clone();
@@ -189,7 +208,6 @@ pub fn run() -> Result<()> {
     // ждём с таймаутом (цикл мог зависнуть — клиент не должен висеть вечно).
     // После Quit serve() возвращается сам (контракт driftling_ipc) — поток
     // завершается штатно.
-    let server = Server::bind()?;
     let ipc_thread = std::thread::spawn(move || {
         let result = server.serve(|req| {
             let (reply_tx, reply_rx) = mpsc::channel();
