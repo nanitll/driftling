@@ -131,8 +131,10 @@ impl DriftlingTray {
 }
 
 impl ksni::Tray for DriftlingTray {
+    /// SNI Id = app-id (F1): по нему хосты трея (KDE и др.) сопоставляют
+    /// иконку с .desktop-файлом приложения и запоминают её настройки.
     fn id(&self) -> String {
-        "driftling".into()
+        driftling_core::APP_ID.into()
     }
 
     fn title(&self) -> String {
@@ -208,12 +210,19 @@ fn query_info(tx: &Sender<IpcMessage>) -> Result<Option<(bool, u32)>> {
     }
 }
 
-/// idle-кадр плейсхолдера в цвете питомца -> ksni::Icon: ARGB32 в network
-/// byte order, то есть big-endian побайтово (кадр ядра — те же
-/// ARGB8888-слова).
+/// Взрослый idle-кадр арт-пака в цвете питомца -> ksni::Icon: ARGB32 в
+/// network byte order, то есть big-endian побайтово (кадр ядра — те же
+/// ARGB8888-слова). Битый пак — фолбэк на процедурный кадр (как в демоне).
 fn tray_icon(color: u32) -> ksni::Icon {
-    let set = sprite::placeholder_colored(ICON_SIZE, Stage::Adult, color);
-    let frame = &set.idle[0];
+    let frame = driftling_core::pack::default_pack()
+        .map(|p| {
+            p.frames(Stage::Adult, "idle", ICON_SIZE, color)
+                .swap_remove(0)
+        })
+        .unwrap_or_else(|e| {
+            log::warn!("трей: арт-пак не загрузился ({e}) — процедурный фолбэк");
+            sprite::placeholder_colored(ICON_SIZE, Stage::Adult, color).idle[0].clone()
+        });
     let mut data = Vec::with_capacity(frame.argb.len() * 4);
     for px in &frame.argb {
         data.extend_from_slice(&px.to_be_bytes());

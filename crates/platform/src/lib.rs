@@ -8,11 +8,39 @@
 //! выход, `keyboard_interactivity: None`, input region = прямоугольник спрайта
 //! (обновляется каждый кадр), рендер CPU в wl_shm через SlotPool.
 //! Модель — wl_shimeji (см. docs/RESEARCH.md), реализация clean-room.
+//!
+//! X11-бэкенд (D3): override-redirect ARGB-окно по границам сцены,
+//! XShape INPUT-регион, RandR-геометрия выхода — см. [`x11`].
 
+use anyhow::Result;
 use driftling_core::sprite::Frame;
 use driftling_core::{Rect, Vec2};
 
+mod render;
+mod supervise;
 pub mod wayland;
+pub mod x11;
+
+/// Запустить бэкенд под текущее окружение: `WAYLAND_DISPLAY` → Wayland,
+/// иначе `DISPLAY` → X11, иначе ошибка (графической сессии нет).
+/// Wayland первичен: на Wayland-сессии `DISPLAY` — это XWayland, и рисовать
+/// поверх экрана через него нельзя.
+pub fn run_auto(app: impl App + 'static) -> Result<()> {
+    if env_nonempty("WAYLAND_DISPLAY") {
+        wayland::run(app)
+    } else if env_nonempty("DISPLAY") {
+        x11::run(app)
+    } else {
+        anyhow::bail!(
+            "не найдено ни WAYLAND_DISPLAY, ни DISPLAY — запускать надо из графической сессии"
+        )
+    }
+}
+
+/// Переменная окружения есть и непуста.
+fn env_nonempty(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
 
 /// Что нарисовать в этом кадре.
 pub struct Scene<'a> {

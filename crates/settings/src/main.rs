@@ -17,7 +17,7 @@ use std::time::Duration;
 mod i18n;
 use i18n::fl;
 
-use driftling_core::sprite::{placeholder, placeholder_colored, Frame};
+use driftling_core::sprite::{placeholder_colored, Frame};
 use driftling_core::{palette, PetAttributes, PetStats, Stage, DEFAULT_PET_COLOR, PET_PRESETS};
 use driftling_ipc::{call, Request, Response};
 use eframe::egui::{
@@ -796,22 +796,45 @@ fn frame_to_image(f: &Frame) -> egui::ColorImage {
     )
 }
 
-/// Кэш idle-кадров под текущие размер и цвет питомца.
+/// «Дежурные» кадры стадии из встроенного арт-пака (фаза C): idle тела,
+/// для яйца — семейство `egg` (у яйца нет idle). Колоризация — тот же
+/// путь, что у демона (pack::colorize цветом питомца). Битый пак — не
+/// смерть: фолбэк на процедурный блоб с логом, как в демоне.
+fn pack_idle_frames(stage: Stage, target_px: u32, color: u32) -> Vec<Frame> {
+    match driftling_core::pack::default_pack() {
+        Ok(p) => {
+            let anim = if stage == Stage::Egg { "egg" } else { "idle" };
+            p.frames(stage, anim, target_px, color)
+        }
+        Err(e) => {
+            log::warn!("арт-пак не загрузился ({e}) — процедурный фолбэк");
+            placeholder_colored(target_px, stage, color).idle
+        }
+    }
+}
+
+/// Кэш дежурных кадров под текущие размер, цвет и стадию питомца.
 #[derive(Default)]
 struct Portrait {
     size: u32,
     color: u32,
+    /// Стадия роста из PetInfo (None до первого ensure) — яйцо в карточке
+    /// выглядит яйцом, а не взрослым.
+    stage: Option<Stage>,
     frames: Vec<TextureHandle>,
 }
 
 impl Portrait {
-    fn ensure(&mut self, ctx: &egui::Context, size: u32, color: u32) {
-        if self.size == size && self.color == color && !self.frames.is_empty() {
+    fn ensure(&mut self, ctx: &egui::Context, size: u32, color: u32, stage: Stage) {
+        if self.size == size
+            && self.color == color
+            && self.stage == Some(stage)
+            && !self.frames.is_empty()
+        {
             return;
         }
-        let set = placeholder_colored(size.clamp(32, 256), Stage::Adult, color);
-        self.frames = set
-            .idle
+        let frames = pack_idle_frames(stage, size.clamp(32, 256), color);
+        self.frames = frames
             .iter()
             .enumerate()
             .map(|(i, f)| {
@@ -824,6 +847,7 @@ impl Portrait {
             .collect();
         self.size = size;
         self.color = color;
+        self.stage = Some(stage);
     }
 
     /// Кадр на момент времени `t` (2 fps, как idle в спрайт-движке).
@@ -1002,11 +1026,12 @@ impl SettingsApp {
         ui.horizontal(|ui| {
             ui.add_space(6.0);
             if self.logo.is_none() {
-                // Логотип в цвете питомца; сбрасывается в sync_accent.
-                let set = placeholder_colored(64, Stage::Adult, self.accent_argb);
+                // Логотип — взрослый idle-кадр арт-пака в цвете питомца;
+                // сбрасывается в sync_accent.
+                let frames = pack_idle_frames(Stage::Adult, 64, self.accent_argb);
                 self.logo = Some(ui.ctx().load_texture(
                     "logo",
-                    frame_to_image(&set.idle[0]),
+                    frame_to_image(&frames[0]),
                     TextureOptions::NEAREST,
                 ));
             }
@@ -1207,7 +1232,9 @@ impl SettingsApp {
                     .map(|i| i.attributes.size)
                     .unwrap_or_else(|| PetAttributes::default().size);
                 let color = info.as_ref().map(|i| i.color).unwrap_or(DEFAULT_PET_COLOR);
-                self.portrait.ensure(ui.ctx(), size, color);
+                // Стадия — из живого PetInfo (демон лежит — взрослый арт).
+                let stage = info.as_ref().map(|i| i.stage).unwrap_or(Stage::Adult);
+                self.portrait.ensure(ui.ctx(), size, color, stage);
                 let t = ui.input(|i| i.time);
                 egui::Frame::new()
                     .fill(PORTRAIT_BG)
@@ -1697,10 +1724,12 @@ impl eframe::App for SettingsApp {
     }
 }
 
-/// Иконка окна: первый idle-кадр питомца (иначе в заголовке — generic «W»).
+/// Иконка окна: взрослый idle-кадр арт-пака (иначе в заголовке — generic
+/// «W»). Фолбэк-иконка для окружений без установленного .desktop; с ним
+/// иконку берут из темы по app_id (см. main).
 fn app_icon() -> egui::IconData {
-    let set = placeholder(64);
-    let f = &set.idle[0];
+    let frames = pack_idle_frames(Stage::Adult, 64, DEFAULT_PET_COLOR);
+    let f = &frames[0];
     let rgba = f
         .argb
         .iter()
@@ -1727,6 +1756,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([780.0, 540.0])
             .with_min_inner_size([640.0, 480.0])
+            // app_id = имя .desktop-файла (SHIPPING.md, F1): без совпадения
+            // KDE показывает generic-иконку в панели/alt-tab. egui-winit
+            // прокидывает это в winit with_name (Wayland app_id).
+            .with_app_id(driftling_core::APP_ID)
             .with_icon(app_icon()),
         ..Default::default()
     };

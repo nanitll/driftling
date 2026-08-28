@@ -1,6 +1,6 @@
 [package]
 name = "driftling-platform"
-description = "Overlay backends: Wayland (wlr-layer-shell via smithay-client-toolkit); X11 later"
+description = "Overlay backends: Wayland (wlr-layer-shell via smithay-client-toolkit) and X11 (x11rb)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,5 +9,9 @@ repository.workspace = true
 [dependencies]
 driftling-core = { workspace = true }
 smithay-client-toolkit = { workspace = true }
+# X11-бэкенд: shape — input-регион фигурой, randr — геометрия выхода.
+x11rb = { workspace = true, features = ["shape", "randr"] }
+# poll(2) по fd X-соединения — адаптивный таймер без event-loop-крейта.
+rustix = { workspace = true, features = ["event"] }
 anyhow = { workspace = true }
 log = { workspace = true }

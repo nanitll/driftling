@@ -11,8 +11,8 @@ use serde::Deserialize;
 use crate::{WindowPlatform, WorldSnapshot};
 
 /// Кромка короче этого — не платформа (стоять негде): отсекает служебные
-/// окна-точки вроде xwaylandvideobridge (1×1 px).
-const MIN_PLATFORM_SIZE: f32 = 16.0;
+/// окна-точки вроде xwaylandvideobridge (1×1 px). Общий порог всех провайдеров.
+pub(crate) const MIN_PLATFORM_SIZE: f32 = 16.0;
 
 /// Окно из снапшота скрипта. Порядок в массиве — bottom-to-top (стекинг KWin).
 #[derive(Debug, Deserialize)]
@@ -87,7 +87,8 @@ pub(crate) fn filter(raw: &RawSnapshot) -> WorldSnapshot {
 }
 
 /// Собственные окна питомца (оверлей, настройки) — не платформы.
-fn is_own_window(cls: &str) -> bool {
+/// Общий фильтр всех провайдеров (класс/app_id окна).
+pub(crate) fn is_own_window(cls: &str) -> bool {
     cls.to_ascii_lowercase().contains("driftling")
 }
 

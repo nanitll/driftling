@@ -1,6 +1,6 @@
 [package]
 name = "driftling-worldsense"
-description = "World sense: window-geometry providers (KWin now; sway/Hyprland/X11 in D3)"
+description = "World sense: window-geometry providers (KWin, sway, Hyprland, X11/EWMH)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,3 +13,5 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
 zbus = { workspace = true }
+# X11-провайдер (EWMH): только core-протокол, без фич-расширений.
+x11rb = { workspace = true }

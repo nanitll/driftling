@@ -1,0 +1,187 @@
+# Манифест встроенного пака «default».
+# Формат описан в crates/core/src/pack.rs (модульный doc-комментарий);
+# он же — будущий манифест внешних .driftpack.
+format = 1
+
+[stages.egg]
+native = 24
+
+[stages.egg.anims.egg]
+fps = 1.5
+frames = ["egg_0", "egg_1"]
+
+[stages.egg.anims.hatch]
+fps = 2.0
+frames = ["hatch_0", "hatch_1", "hatch_2"]
+
+[stages.baby]
+native = 24
+
+[stages.baby.anims.idle]
+fps = 2.0
+frames = ["idle_0", "idle_1"]
+
+[stages.baby.anims.walk]
+fps = 6.0
+frames = ["walk_0", "walk_1", "walk_2", "walk_3"]
+
+[stages.baby.anims.sleep]
+fps = 1.0
+frames = ["sleep_0", "sleep_1"]
+
+[stages.baby.anims.falling]
+fps = 8.0
+frames = ["falling_0"]
+
+[stages.baby.anims.dragged]
+fps = 4.0
+frames = ["dragged_0"]
+
+[stages.baby.anims.landing]
+fps = 6.0
+frames = ["landing_0"]
+
+[stages.baby.anims.eating]
+fps = 4.0
+frames = ["eating_0", "eating_1"]
+
+[stages.baby.anims.happy]
+fps = 3.0
+frames = ["happy_0", "happy_1"]
+
+[stages.baby.anims.sad]
+fps = 1.5
+frames = ["sad_0"]
+
+[stages.baby.anims.sick]
+fps = 1.5
+frames = ["sick_0"]
+
+[stages.child]
+native = 28
+
+[stages.child.anims.idle]
+fps = 2.0
+frames = ["idle_0", "idle_1"]
+
+[stages.child.anims.walk]
+fps = 6.0
+frames = ["walk_0", "walk_1", "walk_2", "walk_3"]
+
+[stages.child.anims.sleep]
+fps = 1.0
+frames = ["sleep_0", "sleep_1"]
+
+[stages.child.anims.falling]
+fps = 8.0
+frames = ["falling_0"]
+
+[stages.child.anims.dragged]
+fps = 4.0
+frames = ["dragged_0"]
+
+[stages.child.anims.landing]
+fps = 6.0
+frames = ["landing_0"]
+
+[stages.child.anims.eating]
+fps = 4.0
+frames = ["eating_0", "eating_1"]
+
+[stages.child.anims.happy]
+fps = 3.0
+frames = ["happy_0", "happy_1"]
+
+[stages.child.anims.sad]
+fps = 1.5
+frames = ["sad_0"]
+
+[stages.child.anims.sick]
+fps = 1.5
+frames = ["sick_0"]
+
+[stages.teen]
+native = 32
+
+[stages.teen.anims.idle]
+fps = 2.0
+frames = ["idle_0", "idle_1"]
+
+[stages.teen.anims.walk]
+fps = 6.0
+frames = ["walk_0", "walk_1", "walk_2", "walk_3"]
+
+[stages.teen.anims.sleep]
+fps = 1.0
+frames = ["sleep_0", "sleep_1"]
+
+[stages.teen.anims.falling]
+fps = 8.0
+frames = ["falling_0"]
+
+[stages.teen.anims.dragged]
+fps = 4.0
+frames = ["dragged_0"]
+
+[stages.teen.anims.landing]
+fps = 6.0
+frames = ["landing_0"]
+
+[stages.teen.anims.eating]
+fps = 4.0
+frames = ["eating_0", "eating_1"]
+
+[stages.teen.anims.happy]
+fps = 3.0
+frames = ["happy_0", "happy_1"]
+
+[stages.teen.anims.sad]
+fps = 1.5
+frames = ["sad_0"]
+
+[stages.teen.anims.sick]
+fps = 1.5
+frames = ["sick_0"]
+
+[stages.adult]
+native = 32
+
+[stages.adult.anims.idle]
+fps = 2.0
+frames = ["idle_0", "idle_1"]
+
+[stages.adult.anims.walk]
+fps = 6.0
+frames = ["walk_0", "walk_1", "walk_2", "walk_3"]
+
+[stages.adult.anims.sleep]
+fps = 1.0
+frames = ["sleep_0", "sleep_1"]
+
+[stages.adult.anims.falling]
+fps = 8.0
+frames = ["falling_0"]
+
+[stages.adult.anims.dragged]
+fps = 4.0
+frames = ["dragged_0"]
+
+[stages.adult.anims.landing]
+fps = 6.0
+frames = ["landing_0"]
+
+[stages.adult.anims.eating]
+fps = 4.0
+frames = ["eating_0", "eating_1"]
+
+[stages.adult.anims.happy]
+fps = 3.0
+frames = ["happy_0", "happy_1"]
+
+[stages.adult.anims.sad]
+fps = 1.5
+frames = ["sad_0"]
+
+[stages.adult.anims.sick]
+fps = 1.5
+frames = ["sick_0"]

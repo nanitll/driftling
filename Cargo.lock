@@ -1035,7 +1035,9 @@ dependencies = [
  "anyhow",
  "driftling-core",
  "log",
+ "rustix 1.1.4",
  "smithay-client-toolkit 0.19.2",
+ "x11rb",
 ]
 
 [[package]]
@@ -1063,6 +1065,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "x11rb",
  "zbus",
 ]
 

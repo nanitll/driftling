@@ -4,8 +4,8 @@
 //! - `driftling_core::journal` — журнал событий, единственный источник
 //!   истины о питомце (имя, характеристики, статы, стадия, summoned);
 //! - `driftling_core::Pet` (поведение на экране, tick + pointer);
-//! - `driftling_core::sprite::placeholder` (кадры);
-//! - `driftling_platform::wayland::run` (оверлей: App::tick -> Scene);
+//! - `driftling_core::pack` (кадры арт-пака; процедурный sprite.rs — фолбэк);
+//! - `driftling_platform::run_auto` (оверлей Wayland/X11: App::tick -> Scene);
 //! - `driftling_ipc::Server` в отдельном потоке -> канал -> DaemonApp::tick.
 //!
 //! Контракт App::tick: собрать Scene из текущего кадра питомца
@@ -25,7 +25,9 @@
 //!
 //! Волна 2 фазы B — визуальный слой (B3/B5/B6):
 //! - **Спрайты по стадии/настроению**: набор кадров пересоздаётся при смене
-//!   свёрнутой стадии или размера ([`sprite::placeholder_for_stage`]); кадр
+//!   свёрнутой стадии или размера ([`stage_sprites`]: арт-пак фазы C с
+//!   фолбэком на процедурный блоб); в памяти живёт ТОЛЬКО набор текущей
+//!   стадии — старый дропается при смене (бюджет RSS); кадр
 //!   выбирается через [`SpriteSet::frame_look`] по полному виду
 //!   ([`Look`]: состояние + стадия + настроение + оверлей). Яйцо не ходит —
 //!   [`Pet::set_grounded_only`].
@@ -231,7 +233,7 @@ pub fn run() -> Result<()> {
     install_panic_hook();
 
     let quit_via_ipc = Arc::clone(&app.quit_via_ipc);
-    let result = driftling_platform::wayland::run(app);
+    let result = driftling_platform::run_auto(app);
     // Выход по ctl quit: дождаться IPC-поток, чтобы ответ «ok» дописался
     // клиенту до конца процесса. serve() после Quit возвращается сам
     // (контракт driftling_ipc), так что join ограничен. При SIGTERM же
@@ -445,6 +447,27 @@ fn hello_bubble(from: f64, secs: f64) -> Bubble {
     }
 }
 
+/// Набор кадров стадии из встроенного арт-пака (фаза C), колоризованный
+/// цветом питомца. Целевой размер — базовый размер (attributes.size),
+/// отмасштабированный [`sprite::stage_scale`]: та же лестница роста, что
+/// была у процедурного блоба; пак сам берёт ближайший целый множитель
+/// native (пиксель-арт не мылится). Битый пак — не смерть: фолбэк на
+/// процедурный спрайт с логом (внешние .driftpack придут в M4, у
+/// встроенного пака валидность гарантируют тесты core).
+///
+/// Возвращается ОДИН набор — вызывающий хранит только текущую стадию,
+/// присваивание дропает старый набор (бюджет RSS фазы B).
+fn stage_sprites(base: u32, stage: Stage, color: u32) -> SpriteSet {
+    let target = ((base as f32) * sprite::stage_scale(stage)).round() as u32;
+    match driftling_core::pack::default_sprite_set(stage, target, color) {
+        Ok(set) => set,
+        Err(e) => {
+            log::warn!("арт-пак не загрузился ({e}) — процедурный фолбэк");
+            sprite::placeholder_colored(base, stage, color)
+        }
+    }
+}
+
 /// Запустить окно настроек не блокируясь (пункт меню «Настройки»).
 /// Та же стратегия поиска бинаря, что в tray.rs/main.rs: рядом с собой,
 /// затем в PATH; ребёнка дожидается отдельный поток (не плодим зомби).
@@ -565,7 +588,7 @@ impl DaemonApp {
         let stage = derived.stage;
         let color = derived.color;
         Self {
-            sprites: sprite::placeholder_colored(size, stage, color),
+            sprites: stage_sprites(size, stage, color),
             events: storage.events,
             clock: storage.clock,
             fold_cfg,
@@ -791,7 +814,19 @@ impl DaemonApp {
                 color & 0x00ff_ffff
             );
         }
-        self.sprites = sprite::placeholder_colored(base, stage, color);
+        let (old_stage, old_px) = (self.sprite_stage, self.sprites.size);
+        // Присваивание дропает набор прежней стадии — кэшируется ровно один.
+        self.sprites = stage_sprites(base, stage, color);
+        if stage != old_stage {
+            // Видимость роста в логе — парная строка к «перекраске» выше.
+            log::info!(
+                "рост: {} -> {} (спрайт {} -> {} px)",
+                old_stage.as_str(),
+                stage.as_str(),
+                old_px,
+                self.sprites.size
+            );
+        }
         self.sprite_stage = stage;
         self.sprite_base = base;
         self.sprite_color = color;
@@ -1713,9 +1748,13 @@ mod tests {
         app.tick(0.0);
         assert_eq!(reply.recv().unwrap(), Response::Ok);
         // Спрайты пересозданы под новый базовый размер С УЧЁТОМ стадии:
-        // новорождённый — яйцо, масштаб stage_scale(Egg).
-        let expected =
-            ((128.0 * driftling_core::sprite::stage_scale(Stage::Egg)).round() as u32).max(16);
+        // новорождённый — яйцо; ожидание считаем тем же путём, что и демон
+        // (арт-пак: target = base * stage_scale, целый множитель native).
+        let expected = stage_sprites(128, Stage::Egg, driftling_core::DEFAULT_PET_COLOR).size;
+        assert!(
+            expected > stage_sprites(32, Stage::Egg, driftling_core::DEFAULT_PET_COLOR).size,
+            "базовый размер реально влияет на набор"
+        );
         assert_eq!(app.sprites.size, expected);
         assert_eq!(app.pet.as_ref().unwrap().size, expected as f32);
         assert_eq!(app.pet.as_ref().unwrap().config().walk_speed, 200.0);

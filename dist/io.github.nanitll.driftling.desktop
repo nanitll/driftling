@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Driftling
+Comment=A tiny desktop pet that lives on your screen
+Comment[ru]=Крошечный питомец, который живёт на вашем экране
+Exec=driftling
+Icon=io.github.nanitll.driftling
+Terminal=false
+Categories=Utility;Amusement;
+Keywords=pet;tamagotchi;shimeji;desktop pet;
+Keywords[ru]=питомец;тамагочи;
+StartupNotify=false
+StartupWMClass=io.github.nanitll.driftling
+SingleMainWindow=false

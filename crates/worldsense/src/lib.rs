@@ -10,11 +10,18 @@
 //! Сейчас реализованы:
 //! - KWin (KDE Plasma 6): свой QML-скрипт внутри KWin шлёт снапшоты по D-Bus
 //!   (см. `assets/kwin/driftling-sense.qml` и модуль [`kwin`]);
-//! - Null: всегда `None` (все прочие окружения до D3).
+//! - sway: i3-IPC через `$SWAYSOCK` (модуль [`sway`]);
+//! - Hyprland: сокеты инстанса из `$HYPRLAND_INSTANCE_SIGNATURE`
+//!   (модуль [`hyprland`]);
+//! - X11 (чистый X11-сеанс без Wayland): EWMH-опрос корня (модуль [`x11`]);
+//! - Null: всегда `None` (все прочие окружения).
 
+mod hyprland;
 mod kwin;
 mod null;
 mod parse;
+mod sway;
+mod x11;
 
 use driftling_core::Rect;
 
@@ -46,26 +53,56 @@ pub trait WorldSense: Send {
     fn latest(&mut self) -> Option<WorldSnapshot>;
 }
 
-/// Выбирает провайдера под текущее окружение.
+/// Выбирает провайдера под текущее окружение. Порядок:
 ///
-/// KDE (в `XDG_CURRENT_DESKTOP` есть `KDE` и `org.kde.KWin` присутствует на
-/// сессионной шине) — KWin-провайдер; всё остальное — Null-провайдер
-/// (штатная деградация: пол = низ экрана).
+/// 1. KDE (в `XDG_CURRENT_DESKTOP` есть `KDE` и `org.kde.KWin` на шине) —
+///    KWin-провайдер;
+/// 2. задан `$SWAYSOCK` — sway (i3-IPC);
+/// 3. задана `$HYPRLAND_INSTANCE_SIGNATURE` — Hyprland;
+/// 4. `$DISPLAY` без `$WAYLAND_DISPLAY` (чистый X11-сеанс) — EWMH-провайдер;
+/// 5. иначе Null (штатная деградация: пол = низ экрана).
+///
+/// Ошибка подъёма провайдера не фатальна — пробуем следующего по списку.
 pub fn detect() -> Box<dyn WorldSense> {
-    if !desktop_is_kde() {
-        log::info!("worldsense: не-KDE окружение — null-провайдер (пол = низ экрана)");
-        return Box::new(null::NullSense);
-    }
-    match kwin::KWinSense::new() {
-        Ok(sense) => {
-            log::info!("worldsense: KWin-провайдер активен");
-            Box::new(sense)
-        }
-        Err(e) => {
-            log::warn!("worldsense: KWin-провайдер не поднялся ({e}) — null-провайдер");
-            Box::new(null::NullSense)
+    if desktop_is_kde() {
+        match kwin::KWinSense::new() {
+            Ok(sense) => {
+                log::info!("worldsense: выбран KWin-провайдер");
+                return Box::new(sense);
+            }
+            Err(e) => log::warn!("worldsense: KWin-провайдер не поднялся ({e})"),
         }
     }
+    if env_non_empty("SWAYSOCK") {
+        match sway::SwaySense::new() {
+            Ok(sense) => {
+                log::info!("worldsense: выбран sway-провайдер");
+                return Box::new(sense);
+            }
+            Err(e) => log::warn!("worldsense: sway-провайдер не поднялся ({e})"),
+        }
+    }
+    if env_non_empty("HYPRLAND_INSTANCE_SIGNATURE") {
+        match hyprland::HyprlandSense::new() {
+            Ok(sense) => {
+                log::info!("worldsense: выбран Hyprland-провайдер");
+                return Box::new(sense);
+            }
+            Err(e) => log::warn!("worldsense: Hyprland-провайдер не поднялся ({e})"),
+        }
+    }
+    // --- D3b: X11 (EWMH) — проверка окружения внутри try_provider ---
+    if let Some(sense) = x11::try_provider() {
+        return sense;
+    }
+    // --- конец D3b ---
+    log::info!("worldsense: подходящего провайдера нет — null (пол = низ экрана)");
+    Box::new(null::NullSense)
+}
+
+/// Переменная окружения задана и не пуста.
+fn env_non_empty(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
 }
 
 /// `XDG_CURRENT_DESKTOP` — список через `:`, регистр не гарантирован.

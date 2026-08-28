@@ -56,6 +56,10 @@ jobs:
 
   # Headless-смоук (ТД-27, ТЗ §8): демон под sway в headless-режиме wlroots.
   # Скрипт также гоняется локально: SMOKE_COMPOSITOR=session ci/smoke.sh.
+  # TODO(D3): второй смоук-заход под X11 — Xvfb + оконный WM с EWMH
+  # (например, openbox): DISPLAY без WAYLAND_DISPLAY гоняет x11-бэкенд и
+  # EWMH-worldsense (локально проверено на живом Xwayland, Xvfb на
+  # дев-машине нет).
   smoke:
     runs-on: ubuntu-latest
     # TODO: снять continue-on-error после первого зелёного прогона в Actions.

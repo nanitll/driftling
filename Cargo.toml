@@ -26,6 +26,10 @@ driftling-ipc = { path = "crates/ipc" }
 driftling-worldsense = { path = "crates/worldsense" }
 
 smithay-client-toolkit = "0.19"
+# X11-бэкенд и worldsense-провайдер (D3): чистый Rust, без libxcb
+# (RustConnection); фичи-расширения добавляются в крейтах. Лицензия
+# MIT OR Apache-2.0 — в allow-списке deny.toml.
+x11rb = "0.13"
 rustix = { version = "1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
