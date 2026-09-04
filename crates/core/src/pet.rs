@@ -121,6 +121,9 @@ pub struct Pet {
     /// Уснуть сразу после приземления: команда «Уложить спать», отданная
     /// на стене или потолке, сначала отцепляет питомца (фаза G).
     sleep_on_land: bool,
+    /// Текущая прогулка — «поход к стене» (фаза G): питомец идёт до края
+    /// экрана не сворачивая и лезет наверх. Снимается на выходе из Walk.
+    wall_trip: bool,
 }
 
 /// Порог движения курсора, после которого нажатие становится захватом,
@@ -151,6 +154,7 @@ impl Pet {
             action_time: 0.0,
             action_left: 1.0,
             sleep_on_land: false,
+            wall_trip: false,
         }
     }
 
@@ -506,7 +510,12 @@ impl Pet {
     /// Попытка полезть на стену у края экрана (фаза G): бросок кубика по
     /// `w_wall_climb`. Яйцо (grounded_only) не лазает.
     fn try_wall_climb(&mut self, world: &World, wall: Surface) -> bool {
-        if self.grounded_only || self.rng.u32(0..100) >= self.cfg.w_wall_climb {
+        if self.grounded_only {
+            return false;
+        }
+        // Дошёл целенаправленно — лезет обязательно; забрёл случайно —
+        // как повезёт.
+        if !self.wall_trip && self.rng.u32(0..100) >= self.cfg.w_wall_climb {
             return false;
         }
         self.switch_surface(wall);
@@ -735,8 +744,15 @@ impl Pet {
             next = PetState::Idle;
             dur = self.roll(self.cfg.idle_range);
         }
-        if next == PetState::Walk && self.rng.bool() {
-            self.facing = self.facing.flip();
+        if next == PetState::Walk {
+            if self.rng.bool() {
+                self.facing = self.facing.flip();
+            }
+            // Поход к стене: идём до края экрана, не сворачивая по таймеру.
+            if !self.grounded_only && self.rng.u32(0..100) < self.cfg.w_wall_trip {
+                self.wall_trip = true;
+                dur = f32::INFINITY;
+            }
         }
         self.enter(next);
         self.state_left = dur;
@@ -749,6 +765,10 @@ impl Pet {
 
     fn enter(&mut self, next: PetState) {
         if self.state != next {
+            if self.state == PetState::Walk {
+                // Поход к стене живёт ровно одну прогулку.
+                self.wall_trip = false;
+            }
             self.state = next;
             self.state_time = 0.0;
         }
@@ -807,6 +827,10 @@ mod tests {
     fn walk_turns_at_screen_edge() {
         let w = world();
         let mut p = pet();
+        // Проверяем именно разворот: лазание по стенам выключено
+        // (оно живёт в своих тестах фазы G).
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
         // Приземлить и заставить идти влево от левого края.
         for _ in 0..600 {
             p.tick(&w, 1.0 / 60.0);
@@ -827,6 +851,11 @@ mod tests {
     fn drag_and_throw() {
         let w = world();
         let mut p = pet();
+        // Тест про физику броска: цепляние за стену отключено, иначе
+        // питомец залипнет на кромке экрана вместо земли.
+        p.cfg.wall_grab_speed = f32::INFINITY;
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
         for _ in 0..600 {
             p.tick(&w, 1.0 / 60.0);
         }
@@ -1379,6 +1408,29 @@ mod tests {
         assert_eq!(p.pos.y, w.ground_y());
     }
 
+    /// «Поход к стене» (фаза G): рано или поздно питомец сам доходит до
+    /// края экрана и лезет наверх — без этого лазание было бы видно
+    /// только по случайности.
+    #[test]
+    fn pet_eventually_goes_climbing_on_its_own() {
+        let w = world();
+        let mut p = pet();
+        let mut climbed = false;
+        let mut max_height = f32::MAX;
+        for _ in 0..200_000 {
+            p.tick(&w, 1.0 / 60.0);
+            if p.state == PetState::Climb || p.surface != Surface::Floor {
+                climbed = true;
+                max_height = max_height.min(p.bounds().y);
+            }
+        }
+        assert!(climbed, "за час жизни питомец обязан слазить на стену");
+        assert!(
+            max_height < w.ground_y() - 200.0,
+            "и забраться заметно выше пола: {max_height}"
+        );
+    }
+
     /// Ориентация кадра: на полу — обычная, на потолке — вверх ногами,
     /// на стенах — поворот на четверть.
     #[test]
@@ -1559,5 +1611,51 @@ mod tests {
         p.world_changed(&w);
         assert_eq!(p.state, PetState::Dragged);
         assert_eq!((p.pos.x, p.pos.y), (pos.x, pos.y));
+    }
+}
+
+#[cfg(test)]
+mod g_stats {
+    use super::*;
+
+    /// Замер баланса, а не ассерт-тест: прогон часа жизни печатает, на что
+    /// уходит время питомца. Ею подбирались веса фазы G — «слишком часто
+    /// бегает» проверяется числом, а не на глаз.
+    ///
+    /// `cargo test -p driftling-core g_stats -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_time_budget() {
+        let w = World::new(Rect::new(0.0, 0.0, 1920.0, 1080.0));
+        let mut p = Pet::new(Vec2::new(960.0, 100.0), 64.0, BehaviorConfig::default(), 7);
+        let (mut walk, mut idle, mut sleep, mut off_floor, mut trips) = (0, 0, 0, 0, 0);
+        let mut was_floor = true;
+        let total = 60 * 60 * 30; // час при 30 Гц
+        for _ in 0..total {
+            p.tick(&w, 1.0 / 30.0);
+            match p.state {
+                PetState::Walk => walk += 1,
+                PetState::Idle | PetState::Landing => idle += 1,
+                PetState::Sleep => sleep += 1,
+                _ => {}
+            }
+            if p.surface != Surface::Floor {
+                off_floor += 1;
+                if was_floor {
+                    trips += 1;
+                }
+                was_floor = false;
+            } else {
+                was_floor = true;
+            }
+        }
+        let pct = |n: i32| 100.0 * n as f32 / total as f32;
+        println!(
+            "час жизни: ходьба {:.0}%, покой {:.0}%, сон {:.0}%, вне пола {:.0}%, вылазок на стены {trips}",
+            pct(walk),
+            pct(idle),
+            pct(sleep),
+            pct(off_floor)
+        );
     }
 }
