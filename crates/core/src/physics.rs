@@ -75,6 +75,44 @@ impl Orient {
     pub const fn swaps_axes(self) -> bool {
         self.quarter_turns % 2 == 1
     }
+
+    /// Размер кадра `(w, h)` после трансформации.
+    pub const fn output_size(self, w: u32, h: u32) -> (u32, u32) {
+        if self.swaps_axes() {
+            (h, w)
+        } else {
+            (w, h)
+        }
+    }
+
+    /// Обратная трансформация: какой пиксель исходного кадра `w`x`h` лежит
+    /// в точке `(dx, dy)` уже повёрнутого вывода. Сперва откручиваем
+    /// поворот по часовой, затем снимаем зеркала.
+    ///
+    /// Это единственная реализация поворота в проекте: ею пользуются и
+    /// CPU-рендер оверлея, и дев-инструменты — расхождению взяться неоткуда.
+    pub fn source_pixel(self, w: u32, h: u32, dx: u32, dy: u32) -> (u32, u32) {
+        let (fx, fy) = match self.quarter_turns % 4 {
+            0 => (dx, dy),
+            1 => (dy, h.saturating_sub(1) - dx.min(h.saturating_sub(1))),
+            2 => (
+                w.saturating_sub(1) - dx.min(w.saturating_sub(1)),
+                h.saturating_sub(1) - dy.min(h.saturating_sub(1)),
+            ),
+            _ => (w.saturating_sub(1) - dy.min(w.saturating_sub(1)), dx),
+        };
+        let sx = if self.flip_x {
+            w.saturating_sub(1) - fx.min(w.saturating_sub(1))
+        } else {
+            fx
+        };
+        let sy = if self.flip_y {
+            h.saturating_sub(1) - fy.min(h.saturating_sub(1))
+        } else {
+            fy
+        };
+        (sx.min(w.saturating_sub(1)), sy.min(h.saturating_sub(1)))
+    }
 }
 
 impl Surface {

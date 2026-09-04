@@ -62,11 +62,7 @@ pub struct SpriteInstance<'a> {
 impl SpriteInstance<'_> {
     /// Размер кадра на экране с учётом поворота.
     pub fn size(&self) -> (u32, u32) {
-        if self.orient.swaps_axes() {
-            (self.frame.h, self.frame.w)
-        } else {
-            (self.frame.w, self.frame.h)
-        }
+        self.orient.output_size(self.frame.w, self.frame.h)
     }
 }
 

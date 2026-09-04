@@ -19,6 +19,7 @@ use driftling_core::growth::Stage;
 use driftling_core::pack::{default_pack, Pack, BODY_ANIMS, EGG_ANIMS, EXTRA_ANIMS};
 use driftling_core::palette::DEFAULT_PET_COLOR;
 use driftling_core::sprite::{placeholder_colored, Frame};
+use driftling_core::{Direction, Orient, Surface};
 
 const LIGHT_BG: u32 = 0xff_e9_e9_ef;
 const DARK_BG: u32 = 0xff_34_36_3f;
@@ -28,9 +29,9 @@ const SCALE: u32 = 4;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
-        [_, m, o] if m == "sheets" || m == "icons" => (m.as_str(), Path::new(o)),
+        [_, m, o] if m == "sheets" || m == "icons" || m == "surfaces" => (m.as_str(), Path::new(o)),
         _ => {
-            eprintln!("использование: render_pack (sheets|icons) <каталог>");
+            eprintln!("использование: render_pack (sheets|icons|surfaces) <каталог>");
             std::process::exit(2);
         }
     };
@@ -44,6 +45,7 @@ fn main() {
     };
     match mode {
         "sheets" => sheets(pack, out),
+        "surfaces" => surfaces(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -61,6 +63,26 @@ impl Canvas {
             w,
             h,
             px: vec![bg; (w * h) as usize],
+        }
+    }
+
+    /// Блит с ориентацией — той же математикой поворота, что и в оверлее
+    /// ([`Orient::source_pixel`]); дев-пруф показывает ровно то, что
+    /// увидит композитор на стене и под потолком.
+    fn blit_oriented(&mut self, f: &Frame, x0: u32, y0: u32, orient: Orient) {
+        let (ow, oh) = orient.output_size(f.w, f.h);
+        for dy in 0..oh {
+            for dx in 0..ow {
+                let (sx, sy) = orient.source_pixel(f.w, f.h, dx, dy);
+                let p = f.argb[(sy * f.w + sx) as usize];
+                if p >> 24 == 0 {
+                    continue;
+                }
+                let (cx, cy) = (x0 + dx, y0 + dy);
+                if cx < self.w && cy < self.h {
+                    self.px[(cy * self.w + cx) as usize] = p;
+                }
+            }
         }
     }
 
@@ -82,6 +104,49 @@ impl Canvas {
     fn save(&self, path: &Path) {
         write_png(path, self.w, self.h, &self.px);
     }
+}
+
+/// Дев-пруф фазы G: «комната» с питомцем на всех поверхностях —
+/// пол, обе стены и потолок, каждый со своим кадром и ориентацией.
+fn surfaces(pack: &Pack, out: &Path) {
+    const ROOM_W: u32 = 420;
+    const ROOM_H: u32 = 300;
+    const PET: u32 = 64;
+    let frames = |anim: &str| pack.frames(Stage::Adult, anim, PET, DEFAULT_PET_COLOR);
+    let walk = frames("walk");
+    let climb = frames("climb");
+    let cling = frames("cling");
+    let idle = frames("idle");
+
+    for (name, bg) in [("surfaces_light", LIGHT_BG), ("surfaces_dark", DARK_BG)] {
+        let mut c = Canvas::new(ROOM_W, ROOM_H, bg);
+        // Пол: обычная ориентация, мордой вправо и влево.
+        c.blit_oriented(
+            &walk[0],
+            40,
+            ROOM_H - PET,
+            Surface::Floor.orient(Direction::Right),
+        );
+        c.blit_oriented(
+            &idle[0],
+            150,
+            ROOM_H - PET,
+            Surface::Floor.orient(Direction::Left),
+        );
+        // Левая стена: ползёт вверх (facing Left = вверх).
+        c.blit_oriented(&climb[0], 0, 90, Surface::WallLeft.orient(Direction::Left));
+        // Правая стена: висит, держась (facing Right = вверх).
+        c.blit_oriented(
+            &cling[0],
+            ROOM_W - PET,
+            120,
+            Surface::WallRight.orient(Direction::Right),
+        );
+        // Потолок: висит вниз головой и ползёт вправо.
+        c.blit_oriented(&climb[1], 200, 0, Surface::Ceiling.orient(Direction::Right));
+        c.save(&out.join(format!("{name}.png")));
+    }
+    println!("пруф поверхностей записан в {}", out.display());
 }
 
 /// Все семейства стадии в порядке манифест-констант.

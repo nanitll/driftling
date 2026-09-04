@@ -108,19 +108,11 @@ pub(crate) fn compose(
 }
 
 /// Индекс исходного пикселя кадра для точки (dx, dy) в системе координат
-/// вывода (уже повёрнутой). Обратная трансформация к [`Orient`]: сперва
-/// откручиваем поворот по часовой, затем снимаем зеркала.
+/// вывода. Сама математика поворота живёт в ядре ([`Orient::source_pixel`]),
+/// чтобы у оверлея и дев-инструментов она была общая.
 fn source_index(frame: &Frame, orient: Orient, dx: u32, dy: u32) -> usize {
-    let (w, h) = (frame.w, frame.h);
-    let (fx, fy) = match orient.quarter_turns % 4 {
-        0 => (dx, dy),
-        1 => (dy, h - 1 - dx),
-        2 => (w - 1 - dx, h - 1 - dy),
-        _ => (w - 1 - dy, dx),
-    };
-    let sx = if orient.flip_x { w - 1 - fx } else { fx };
-    let sy = if orient.flip_y { h - 1 - fy } else { fy };
-    (sy * w + sx) as usize
+    let (sx, sy) = orient.source_pixel(frame.w, frame.h, dx, dy);
+    (sy * frame.w + sx) as usize
 }
 
 /// Блит спрайта на холст: nearest-neighbour масштаб, ориентация кадра
@@ -137,11 +129,7 @@ fn blit(
     if frame.w == 0 || frame.h == 0 {
         return;
     }
-    let (out_w, out_h) = if orient.swaps_axes() {
-        (frame.h, frame.w)
-    } else {
-        (frame.w, frame.h)
-    };
+    let (out_w, out_h) = orient.output_size(frame.w, frame.h);
     let base_x = ox * scale as i32;
     let base_y = oy * scale as i32;
     for dy in 0..out_h * scale {
