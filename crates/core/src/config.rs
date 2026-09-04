@@ -292,7 +292,9 @@ mod tests {
         )
         .expect("legacy-ключи должны найтись");
         assert_eq!(attrs.size, 90);
-        assert_eq!(attrs.walk_speed, 400.0);
+        // Скорость режется потолком движка (фаза G: было 400, стало 160);
+        // «успокоение» до прогулочной — уже дело демона (PetAttributes::tamed).
+        assert_eq!(attrs.walk_speed, crate::attributes::MAX_WALK_SPEED);
         assert_eq!(attrs.curiosity, 100);
         assert_eq!(attrs.sleepiness, 0);
 

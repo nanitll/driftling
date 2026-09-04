@@ -8,6 +8,8 @@ state-sleep = Спит
 state-falling = Падает
 state-dragged = В руках
 state-landing = Приземлился
+state-climb = Лезет по стене
+state-bonk = Набил шишку
 state-unknown = Неизвестно
 
 # --- Аптайм (плюральные формы CLDR: one/few/many) ---

@@ -9,8 +9,9 @@
 //! - `driftling_ipc::Server` в отдельном потоке -> канал -> DaemonApp::tick.
 //!
 //! Контракт App::tick: собрать Scene из текущего кадра питомца
-//! (`SpriteSet::frame(state, state_time, facing)`, origin = bounds().{x,y},
-//! mirror = facing==Left) и input_rects = [bounds()], когда питомец призван.
+//! (`SpriteSet::frame_look(...)`, origin = bounds().{x,y}, ориентация —
+//! `Pet::orient()`: зеркало по взгляду плюс поворот под поверхность, на
+//! которой питомец сидит) и input_rects = [bounds()], когда он призван.
 //!
 //! Персистентность (фаза B): каждое действие ухода — событие журнала,
 //! записанное на диск в момент команды (append + fsync в `Journal::append`);
@@ -75,8 +76,9 @@ use driftling_core::physics::Platform;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
     apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
-    Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Pet, PetAttributes,
-    PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, SyncConfig, SyncMode, Vec2, World,
+    Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient, Pet,
+    PetAttributes, PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, SyncConfig, SyncMode,
+    Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
@@ -262,7 +264,7 @@ pub fn run() -> Result<()> {
     // Восприятие мира (фаза D): KWin-провайдер на KDE, null-провайдер
     // (пол = низ экрана) везде ещё; деградация штатная, демон работает всегда.
     let sense = driftling_worldsense::detect();
-    let app = DaemonApp::new(
+    let mut app = DaemonApp::new(
         rx,
         data_dir,
         legacy_attrs,
@@ -270,6 +272,9 @@ pub fn run() -> Result<()> {
         Some(sense),
         sync_cfg,
     );
+    // Разовая нормализация характеристик из эпохи ручного config.toml
+    // (фаза G): 400 px/s и непоседливость 100 — это не характер, а баг.
+    app.tame_attributes();
 
     // SIGTERM/SIGINT (ТД-20): флаг проверяется в tick -> graceful-выход.
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
@@ -851,6 +856,35 @@ impl DaemonApp {
         self.last_fold = Instant::now();
     }
 
+    /// Разовое «успокоение» характеристик (фаза G).
+    ///
+    /// Питомцы, приехавшие из ручного `config.toml` эпохи M0, несут в
+    /// журнале экстремальные значения (скорость 400 px/s, непоседливость
+    /// 100 при нулевой сонливости): такой питомец без остановки носится
+    /// по экрану. Нормализация — обычное журнальное событие
+    /// `AttributesSet`: она разъедется на все устройства и откатывается
+    /// дебаг-панелью, а не переписывает историю задним числом.
+    /// Питомцы в норме (и уже нормализованные) не трогаются.
+    fn tame_attributes(&mut self) {
+        let Some(tamed) = self.derived.attributes.tamed() else {
+            return;
+        };
+        let before = self.derived.attributes;
+        match self.append_event(EventKind::AttributesSet { attributes: tamed }) {
+            Ok(()) => log::info!(
+                "характер успокоен (фаза G): скорость {:.0}->{:.0}, непоседливость {}->{}, \
+                 сонливость {}->{}",
+                before.walk_speed,
+                tamed.walk_speed,
+                before.curiosity,
+                tamed.curiosity,
+                before.sleepiness,
+                tamed.sleepiness
+            ),
+            Err(e) => log::warn!("не удалось записать нормализацию характеристик: {e}"),
+        }
+    }
+
     /// Дописать событие ухода: диск (append + fsync) -> память -> свёртка.
     /// Ошибка диска = событие не случилось (Err наружу, состояние не
     /// трогаем). В деградации событие живёт только в памяти — уход
@@ -1070,7 +1104,7 @@ impl DaemonApp {
         self.sprite_color = color;
         let attrs = self.derived.attributes;
         if let Some(pet) = &mut self.pet {
-            pet.apply_config(attrs.behavior_config(), self.sprites.size as f32);
+            pet.apply_config(attrs.behavior_config_for(stage), self.sprites.size as f32);
             pet.set_grounded_only(stage == Stage::Egg);
         }
         if hatched && self.pet.is_some() {
@@ -1164,7 +1198,9 @@ impl DaemonApp {
             let mut pet = Pet::new(
                 pos,
                 self.sprites.size as f32,
-                self.derived.attributes.behavior_config(),
+                self.derived
+                    .attributes
+                    .behavior_config_for(self.derived.stage),
                 // Сид из битов монотонного времени: дёшево и достаточно.
                 now.to_bits(),
             );
@@ -1211,7 +1247,9 @@ impl DaemonApp {
             let mut pet = Pet::new(
                 start,
                 size,
-                self.derived.attributes.behavior_config(),
+                self.derived
+                    .attributes
+                    .behavior_config_for(self.derived.stage),
                 now.to_bits(),
             );
             pet.state = PetState::Walk;
@@ -1252,6 +1290,9 @@ impl DaemonApp {
             self.pet = None;
             return;
         };
+        // Со стены/потолка (фаза G) питомец сперва встаёт на ноги —
+        // пробежку присутствия демон ведёт по полу.
+        pet.detach_to_floor();
         // Ближайший край; спящего пробежка будит (Slept закроет note_sleep).
         let dir = if pet.pos.x - world.screen.x <= world.screen.right() - pet.pos.x {
             -1.0
@@ -1530,7 +1571,7 @@ impl DaemonApp {
         let a = attrs.clamped();
         if let Some(pet) = &mut self.pet {
             let keep_size = pet.size;
-            pet.apply_config(a.behavior_config(), keep_size);
+            pet.apply_config(a.behavior_config_for(self.derived.stage), keep_size);
         }
         log::info!("set_attributes: применены {a:?}");
         self.care(EventKind::AttributesSet { attributes: a })
@@ -1804,16 +1845,20 @@ impl App for DaemonApp {
                     stage: self.derived.stage,
                     mood,
                     overlay: self.overlay.as_ref().map(|o| o.look),
+                    surface: pet.surface,
+                    idle_action: pet.idle_action(),
                 };
-                // Фаза анимации оверлея — от его старта, не от state_time.
+                // Фаза анимации оверлея — от его старта, не от state_time;
+                // у мелких занятий в покое (фаза G) — своя фаза.
                 let t = match &self.overlay {
                     Some(o) => (now - o.from) as f32,
-                    None => pet.state_time,
+                    None => pet.anim_time(),
                 };
                 let mut sprites = vec![SpriteInstance {
                     frame: self.sprites.frame_look(&look, t),
                     origin: Vec2::new(bounds.x, bounds.y),
-                    mirror: pet.facing == Direction::Left,
+                    // Поворот под поверхность + зеркало по взгляду (фаза G).
+                    orient: pet.orient(),
                 }];
                 // Пробегающего мимо (run-off/run-in, фаза E) не поймать:
                 // хит-области нет, указатель проходит насквозь.
@@ -1823,17 +1868,24 @@ impl App for DaemonApp {
                     vec![bounds]
                 };
                 // Пузырь — над питомцем, в пределах экрана, без хит-области.
+                // Под потолком (фаза G) места сверху нет — пузырь уходит вниз.
                 if let Some(bubble) = self.bubble.as_ref().filter(|b| now >= b.from) {
                     let (bw, bh) = (bubble.frame.w as f32, bubble.frame.h as f32);
-                    let x = (pet.pos.x - bw / 2.0).clamp(
+                    let cx = bounds.x + bounds.w / 2.0;
+                    let x = (cx - bw / 2.0).clamp(
                         world.screen.x,
                         (world.screen.right() - bw).max(world.screen.x),
                     );
-                    let y = (bounds.y - bh - BUBBLE_GAP).max(world.screen.y);
+                    let above = bounds.y - bh - BUBBLE_GAP;
+                    let y = if above >= world.screen.y {
+                        above
+                    } else {
+                        (bounds.bottom() + BUBBLE_GAP).min(world.ground_y() - bh)
+                    };
                     sprites.push(SpriteInstance {
                         frame: &bubble.frame,
                         origin: Vec2::new(x, y),
-                        mirror: false,
+                        orient: Orient::IDENTITY,
                     });
                 }
                 // Меню — поверх всего (последним в порядке блита) + хит-зона.
@@ -1841,7 +1893,7 @@ impl App for DaemonApp {
                     sprites.push(SpriteInstance {
                         frame: &menu.frame,
                         origin: menu.origin,
-                        mirror: false,
+                        orient: Orient::IDENTITY,
                     });
                     input_rects.push(menu.screen_rect());
                 }
@@ -2095,6 +2147,60 @@ mod tests {
         let (events, warnings) = Journal::open(dir).unwrap();
         assert_eq!(warnings, 0, "журнал без битых строк");
         events.into_iter().map(|e| e.kind).collect()
+    }
+
+    /// Фаза G: питомец с характеристиками из ручного config.toml эпохи M0
+    /// один раз успокаивается событием журнала; повторный старт события
+    /// не плодит.
+    #[test]
+    fn legacy_wild_attributes_are_tamed_once() {
+        let dir = tmp_dir("tame");
+        let wild = PetAttributes {
+            size: 90,
+            walk_speed: 400.0,
+            curiosity: 100,
+            sleepiness: 0,
+            ..PetAttributes::default()
+        };
+        // Демон с legacy-конфигом: Genesis унесёт «дикие» характеристики.
+        let (tx, rx) = mpsc::channel::<IpcMessage>();
+        let mut app = DaemonApp::new(
+            rx,
+            dir.clone(),
+            Some(wild),
+            None,
+            None,
+            SyncConfig::default(),
+        );
+        assert_eq!(app.derived.attributes.walk_speed, 400.0);
+        app.tame_attributes();
+        let calm = app.derived.attributes;
+        assert!(calm.walk_speed <= driftling_core::attributes::CALM_WALK_SPEED);
+        assert!(calm.curiosity <= driftling_core::attributes::CALM_CURIOSITY);
+        assert_eq!(calm.size, 90, "размер не трогаем");
+        let kinds = journal_kinds(&dir);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| matches!(k, EventKind::AttributesSet { .. }))
+                .count(),
+            1
+        );
+
+        // Второй запуск на том же каталоге: успокаивать больше нечего.
+        drop(tx);
+        let (_tx2, rx2) = mpsc::channel::<IpcMessage>();
+        let mut again = DaemonApp::new(rx2, dir.clone(), None, None, None, SyncConfig::default());
+        again.tame_attributes();
+        assert_eq!(
+            journal_kinds(&dir)
+                .iter()
+                .filter(|k| matches!(k, EventKind::AttributesSet { .. }))
+                .count(),
+            1,
+            "нормализация не повторяется"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2380,7 +2486,7 @@ mod tests {
 
         let attrs = PetAttributes {
             size: 128,
-            walk_speed: 200.0,
+            walk_speed: 120.0,
             ..PetAttributes::default()
         };
         let reply = send(&tx, Request::SetAttributes(attrs));
@@ -2396,7 +2502,13 @@ mod tests {
         );
         assert_eq!(app.sprites.size, expected);
         assert_eq!(app.pet.as_ref().unwrap().size, expected as f32);
-        assert_eq!(app.pet.as_ref().unwrap().config().walk_speed, 200.0);
+        // Скорость доезжает с поправкой на стадию (фаза G): яйцо
+        // двигалось бы медленнее взрослого.
+        let expected_speed = 120.0 * sprite::stage_scale(Stage::Egg);
+        assert_eq!(
+            app.pet.as_ref().unwrap().config().walk_speed,
+            expected_speed
+        );
 
         // Характеристики реально доехали до журнала.
         assert!(matches!(
@@ -2418,7 +2530,7 @@ mod tests {
                 assert_eq!(name, fl!("default-pet-name"));
                 assert!(state.is_some());
                 assert_eq!(attributes.size, 128);
-                assert_eq!(attributes.walk_speed, 200.0);
+                assert_eq!(attributes.walk_speed, 120.0);
                 // Новорождённый: статы ещё не успели просесть, стадия — яйцо.
                 assert!(stats.satiety > 99.0 && stats.health > 99.0);
                 assert_eq!(stage, Stage::Egg);
@@ -2526,7 +2638,7 @@ mod tests {
         geometry(&mut app);
         app.pet.as_mut().unwrap().facing = Direction::Left;
         let scene = app.tick(0.0);
-        assert!(scene.sprites[0].mirror);
+        assert!(scene.sprites[0].orient.flip_x);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

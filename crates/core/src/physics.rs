@@ -5,8 +5,8 @@
 //! побеждает самая высокая. Платформы поставляет worldsense-провайдер
 //! демона, ядро о протоколах ничего не знает.
 
-use crate::geometry::Rect;
-use crate::pet::World;
+use crate::geometry::{Rect, Vec2};
+use crate::pet::{Direction, World};
 
 /// Платформа, по которой можно ходить: верхняя кромка окна.
 /// `id` — стабильный идентификатор окна от провайдера (для отладки/логов;
@@ -15,6 +15,135 @@ use crate::pet::World;
 pub struct Platform {
     pub rect: Rect,
     pub id: u64,
+}
+
+/// Поверхность, к которой прижат питомец (фаза G: стены и потолок).
+///
+/// Опорная точка `Pet::pos` — всегда точка касания поверхности (центр той
+/// кромки спрайта, которой питомец её касается), поэтому смена поверхности
+/// не «телепортирует» питомца: меняется только раскладка [`Pet::bounds`]
+/// и ориентация кадра.
+///
+/// Направление движения вдоль поверхности задаётся [`Surface::tangent`] при
+/// `facing = Right`; знак `facing` его переворачивает. Тангенсы выбраны так,
+/// чтобы «нос» повёрнутого кадра всегда смотрел вперёд по движению:
+/// на левой стене `Right` — это вниз, на правой — вверх (см. [`Surface::orient`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Surface {
+    /// Земля или верхняя кромка окна: ноги вниз (модель фаз M0–D).
+    #[default]
+    Floor,
+    /// Потолок экрана: питомец висит под ним ногами вверх.
+    Ceiling,
+    /// Левая стена экрана: ноги влево, тело вправо от кромки.
+    WallLeft,
+    /// Правая стена экрана: ноги вправо, тело влево от кромки.
+    WallRight,
+}
+
+/// Ориентация кадра при отрисовке: локальные отражения спрайта, затем
+/// поворот на `quarter_turns` четвертей по часовой стрелке.
+/// Кадры пака нарисованы мордой вправо и ногами вниз — всё остальное
+/// получается этой трансформацией, отдельного арта под стены не нужно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Orient {
+    /// Отразить по горизонтали в системе координат кадра (смотрит влево).
+    pub flip_x: bool,
+    /// Отразить по вертикали в системе координат кадра (висит вниз головой).
+    pub flip_y: bool,
+    /// Поворот по часовой стрелке, 0..=3 четверти.
+    pub quarter_turns: u8,
+}
+
+impl Orient {
+    pub const IDENTITY: Orient = Orient {
+        flip_x: false,
+        flip_y: false,
+        quarter_turns: 0,
+    };
+
+    /// Только зеркало по горизонтали (совместимость с прежним `mirror`).
+    pub const fn mirrored(flip_x: bool) -> Orient {
+        Orient {
+            flip_x,
+            flip_y: false,
+            quarter_turns: 0,
+        }
+    }
+
+    /// Меняет ли трансформация местами ширину и высоту кадра.
+    pub const fn swaps_axes(self) -> bool {
+        self.quarter_turns % 2 == 1
+    }
+}
+
+impl Surface {
+    /// Единичный вектор движения вдоль поверхности при `facing = Right`.
+    pub fn tangent(self) -> Vec2 {
+        match self {
+            Surface::Floor | Surface::Ceiling => Vec2::new(1.0, 0.0),
+            // Согласовано с orient(): после поворота «нос» кадра смотрит
+            // вниз на левой стене и вверх на правой.
+            Surface::WallLeft => Vec2::new(0.0, 1.0),
+            Surface::WallRight => Vec2::new(0.0, -1.0),
+        }
+    }
+
+    /// Нормаль: от поверхности в свободное пространство (куда смотрит спина).
+    pub fn normal(self) -> Vec2 {
+        match self {
+            Surface::Floor => Vec2::new(0.0, -1.0),
+            Surface::Ceiling => Vec2::new(0.0, 1.0),
+            Surface::WallLeft => Vec2::new(1.0, 0.0),
+            Surface::WallRight => Vec2::new(-1.0, 0.0),
+        }
+    }
+
+    /// Движение идёт по горизонтали (пол и потолок) или по вертикали (стены).
+    pub fn horizontal(self) -> bool {
+        matches!(self, Surface::Floor | Surface::Ceiling)
+    }
+
+    /// Ориентация кадра: ноги всегда упираются в поверхность.
+    pub fn orient(self, facing: Direction) -> Orient {
+        let flip_x = facing == Direction::Left;
+        match self {
+            Surface::Floor => Orient {
+                flip_x,
+                flip_y: false,
+                quarter_turns: 0,
+            },
+            // Потолок — вертикальное отражение: ноги вверх, направление взгляда
+            // по горизонтали сохраняется.
+            Surface::Ceiling => Orient {
+                flip_x,
+                flip_y: true,
+                quarter_turns: 0,
+            },
+            // Поворот на 90° по часовой: низ кадра уходит влево — ноги в стену.
+            Surface::WallLeft => Orient {
+                flip_x,
+                flip_y: false,
+                quarter_turns: 1,
+            },
+            // Против часовой (три четверти по часовой): низ кадра уходит вправо.
+            Surface::WallRight => Orient {
+                flip_x,
+                flip_y: false,
+                quarter_turns: 3,
+            },
+        }
+    }
+
+    /// Прямоугольник спрайта размера `size` при касании в точке `pos`.
+    pub fn bounds(self, pos: Vec2, size: f32) -> Rect {
+        match self {
+            Surface::Floor => Rect::new(pos.x - size / 2.0, pos.y - size, size, size),
+            Surface::Ceiling => Rect::new(pos.x - size / 2.0, pos.y, size, size),
+            Surface::WallLeft => Rect::new(pos.x, pos.y - size / 2.0, size, size),
+            Surface::WallRight => Rect::new(pos.x - size, pos.y - size / 2.0, size, size),
+        }
+    }
 }
 
 /// Порог «ступеньки» при ходьбе, px: перепад опоры в пределах порога

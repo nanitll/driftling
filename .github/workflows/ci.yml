@@ -21,6 +21,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # Производные кадры пака (фаза G) обязаны совпадать с генератором:
+      # правка базового кадра без перегенерации разошлась бы с арт-паком.
+      - run: python3 tools/art/derive_frames.py --check
 
   # ТЗ §3.7: core обязан собираться под wasm32 (задел под веб/мобильные клиенты).
   core-wasm:

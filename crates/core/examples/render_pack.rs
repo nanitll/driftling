@@ -16,7 +16,7 @@ use std::fs;
 use std::path::Path;
 
 use driftling_core::growth::Stage;
-use driftling_core::pack::{default_pack, Pack, BODY_ANIMS, EGG_ANIMS};
+use driftling_core::pack::{default_pack, Pack, BODY_ANIMS, EGG_ANIMS, EXTRA_ANIMS};
 use driftling_core::palette::DEFAULT_PET_COLOR;
 use driftling_core::sprite::{placeholder_colored, Frame};
 
@@ -89,7 +89,13 @@ fn stage_anims(stage: Stage) -> Vec<&'static str> {
     if stage == Stage::Egg {
         EGG_ANIMS.to_vec()
     } else {
-        BODY_ANIMS.to_vec()
+        // Семейства фазы G — следом за базовыми, тем же порядком, что в
+        // константах: лист-обзор должен показывать весь арт стадии.
+        BODY_ANIMS
+            .iter()
+            .chain(EXTRA_ANIMS.iter())
+            .copied()
+            .collect()
     }
 }
 

@@ -185,3 +185,115 @@ frames = ["sad_0"]
 [stages.adult.anims.sick]
 fps = 1.5
 frames = ["sick_0"]
+
+[stages.baby.anims.blink]
+fps = 1.0
+frames = ["blink_0"]
+
+[stages.baby.anims.sit]
+fps = 1.5
+frames = ["sit_0", "sit_1"]
+
+[stages.baby.anims.stretch]
+fps = 2.0
+frames = ["stretch_0", "stretch_1"]
+
+[stages.baby.anims.wiggle]
+fps = 4.0
+frames = ["wiggle_0", "wiggle_1"]
+
+[stages.baby.anims.cling]
+fps = 1.5
+frames = ["cling_0", "cling_1"]
+
+[stages.baby.anims.climb]
+fps = 5.0
+frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
+
+[stages.baby.anims.dizzy]
+fps = 4.0
+frames = ["dizzy_0", "dizzy_1"]
+
+[stages.child.anims.blink]
+fps = 1.0
+frames = ["blink_0"]
+
+[stages.child.anims.sit]
+fps = 1.5
+frames = ["sit_0", "sit_1"]
+
+[stages.child.anims.stretch]
+fps = 2.0
+frames = ["stretch_0", "stretch_1"]
+
+[stages.child.anims.wiggle]
+fps = 4.0
+frames = ["wiggle_0", "wiggle_1"]
+
+[stages.child.anims.cling]
+fps = 1.5
+frames = ["cling_0", "cling_1"]
+
+[stages.child.anims.climb]
+fps = 5.0
+frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
+
+[stages.child.anims.dizzy]
+fps = 4.0
+frames = ["dizzy_0", "dizzy_1"]
+
+[stages.teen.anims.blink]
+fps = 1.0
+frames = ["blink_0"]
+
+[stages.teen.anims.sit]
+fps = 1.5
+frames = ["sit_0", "sit_1"]
+
+[stages.teen.anims.stretch]
+fps = 2.0
+frames = ["stretch_0", "stretch_1"]
+
+[stages.teen.anims.wiggle]
+fps = 4.0
+frames = ["wiggle_0", "wiggle_1"]
+
+[stages.teen.anims.cling]
+fps = 1.5
+frames = ["cling_0", "cling_1"]
+
+[stages.teen.anims.climb]
+fps = 5.0
+frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
+
+[stages.teen.anims.dizzy]
+fps = 4.0
+frames = ["dizzy_0", "dizzy_1"]
+
+[stages.adult.anims.blink]
+fps = 1.0
+frames = ["blink_0"]
+
+[stages.adult.anims.sit]
+fps = 1.5
+frames = ["sit_0", "sit_1"]
+
+[stages.adult.anims.stretch]
+fps = 2.0
+frames = ["stretch_0", "stretch_1"]
+
+[stages.adult.anims.wiggle]
+fps = 4.0
+frames = ["wiggle_0", "wiggle_1"]
+
+[stages.adult.anims.cling]
+fps = 1.5
+frames = ["cling_0", "cling_1"]
+
+[stages.adult.anims.climb]
+fps = 5.0
+frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
+
+[stages.adult.anims.dizzy]
+fps = 4.0
+frames = ["dizzy_0", "dizzy_1"]

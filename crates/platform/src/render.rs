@@ -3,7 +3,7 @@
 //! это и wl_shm ARGB8888, и 32-битный ZPixmap на LSB-first X-серверах.
 
 use driftling_core::sprite::Frame;
-use driftling_core::Rect;
+use driftling_core::{Orient, Rect};
 
 use crate::Scene;
 
@@ -15,10 +15,11 @@ pub(crate) fn scene_bounds(scene: &Scene<'_>) -> Option<(i32, i32, u32, u32)> {
         if s.frame.w == 0 || s.frame.h == 0 {
             continue;
         }
+        let (sw, sh) = s.size();
         let x0 = s.origin.x.round() as i32;
         let y0 = s.origin.y.round() as i32;
-        let x1 = x0 + s.frame.w as i32;
-        let y1 = y0 + s.frame.h as i32;
+        let x1 = x0 + sw as i32;
+        let y1 = y0 + sh as i32;
         acc = Some(match acc {
             None => (x0, y0, x1, y1),
             Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
@@ -47,7 +48,7 @@ struct SpriteKey {
     h: u32,
     /// Положение спрайта внутри буфера (относительно объединённых границ).
     rel: (i32, i32),
-    mirror: bool,
+    orient: Orient,
 }
 
 pub(crate) fn content_key(scene: &Scene<'_>, origin: (i32, i32), scale: u32) -> ContentKey {
@@ -65,7 +66,7 @@ pub(crate) fn content_key(scene: &Scene<'_>, origin: (i32, i32), scale: u32) -> 
                     s.origin.x.round() as i32 - origin.0,
                     s.origin.y.round() as i32 - origin.1,
                 ),
-                mirror: s.mirror,
+                orient: s.orient,
             })
             .collect(),
     }
@@ -102,43 +103,58 @@ pub(crate) fn compose(
             s.origin.x.round() as i32 - origin.0,
             s.origin.y.round() as i32 - origin.1,
         );
-        blit(canvas, size, s.frame, rel, s.mirror, scale);
+        blit(canvas, size, s.frame, rel, s.orient, scale);
     }
 }
 
-/// Блит спрайта на холст: nearest-neighbour масштаб, опциональное
-/// горизонтальное зеркало, пропуск пикселей с альфой 0, клип по краям.
-/// `origin` — логические координаты левого верхнего угла спрайта на холсте.
+/// Индекс исходного пикселя кадра для точки (dx, dy) в системе координат
+/// вывода (уже повёрнутой). Обратная трансформация к [`Orient`]: сперва
+/// откручиваем поворот по часовой, затем снимаем зеркала.
+fn source_index(frame: &Frame, orient: Orient, dx: u32, dy: u32) -> usize {
+    let (w, h) = (frame.w, frame.h);
+    let (fx, fy) = match orient.quarter_turns % 4 {
+        0 => (dx, dy),
+        1 => (dy, h - 1 - dx),
+        2 => (w - 1 - dx, h - 1 - dy),
+        _ => (w - 1 - dy, dx),
+    };
+    let sx = if orient.flip_x { w - 1 - fx } else { fx };
+    let sy = if orient.flip_y { h - 1 - fy } else { fy };
+    (sy * w + sx) as usize
+}
+
+/// Блит спрайта на холст: nearest-neighbour масштаб, ориентация кадра
+/// (зеркала + поворот на четверти), пропуск пикселей с альфой 0, клип по
+/// краям. `origin` — логические координаты левого верхнего угла спрайта.
 fn blit(
     canvas: &mut [u8],
     (cw, ch): (u32, u32),
     frame: &Frame,
     (ox, oy): (i32, i32),
-    mirror: bool,
+    orient: Orient,
     scale: u32,
 ) {
     if frame.w == 0 || frame.h == 0 {
         return;
     }
+    let (out_w, out_h) = if orient.swaps_axes() {
+        (frame.h, frame.w)
+    } else {
+        (frame.w, frame.h)
+    };
     let base_x = ox * scale as i32;
     let base_y = oy * scale as i32;
-    for dy in 0..frame.h * scale {
+    for dy in 0..out_h * scale {
         let cy = base_y + dy as i32;
         if cy < 0 || cy >= ch as i32 {
             continue;
         }
-        let sy = dy / scale;
-        for dx in 0..frame.w * scale {
+        for dx in 0..out_w * scale {
             let cx = base_x + dx as i32;
             if cx < 0 || cx >= cw as i32 {
                 continue;
             }
-            let sx = if mirror {
-                frame.w - 1 - dx / scale
-            } else {
-                dx / scale
-            };
-            let px = frame.argb[(sy * frame.w + sx) as usize];
+            let px = frame.argb[source_index(frame, orient, dx / scale, dy / scale)];
             if px >> 24 == 0 {
                 continue; // прозрачный пиксель спрайта
             }
@@ -176,7 +192,7 @@ mod tests {
             sprites: vec![SpriteInstance {
                 frame,
                 origin,
-                mirror,
+                orient: Orient::mirrored(mirror),
             }],
             input_rects: vec![Rect::new(
                 origin.x,
@@ -193,7 +209,7 @@ mod tests {
     fn blit_scale1_pixel_perfect() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 4 * 4 * 4];
-        blit(&mut canvas, (4, 4), &f, (1, 1), false, 1);
+        blit(&mut canvas, (4, 4), &f, (1, 1), Orient::IDENTITY, 1);
         assert_eq!(pixel(&canvas, 4, 1, 1), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 4, 2, 1), 0xff_00_22_00);
         assert_eq!(pixel(&canvas, 4, 1, 2), 0xff_00_00_33);
@@ -208,18 +224,60 @@ mod tests {
     fn blit_mirror_swaps_columns() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 2 * 2 * 4];
-        blit(&mut canvas, (2, 2), &f, (0, 0), true, 1);
+        blit(&mut canvas, (2, 2), &f, (0, 0), Orient::mirrored(true), 1);
         assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_22_00); // B слева
         assert_eq!(pixel(&canvas, 2, 1, 0), 0xff_11_00_00); // A справа
         assert_eq!(pixel(&canvas, 2, 0, 1), 0); // прозрачный (зеркало C)
         assert_eq!(pixel(&canvas, 2, 1, 1), 0xff_00_00_33);
     }
 
+    /// Фаза G: поворот на четверть (питомец на стене) — низ кадра
+    /// уходит влево при 1 четверти и вправо при 3.
+    #[test]
+    fn blit_quarter_turns_rotate_the_frame() {
+        let f = frame_2x2(); // A B / C .
+        let cw = Orient {
+            flip_x: false,
+            flip_y: false,
+            quarter_turns: 1,
+        };
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        blit(&mut canvas, (2, 2), &f, (0, 0), cw, 1);
+        // Поворот по часовой: A уходит вправо-вверх, C — влево-вверх.
+        assert_eq!(pixel(&canvas, 2, 1, 0), 0xff_11_00_00);
+        assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_00_33);
+        assert_eq!(pixel(&canvas, 2, 1, 1), 0xff_00_22_00);
+
+        let ccw = Orient {
+            quarter_turns: 3,
+            ..cw
+        };
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        blit(&mut canvas, (2, 2), &f, (0, 0), ccw, 1);
+        assert_eq!(pixel(&canvas, 2, 0, 1), 0xff_11_00_00);
+        assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_22_00);
+    }
+
+    /// Вертикальное отражение (питомец под потолком) переворачивает ряды.
+    #[test]
+    fn blit_flip_y_swaps_rows() {
+        let f = frame_2x2();
+        let orient = Orient {
+            flip_x: false,
+            flip_y: true,
+            quarter_turns: 0,
+        };
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        blit(&mut canvas, (2, 2), &f, (0, 0), orient, 1);
+        assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_00_33, "нижний ряд наверху");
+        assert_eq!(pixel(&canvas, 2, 0, 1), 0xff_11_00_00);
+    }
+
     #[test]
     fn blit_scale2_nearest_neighbour() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 4 * 4 * 4];
-        blit(&mut canvas, (4, 4), &f, (0, 0), false, 2);
+        blit(&mut canvas, (4, 4), &f, (0, 0), Orient::IDENTITY, 2);
         // Каждый исходный пиксель — блок 2x2.
         for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             assert_eq!(pixel(&canvas, 4, x, y), 0xff_11_00_00);
@@ -237,10 +295,10 @@ mod tests {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 2 * 2 * 4];
         // Наполовину за левым верхним углом: не паникует, видимая часть верна.
-        blit(&mut canvas, (2, 2), &f, (-1, -1), false, 1);
+        blit(&mut canvas, (2, 2), &f, (-1, -1), Orient::IDENTITY, 1);
         assert_eq!(pixel(&canvas, 2, 0, 0), 0); // прозрачный угол спрайта
                                                 // За правым нижним краем — тоже без паники.
-        blit(&mut canvas, (2, 2), &f, (1, 1), false, 1);
+        blit(&mut canvas, (2, 2), &f, (1, 1), Orient::IDENTITY, 1);
         assert_eq!(pixel(&canvas, 2, 1, 1), 0xff_11_00_00);
     }
 
@@ -276,12 +334,12 @@ mod tests {
                 SpriteInstance {
                     frame: &f,
                     origin: Vec2::new(0.0, 0.0),
-                    mirror: false,
+                    orient: Orient::IDENTITY,
                 },
                 SpriteInstance {
                     frame: &f,
                     origin: Vec2::new(10.0, 4.0),
-                    mirror: false,
+                    orient: Orient::IDENTITY,
                 },
             ],
             input_rects: vec![],

@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use driftling_core::sprite::Frame;
-use driftling_core::{Rect, Vec2};
+use driftling_core::{Orient, Rect, Vec2};
 
 mod render;
 mod supervise;
@@ -52,10 +52,22 @@ pub struct Scene<'a> {
 
 pub struct SpriteInstance<'a> {
     pub frame: &'a Frame,
-    /// Левый верхний угол спрайта.
+    /// Левый верхний угол спрайта (уже с учётом поворота: для четвертей
+    /// 90°/270° ширина и высота кадра меняются местами).
     pub origin: Vec2,
-    /// Зеркалировать по горизонтали (питомец смотрит влево).
-    pub mirror: bool,
+    /// Ориентация кадра: зеркала + поворот под поверхность (фаза G).
+    pub orient: Orient,
+}
+
+impl SpriteInstance<'_> {
+    /// Размер кадра на экране с учётом поворота.
+    pub fn size(&self) -> (u32, u32) {
+        if self.orient.swaps_axes() {
+            (self.frame.h, self.frame.w)
+        } else {
+            (self.frame.w, self.frame.h)
+        }
+    }
 }
 
 /// События, которые бэкенд отдаёт приложению.

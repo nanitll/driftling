@@ -3,10 +3,11 @@
 //! стадии роста. Настоящие паки (.driftpack) придут в M4; интерфейс кадров
 //! уже финальный.
 
-use crate::behavior::PetState;
+use crate::behavior::{IdleAction, PetState};
 use crate::growth::Stage;
 use crate::palette::{self, DEFAULT_PET_COLOR};
 use crate::pet::Direction;
+use crate::physics::Surface;
 use crate::stats::PetStats;
 
 /// Кадр: ARGB8888. Процедурные спрайты держат альфу 0 или 255; текстовые
@@ -36,12 +37,30 @@ pub enum ActionLook {
 
 /// Полное описание внешнего вида питомца в кадре: состояние поведения,
 /// стадия роста, градация настроения и опциональный оверлей-экшен.
+/// Фаза G добавляет поверхность (на стене питомец цепляется, а не стоит)
+/// и мелкое занятие в покое.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Look {
     pub state: PetState,
     pub stage: Stage,
     pub mood: MoodTier,
     pub overlay: Option<ActionLook>,
+    pub surface: Surface,
+    pub idle_action: IdleAction,
+}
+
+impl Look {
+    /// Простой вид: только состояние и стадия (для тестов и совместимости).
+    pub fn simple(state: PetState, stage: Stage) -> Look {
+        Look {
+            state,
+            stage,
+            mood: MoodTier::Ok,
+            overlay: None,
+            surface: Surface::Floor,
+            idle_action: IdleAction::Stand,
+        }
+    }
 }
 
 /// Градация настроения из статов (ТЗ §3.2). Отдельного флага болезни в
@@ -86,12 +105,30 @@ pub struct SpriteSet {
     pub sad: Vec<Frame>,
     pub sick: Vec<Frame>,
     pub happy: Vec<Frame>,
+    // ---- Фаза G: необязательные семейства ----
+    // Пустой вектор = у пака этого семейства нет: кадр берётся из отката
+    // (см. `frame_look`), поэтому старые .driftpack продолжают работать.
+    /// Моргание — короткая пауза в покое.
+    pub blink: Vec<Frame>,
+    /// Сидит, поджав лапки.
+    pub sit: Vec<Frame>,
+    /// Потягивается с зевком.
+    pub stretch: Vec<Frame>,
+    /// Топчется/водит антенной.
+    pub wiggle: Vec<Frame>,
+    /// Держится за стену или потолок без движения.
+    pub cling: Vec<Frame>,
+    /// Ползёт по стене или потолку.
+    pub climb: Vec<Frame>,
+    /// Звёздочки после удара о потолок.
+    pub dizzy: Vec<Frame>,
 }
 
 impl SpriteSet {
     /// Кадр под полный внешний вид в момент `t` секунд с входа в состояние.
-    /// Приоритет: оверлей-экшен -> стадия яйца -> настроение (только в Idle,
-    /// чтобы походка/сон/падение читались как раньше) -> базовое состояние.
+    /// Приоритет: оверлей-экшен -> стадия яйца -> поверхность (стена/потолок)
+    /// -> мелкое занятие/настроение в покое -> базовое состояние.
+    /// Семейства фазы G необязательны: пустое откатывается к базовому.
     pub fn frame_look(&self, look: &Look, t: f32) -> &Frame {
         if let Some(action) = look.overlay {
             return match action {
@@ -103,17 +140,37 @@ impl SpriteSet {
             return pick(&self.egg, 1.5, t);
         }
         match look.state {
-            PetState::Idle => match look.mood {
-                MoodTier::Happy => pick(&self.happy, 3.0, t),
-                MoodTier::Ok => pick(&self.idle, 2.0, t),
-                MoodTier::Sad => pick(&self.sad, 1.5, t),
-                MoodTier::Sick => pick(&self.sick, 1.5, t),
-            },
+            PetState::Idle if look.surface != Surface::Floor => {
+                pick_or(&self.cling, &self.idle, 1.5, t)
+            }
+            PetState::Idle => self.idle_frame(look, t),
             PetState::Walk => pick(&self.walk, 6.0, t),
+            PetState::Climb => pick_or(&self.climb, &self.walk, 5.0, t),
             PetState::Sleep => pick(&self.sleep, 1.0, t),
             PetState::Falling => pick(&self.falling, 8.0, t),
             PetState::Dragged => pick(&self.dragged, 4.0, t),
             PetState::Landing => pick(&self.landing, 6.0, t),
+            PetState::Bonk => pick_or(&self.dizzy, &self.landing, 4.0, t),
+        }
+    }
+
+    /// Кадр покоя на полу: плохое самочувствие важнее мелких занятий —
+    /// больной питомец не потягивается и не топчется.
+    fn idle_frame(&self, look: &Look, t: f32) -> &Frame {
+        match look.mood {
+            MoodTier::Sad => return pick(&self.sad, 1.5, t),
+            MoodTier::Sick => return pick(&self.sick, 1.5, t),
+            _ => {}
+        }
+        match look.idle_action {
+            IdleAction::Blink => pick_or(&self.blink, &self.idle, 1.0, t),
+            IdleAction::Sit => pick_or(&self.sit, &self.idle, 1.5, t),
+            IdleAction::Stretch => pick_or(&self.stretch, &self.idle, 2.5, t),
+            IdleAction::Wiggle => pick_or(&self.wiggle, &self.idle, 4.0, t),
+            IdleAction::Stand => match look.mood {
+                MoodTier::Happy => pick(&self.happy, 3.0, t),
+                _ => pick(&self.idle, 2.0, t),
+            },
         }
     }
 
@@ -121,21 +178,22 @@ impl SpriteSet {
     /// настроение, без оверлеев.
     pub fn frame(&self, state: PetState, t: f32, facing: Direction) -> &Frame {
         let _ = facing; // зеркалирование делает рендер по флагу facing
-        self.frame_look(
-            &Look {
-                state,
-                stage: Stage::Adult,
-                mood: MoodTier::Ok,
-                overlay: None,
-            },
-            t,
-        )
+        self.frame_look(&Look::simple(state, Stage::Adult), t)
     }
 }
 
 fn pick(frames: &[Frame], fps: f32, t: f32) -> &Frame {
     let idx = ((t * fps) as usize) % frames.len().max(1);
     &frames[idx]
+}
+
+/// Кадр из `primary`, а если семейства в паке нет — из `fallback`.
+fn pick_or<'a>(primary: &'a [Frame], fallback: &'a [Frame], fps: f32, t: f32) -> &'a Frame {
+    if primary.is_empty() {
+        pick(fallback, fps, t)
+    } else {
+        pick(primary, fps, t)
+    }
 }
 
 const EYE: u32 = 0xff_1e_1e_2e;
@@ -343,6 +401,99 @@ pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet
                 size,
                 BlobStyle {
                     hop: 0.06,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+        ],
+        // Фаза G: у процедурного блоба тоже есть свои варианты — иначе
+        // фолбэк-питомец застывал бы столбом там, где арт-пак живёт.
+        blink: vec![blob(
+            size,
+            BlobStyle {
+                eyes: Eyes::Closed,
+                ..BlobStyle::default()
+            },
+            c,
+        )],
+        sit: vec![blob(
+            size,
+            BlobStyle {
+                squash: 0.18,
+                ..BlobStyle::default()
+            },
+            c,
+        )],
+        stretch: vec![
+            blob(
+                size,
+                BlobStyle {
+                    squash: -0.14,
+                    eyes: Eyes::Closed,
+                    mouth: Mouth::Open,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: -0.06,
+                    eyes: Eyes::Closed,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+        ],
+        wiggle: vec![
+            blob(
+                size,
+                BlobStyle {
+                    hop: 0.04,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.06,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+        ],
+        cling: vec![blob(
+            size,
+            BlobStyle {
+                squash: 0.1,
+                ..BlobStyle::default()
+            },
+            c,
+        )],
+        climb: vec![
+            blob_walk(size, 0.04, 0, c),
+            blob_walk(size, 0.0, 2, c),
+            blob_walk(size, 0.04, 1, c),
+            blob_walk(size, 0.0, 3, c),
+        ],
+        dizzy: vec![
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.2,
+                    eyes: Eyes::Closed,
+                    mouth: Mouth::Wavy,
+                    ..BlobStyle::default()
+                },
+                c,
+            ),
+            blob(
+                size,
+                BlobStyle {
+                    squash: 0.16,
+                    eyes: Eyes::Droopy,
+                    mouth: Mouth::Wavy,
                     ..BlobStyle::default()
                 },
                 c,
@@ -848,12 +999,7 @@ mod tests {
     #[test]
     fn frame_look_selects_families() {
         let set = placeholder_for_stage(96, Stage::Egg);
-        let egg_look = Look {
-            state: PetState::Idle,
-            stage: Stage::Egg,
-            mood: MoodTier::Ok,
-            overlay: None,
-        };
+        let egg_look = Look::simple(PetState::Idle, Stage::Egg);
         assert!(in_family(set.frame_look(&egg_look, 0.0), &set.egg));
         assert!(in_family(
             set.frame_look(
@@ -867,12 +1013,7 @@ mod tests {
         ));
 
         let set = placeholder(96);
-        let idle = Look {
-            state: PetState::Idle,
-            stage: Stage::Adult,
-            mood: MoodTier::Ok,
-            overlay: None,
-        };
+        let idle = Look::simple(PetState::Idle, Stage::Adult);
         assert!(in_family(set.frame_look(&idle, 0.0), &set.idle));
         assert!(in_family(
             set.frame_look(

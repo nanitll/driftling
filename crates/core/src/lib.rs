@@ -29,7 +29,7 @@ pub mod sync;
 pub mod text;
 
 pub use attributes::{PetAttributes, PetRecord};
-pub use behavior::{BehaviorConfig, PetState};
+pub use behavior::{BehaviorConfig, IdleAction, PetState};
 pub use config::{Config, SyncConfig, SyncMode};
 pub use geometry::{Rect, Vec2};
 pub use growth::Stage;
@@ -40,5 +40,6 @@ pub use journal::{
 };
 pub use palette::{DEFAULT_PET_COLOR, PET_PRESETS};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
+pub use physics::{Orient, Surface};
 pub use stats::PetStats;
 pub use sync::{apply_remote, cursors_of, events_after, Cursors};

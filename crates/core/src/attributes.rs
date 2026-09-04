@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::behavior::BehaviorConfig;
+use crate::growth::Stage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -44,6 +45,17 @@ impl Default for PetAttributes {
     }
 }
 
+/// Потолок скорости ходьбы, px/s (жёсткий предел движка, фаза G).
+/// До фазы G потолок был 400 — на экране это выглядело не прогулкой,
+/// а метанием из угла в угол.
+pub const MAX_WALK_SPEED: f32 = 160.0;
+/// Спокойный потолок скорости для нормализации старых записей, px/s.
+pub const CALM_WALK_SPEED: f32 = 55.0;
+/// Спокойный потолок непоседливости (вес Idle -> Walk).
+pub const CALM_CURIOSITY: u32 = 55;
+/// Минимальная сонливость: питомец, который не спит вообще, — не питомец.
+pub const MIN_SLEEPINESS: u32 = 8;
+
 impl PetAttributes {
     /// Версия с безопасными диапазонами — кривые значения (битый файл,
     /// дебаг-панель) не должны ломать симуляцию.
@@ -52,12 +64,27 @@ impl PetAttributes {
         let sleep_min = self.sleep_min.clamp(1.0, 3600.0);
         Self {
             size: self.size.clamp(32, 256),
-            walk_speed: self.walk_speed.clamp(5.0, 400.0),
+            walk_speed: self.walk_speed.clamp(5.0, MAX_WALK_SPEED),
             curiosity,
             sleepiness: self.sleepiness.min(100 - curiosity),
             sleep_min,
             sleep_max: self.sleep_max.clamp(sleep_min, 7200.0),
         }
+    }
+
+    /// «Успокоенные» характеристики (фаза G) или None, если и так в норме.
+    ///
+    /// Записи, приехавшие из ручного `config.toml` времён M0, доносят до
+    /// журнала экстремальные значения (скорость 400 px/s, непоседливость
+    /// 100 при нулевой сонливости) — с ними питомец без остановки носится
+    /// по экрану. Демон один раз нормализует такие записи событием
+    /// `AttributesSet`; размер не трогаем — это осознанный выбор хозяина.
+    pub fn tamed(&self) -> Option<Self> {
+        let mut out = self.clamped();
+        out.walk_speed = out.walk_speed.min(CALM_WALK_SPEED);
+        out.curiosity = out.curiosity.min(CALM_CURIOSITY);
+        out.sleepiness = out.sleepiness.max(MIN_SLEEPINESS).min(100 - out.curiosity);
+        (out != *self).then_some(out)
     }
 
     /// Полный BehaviorConfig: характеристики поверх дефолтов движка.
@@ -70,6 +97,16 @@ impl PetAttributes {
             sleep_range: (a.sleep_min, a.sleep_max),
             ..BehaviorConfig::default()
         }
+    }
+
+    /// BehaviorConfig с поправкой на стадию роста (фаза G): малыш и
+    /// коротконогий ребёнок двигаются медленнее взрослого — та же
+    /// лестница, что у размера спрайта ([`crate::sprite::stage_scale`]).
+    pub fn behavior_config_for(&self, stage: Stage) -> BehaviorConfig {
+        let k = crate::sprite::stage_scale(stage);
+        let mut cfg = self.behavior_config();
+        cfg.walk_speed *= k;
+        cfg
     }
 }
 
@@ -339,6 +376,37 @@ mod tests {
         assert_eq!(a.walk_speed, 5.0);
         assert!(a.curiosity + a.sleepiness <= 100);
         assert!(a.sleep_min <= a.sleep_max);
+    }
+
+    /// Фаза G: экстремальные значения из ручного config.toml эпохи M0
+    /// нормализуются, а нормальный характер остаётся нетронутым.
+    #[test]
+    fn tamed_calms_legacy_extremes_only() {
+        let wild = PetAttributes {
+            size: 90,
+            walk_speed: 400.0,
+            curiosity: 100,
+            sleepiness: 0,
+            ..PetAttributes::default()
+        };
+        let calm = wild.tamed().expect("такой характер надо успокоить");
+        assert_eq!(calm.size, 90, "размер — выбор хозяина, его не трогаем");
+        assert!(calm.walk_speed <= CALM_WALK_SPEED);
+        assert!(calm.curiosity <= CALM_CURIOSITY);
+        assert!(calm.sleepiness >= MIN_SLEEPINESS);
+        assert!(calm.curiosity + calm.sleepiness <= 100);
+        assert_eq!(calm.tamed(), None, "повторно успокаивать нечего");
+        assert_eq!(PetAttributes::default().tamed(), None, "норма не трогается");
+    }
+
+    /// Скорость масштабируется стадией роста: малыш медленнее взрослого.
+    #[test]
+    fn behavior_config_scales_with_stage() {
+        let a = PetAttributes::default();
+        let baby = a.behavior_config_for(Stage::Baby).walk_speed;
+        let adult = a.behavior_config_for(Stage::Adult).walk_speed;
+        assert!(baby < adult, "{baby} должен быть меньше {adult}");
+        assert_eq!(adult, a.behavior_config().walk_speed);
     }
 
     #[test]

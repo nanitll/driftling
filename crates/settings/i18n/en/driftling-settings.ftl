@@ -9,6 +9,8 @@ state-sleep = Sleeping
 state-falling = Falling
 state-dragged = Held
 state-landing = Landed
+state-climb = Climbing
+state-bonk = Bumped its head
 state-unknown = Unknown
 
 # --- Uptime (CLDR plural rules) ---

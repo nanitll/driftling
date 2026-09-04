@@ -50,8 +50,16 @@
 //!
 //! Обязательные стадии — все пять. Семейства: у `egg` — `egg` и `hatch`;
 //! у остальных стадий — `idle`, `walk`, `sleep`, `falling`, `dragged`,
-//! `landing`, `eating`, `happy`, `sad`, `sick`. Кадры рисуются мордой
-//! ВПРАВО; влево рендер зеркалит сам.
+//! `landing`, `eating`, `happy`, `sad`, `sick`.
+//!
+//! Необязательные семейства фазы G ([`EXTRA_ANIMS`]): `blink`, `sit`,
+//! `stretch`, `wiggle`, `cling`, `climb`, `dizzy`. Если их в паке нет,
+//! движок берёт откат (`climb` -> `walk`, `cling`/`blink`/`sit`/... ->
+//! `idle`, `dizzy` -> `landing`), так что паки формата 1 без них валидны.
+//!
+//! Кадры рисуются мордой ВПРАВО и ногами ВНИЗ; зеркало по взгляду и
+//! поворот под поверхность (стена, потолок) делает рендер
+//! (`driftling_core::Orient`) — отдельного арта под лазание не нужно.
 //!
 //! ## Загрузка
 //!
@@ -390,6 +398,12 @@ const ALL_STAGES: [Stage; 5] = [
 pub const BODY_ANIMS: [&str; 10] = [
     "idle", "walk", "sleep", "falling", "dragged", "landing", "eating", "happy", "sad", "sick",
 ];
+/// Необязательные семейства фазы G: если пак их не содержит, движок
+/// откатывается к базовым (climb -> walk, cling/blink/sit/... -> idle,
+/// dizzy -> landing). Внешние паки формата 1 остаются валидными.
+pub const EXTRA_ANIMS: [&str; 7] = [
+    "blink", "sit", "stretch", "wiggle", "cling", "climb", "dizzy",
+];
 /// Обязательные семейства стадии яйца.
 pub const EGG_ANIMS: [&str; 2] = ["egg", "hatch"];
 
@@ -530,6 +544,19 @@ impl Pack {
                 .map(|g| scale_nearest(&colorize(g, argb), k))
                 .collect()
         };
+        // Необязательные семейства фазы G: нет в паке — пустой вектор,
+        // SpriteSet::frame_look откатится к базовому семейству.
+        let opt = |anims: &BTreeMap<String, Anim>, name: &str| -> Vec<Frame> {
+            anims
+                .get(name)
+                .map(|a| {
+                    a.frames
+                        .iter()
+                        .map(|g| scale_nearest(&colorize(g, argb), k))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
         let egg = fam(&egg_st.anims, "egg");
         let hatching = fam(&egg_st.anims, "hatch");
         if stage == Stage::Egg {
@@ -547,6 +574,14 @@ impl Pack {
                 happy: egg.clone(),
                 egg,
                 hatching,
+                // Яйцо не лазает и не потягивается — у него один вид.
+                blink: Vec::new(),
+                sit: Vec::new(),
+                stretch: Vec::new(),
+                wiggle: Vec::new(),
+                cling: Vec::new(),
+                climb: Vec::new(),
+                dizzy: Vec::new(),
             };
         }
         SpriteSet {
@@ -563,6 +598,13 @@ impl Pack {
             happy: fam(&st.anims, "happy"),
             egg,
             hatching,
+            blink: opt(&st.anims, "blink"),
+            sit: opt(&st.anims, "sit"),
+            stretch: opt(&st.anims, "stretch"),
+            wiggle: opt(&st.anims, "wiggle"),
+            cling: opt(&st.anims, "cling"),
+            climb: opt(&st.anims, "climb"),
+            dizzy: opt(&st.anims, "dizzy"),
         }
     }
 }
@@ -594,12 +636,108 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/egg/hatch_2.txt"),
     ),
     (
+        "baby/blink_0",
+        include_str!("../../../assets/pack-default/baby/blink_0.txt"),
+    ),
+    (
+        "baby/climb_0",
+        include_str!("../../../assets/pack-default/baby/climb_0.txt"),
+    ),
+    (
+        "baby/climb_1",
+        include_str!("../../../assets/pack-default/baby/climb_1.txt"),
+    ),
+    (
+        "baby/climb_2",
+        include_str!("../../../assets/pack-default/baby/climb_2.txt"),
+    ),
+    (
+        "baby/climb_3",
+        include_str!("../../../assets/pack-default/baby/climb_3.txt"),
+    ),
+    (
+        "baby/cling_0",
+        include_str!("../../../assets/pack-default/baby/cling_0.txt"),
+    ),
+    (
+        "baby/cling_1",
+        include_str!("../../../assets/pack-default/baby/cling_1.txt"),
+    ),
+    (
+        "baby/dizzy_0",
+        include_str!("../../../assets/pack-default/baby/dizzy_0.txt"),
+    ),
+    (
+        "baby/dizzy_1",
+        include_str!("../../../assets/pack-default/baby/dizzy_1.txt"),
+    ),
+    (
+        "baby/dragged_0",
+        include_str!("../../../assets/pack-default/baby/dragged_0.txt"),
+    ),
+    (
+        "baby/eating_0",
+        include_str!("../../../assets/pack-default/baby/eating_0.txt"),
+    ),
+    (
+        "baby/eating_1",
+        include_str!("../../../assets/pack-default/baby/eating_1.txt"),
+    ),
+    (
+        "baby/falling_0",
+        include_str!("../../../assets/pack-default/baby/falling_0.txt"),
+    ),
+    (
+        "baby/happy_0",
+        include_str!("../../../assets/pack-default/baby/happy_0.txt"),
+    ),
+    (
+        "baby/happy_1",
+        include_str!("../../../assets/pack-default/baby/happy_1.txt"),
+    ),
+    (
         "baby/idle_0",
         include_str!("../../../assets/pack-default/baby/idle_0.txt"),
     ),
     (
         "baby/idle_1",
         include_str!("../../../assets/pack-default/baby/idle_1.txt"),
+    ),
+    (
+        "baby/landing_0",
+        include_str!("../../../assets/pack-default/baby/landing_0.txt"),
+    ),
+    (
+        "baby/sad_0",
+        include_str!("../../../assets/pack-default/baby/sad_0.txt"),
+    ),
+    (
+        "baby/sick_0",
+        include_str!("../../../assets/pack-default/baby/sick_0.txt"),
+    ),
+    (
+        "baby/sit_0",
+        include_str!("../../../assets/pack-default/baby/sit_0.txt"),
+    ),
+    (
+        "baby/sit_1",
+        include_str!("../../../assets/pack-default/baby/sit_1.txt"),
+    ),
+    (
+        "baby/sleep_0",
+        include_str!("../../../assets/pack-default/baby/sleep_0.txt"),
+    ),
+    (
+        "baby/sleep_1",
+        include_str!("../../../assets/pack-default/baby/sleep_1.txt"),
+    ),
+    (
+        "baby/stretch_0",
+        include_str!("../../../assets/pack-default/baby/stretch_0.txt"),
+    ),
+    (
+        "baby/stretch_1",
+        include_str!("../../../assets/pack-default/baby/stretch_1.txt"),
     ),
     (
         "baby/walk_0",
@@ -618,48 +756,72 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/baby/walk_3.txt"),
     ),
     (
-        "baby/sleep_0",
-        include_str!("../../../assets/pack-default/baby/sleep_0.txt"),
+        "baby/wiggle_0",
+        include_str!("../../../assets/pack-default/baby/wiggle_0.txt"),
     ),
     (
-        "baby/sleep_1",
-        include_str!("../../../assets/pack-default/baby/sleep_1.txt"),
+        "baby/wiggle_1",
+        include_str!("../../../assets/pack-default/baby/wiggle_1.txt"),
     ),
     (
-        "baby/falling_0",
-        include_str!("../../../assets/pack-default/baby/falling_0.txt"),
+        "child/blink_0",
+        include_str!("../../../assets/pack-default/child/blink_0.txt"),
     ),
     (
-        "baby/dragged_0",
-        include_str!("../../../assets/pack-default/baby/dragged_0.txt"),
+        "child/climb_0",
+        include_str!("../../../assets/pack-default/child/climb_0.txt"),
     ),
     (
-        "baby/landing_0",
-        include_str!("../../../assets/pack-default/baby/landing_0.txt"),
+        "child/climb_1",
+        include_str!("../../../assets/pack-default/child/climb_1.txt"),
     ),
     (
-        "baby/eating_0",
-        include_str!("../../../assets/pack-default/baby/eating_0.txt"),
+        "child/climb_2",
+        include_str!("../../../assets/pack-default/child/climb_2.txt"),
     ),
     (
-        "baby/eating_1",
-        include_str!("../../../assets/pack-default/baby/eating_1.txt"),
+        "child/climb_3",
+        include_str!("../../../assets/pack-default/child/climb_3.txt"),
     ),
     (
-        "baby/happy_0",
-        include_str!("../../../assets/pack-default/baby/happy_0.txt"),
+        "child/cling_0",
+        include_str!("../../../assets/pack-default/child/cling_0.txt"),
     ),
     (
-        "baby/happy_1",
-        include_str!("../../../assets/pack-default/baby/happy_1.txt"),
+        "child/cling_1",
+        include_str!("../../../assets/pack-default/child/cling_1.txt"),
     ),
     (
-        "baby/sad_0",
-        include_str!("../../../assets/pack-default/baby/sad_0.txt"),
+        "child/dizzy_0",
+        include_str!("../../../assets/pack-default/child/dizzy_0.txt"),
     ),
     (
-        "baby/sick_0",
-        include_str!("../../../assets/pack-default/baby/sick_0.txt"),
+        "child/dizzy_1",
+        include_str!("../../../assets/pack-default/child/dizzy_1.txt"),
+    ),
+    (
+        "child/dragged_0",
+        include_str!("../../../assets/pack-default/child/dragged_0.txt"),
+    ),
+    (
+        "child/eating_0",
+        include_str!("../../../assets/pack-default/child/eating_0.txt"),
+    ),
+    (
+        "child/eating_1",
+        include_str!("../../../assets/pack-default/child/eating_1.txt"),
+    ),
+    (
+        "child/falling_0",
+        include_str!("../../../assets/pack-default/child/falling_0.txt"),
+    ),
+    (
+        "child/happy_0",
+        include_str!("../../../assets/pack-default/child/happy_0.txt"),
+    ),
+    (
+        "child/happy_1",
+        include_str!("../../../assets/pack-default/child/happy_1.txt"),
     ),
     (
         "child/idle_0",
@@ -668,6 +830,42 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "child/idle_1",
         include_str!("../../../assets/pack-default/child/idle_1.txt"),
+    ),
+    (
+        "child/landing_0",
+        include_str!("../../../assets/pack-default/child/landing_0.txt"),
+    ),
+    (
+        "child/sad_0",
+        include_str!("../../../assets/pack-default/child/sad_0.txt"),
+    ),
+    (
+        "child/sick_0",
+        include_str!("../../../assets/pack-default/child/sick_0.txt"),
+    ),
+    (
+        "child/sit_0",
+        include_str!("../../../assets/pack-default/child/sit_0.txt"),
+    ),
+    (
+        "child/sit_1",
+        include_str!("../../../assets/pack-default/child/sit_1.txt"),
+    ),
+    (
+        "child/sleep_0",
+        include_str!("../../../assets/pack-default/child/sleep_0.txt"),
+    ),
+    (
+        "child/sleep_1",
+        include_str!("../../../assets/pack-default/child/sleep_1.txt"),
+    ),
+    (
+        "child/stretch_0",
+        include_str!("../../../assets/pack-default/child/stretch_0.txt"),
+    ),
+    (
+        "child/stretch_1",
+        include_str!("../../../assets/pack-default/child/stretch_1.txt"),
     ),
     (
         "child/walk_0",
@@ -686,48 +884,72 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/child/walk_3.txt"),
     ),
     (
-        "child/sleep_0",
-        include_str!("../../../assets/pack-default/child/sleep_0.txt"),
+        "child/wiggle_0",
+        include_str!("../../../assets/pack-default/child/wiggle_0.txt"),
     ),
     (
-        "child/sleep_1",
-        include_str!("../../../assets/pack-default/child/sleep_1.txt"),
+        "child/wiggle_1",
+        include_str!("../../../assets/pack-default/child/wiggle_1.txt"),
     ),
     (
-        "child/falling_0",
-        include_str!("../../../assets/pack-default/child/falling_0.txt"),
+        "teen/blink_0",
+        include_str!("../../../assets/pack-default/teen/blink_0.txt"),
     ),
     (
-        "child/dragged_0",
-        include_str!("../../../assets/pack-default/child/dragged_0.txt"),
+        "teen/climb_0",
+        include_str!("../../../assets/pack-default/teen/climb_0.txt"),
     ),
     (
-        "child/landing_0",
-        include_str!("../../../assets/pack-default/child/landing_0.txt"),
+        "teen/climb_1",
+        include_str!("../../../assets/pack-default/teen/climb_1.txt"),
     ),
     (
-        "child/eating_0",
-        include_str!("../../../assets/pack-default/child/eating_0.txt"),
+        "teen/climb_2",
+        include_str!("../../../assets/pack-default/teen/climb_2.txt"),
     ),
     (
-        "child/eating_1",
-        include_str!("../../../assets/pack-default/child/eating_1.txt"),
+        "teen/climb_3",
+        include_str!("../../../assets/pack-default/teen/climb_3.txt"),
     ),
     (
-        "child/happy_0",
-        include_str!("../../../assets/pack-default/child/happy_0.txt"),
+        "teen/cling_0",
+        include_str!("../../../assets/pack-default/teen/cling_0.txt"),
     ),
     (
-        "child/happy_1",
-        include_str!("../../../assets/pack-default/child/happy_1.txt"),
+        "teen/cling_1",
+        include_str!("../../../assets/pack-default/teen/cling_1.txt"),
     ),
     (
-        "child/sad_0",
-        include_str!("../../../assets/pack-default/child/sad_0.txt"),
+        "teen/dizzy_0",
+        include_str!("../../../assets/pack-default/teen/dizzy_0.txt"),
     ),
     (
-        "child/sick_0",
-        include_str!("../../../assets/pack-default/child/sick_0.txt"),
+        "teen/dizzy_1",
+        include_str!("../../../assets/pack-default/teen/dizzy_1.txt"),
+    ),
+    (
+        "teen/dragged_0",
+        include_str!("../../../assets/pack-default/teen/dragged_0.txt"),
+    ),
+    (
+        "teen/eating_0",
+        include_str!("../../../assets/pack-default/teen/eating_0.txt"),
+    ),
+    (
+        "teen/eating_1",
+        include_str!("../../../assets/pack-default/teen/eating_1.txt"),
+    ),
+    (
+        "teen/falling_0",
+        include_str!("../../../assets/pack-default/teen/falling_0.txt"),
+    ),
+    (
+        "teen/happy_0",
+        include_str!("../../../assets/pack-default/teen/happy_0.txt"),
+    ),
+    (
+        "teen/happy_1",
+        include_str!("../../../assets/pack-default/teen/happy_1.txt"),
     ),
     (
         "teen/idle_0",
@@ -736,6 +958,42 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "teen/idle_1",
         include_str!("../../../assets/pack-default/teen/idle_1.txt"),
+    ),
+    (
+        "teen/landing_0",
+        include_str!("../../../assets/pack-default/teen/landing_0.txt"),
+    ),
+    (
+        "teen/sad_0",
+        include_str!("../../../assets/pack-default/teen/sad_0.txt"),
+    ),
+    (
+        "teen/sick_0",
+        include_str!("../../../assets/pack-default/teen/sick_0.txt"),
+    ),
+    (
+        "teen/sit_0",
+        include_str!("../../../assets/pack-default/teen/sit_0.txt"),
+    ),
+    (
+        "teen/sit_1",
+        include_str!("../../../assets/pack-default/teen/sit_1.txt"),
+    ),
+    (
+        "teen/sleep_0",
+        include_str!("../../../assets/pack-default/teen/sleep_0.txt"),
+    ),
+    (
+        "teen/sleep_1",
+        include_str!("../../../assets/pack-default/teen/sleep_1.txt"),
+    ),
+    (
+        "teen/stretch_0",
+        include_str!("../../../assets/pack-default/teen/stretch_0.txt"),
+    ),
+    (
+        "teen/stretch_1",
+        include_str!("../../../assets/pack-default/teen/stretch_1.txt"),
     ),
     (
         "teen/walk_0",
@@ -754,48 +1012,72 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/teen/walk_3.txt"),
     ),
     (
-        "teen/sleep_0",
-        include_str!("../../../assets/pack-default/teen/sleep_0.txt"),
+        "teen/wiggle_0",
+        include_str!("../../../assets/pack-default/teen/wiggle_0.txt"),
     ),
     (
-        "teen/sleep_1",
-        include_str!("../../../assets/pack-default/teen/sleep_1.txt"),
+        "teen/wiggle_1",
+        include_str!("../../../assets/pack-default/teen/wiggle_1.txt"),
     ),
     (
-        "teen/falling_0",
-        include_str!("../../../assets/pack-default/teen/falling_0.txt"),
+        "adult/blink_0",
+        include_str!("../../../assets/pack-default/adult/blink_0.txt"),
     ),
     (
-        "teen/dragged_0",
-        include_str!("../../../assets/pack-default/teen/dragged_0.txt"),
+        "adult/climb_0",
+        include_str!("../../../assets/pack-default/adult/climb_0.txt"),
     ),
     (
-        "teen/landing_0",
-        include_str!("../../../assets/pack-default/teen/landing_0.txt"),
+        "adult/climb_1",
+        include_str!("../../../assets/pack-default/adult/climb_1.txt"),
     ),
     (
-        "teen/eating_0",
-        include_str!("../../../assets/pack-default/teen/eating_0.txt"),
+        "adult/climb_2",
+        include_str!("../../../assets/pack-default/adult/climb_2.txt"),
     ),
     (
-        "teen/eating_1",
-        include_str!("../../../assets/pack-default/teen/eating_1.txt"),
+        "adult/climb_3",
+        include_str!("../../../assets/pack-default/adult/climb_3.txt"),
     ),
     (
-        "teen/happy_0",
-        include_str!("../../../assets/pack-default/teen/happy_0.txt"),
+        "adult/cling_0",
+        include_str!("../../../assets/pack-default/adult/cling_0.txt"),
     ),
     (
-        "teen/happy_1",
-        include_str!("../../../assets/pack-default/teen/happy_1.txt"),
+        "adult/cling_1",
+        include_str!("../../../assets/pack-default/adult/cling_1.txt"),
     ),
     (
-        "teen/sad_0",
-        include_str!("../../../assets/pack-default/teen/sad_0.txt"),
+        "adult/dizzy_0",
+        include_str!("../../../assets/pack-default/adult/dizzy_0.txt"),
     ),
     (
-        "teen/sick_0",
-        include_str!("../../../assets/pack-default/teen/sick_0.txt"),
+        "adult/dizzy_1",
+        include_str!("../../../assets/pack-default/adult/dizzy_1.txt"),
+    ),
+    (
+        "adult/dragged_0",
+        include_str!("../../../assets/pack-default/adult/dragged_0.txt"),
+    ),
+    (
+        "adult/eating_0",
+        include_str!("../../../assets/pack-default/adult/eating_0.txt"),
+    ),
+    (
+        "adult/eating_1",
+        include_str!("../../../assets/pack-default/adult/eating_1.txt"),
+    ),
+    (
+        "adult/falling_0",
+        include_str!("../../../assets/pack-default/adult/falling_0.txt"),
+    ),
+    (
+        "adult/happy_0",
+        include_str!("../../../assets/pack-default/adult/happy_0.txt"),
+    ),
+    (
+        "adult/happy_1",
+        include_str!("../../../assets/pack-default/adult/happy_1.txt"),
     ),
     (
         "adult/idle_0",
@@ -804,6 +1086,42 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "adult/idle_1",
         include_str!("../../../assets/pack-default/adult/idle_1.txt"),
+    ),
+    (
+        "adult/landing_0",
+        include_str!("../../../assets/pack-default/adult/landing_0.txt"),
+    ),
+    (
+        "adult/sad_0",
+        include_str!("../../../assets/pack-default/adult/sad_0.txt"),
+    ),
+    (
+        "adult/sick_0",
+        include_str!("../../../assets/pack-default/adult/sick_0.txt"),
+    ),
+    (
+        "adult/sit_0",
+        include_str!("../../../assets/pack-default/adult/sit_0.txt"),
+    ),
+    (
+        "adult/sit_1",
+        include_str!("../../../assets/pack-default/adult/sit_1.txt"),
+    ),
+    (
+        "adult/sleep_0",
+        include_str!("../../../assets/pack-default/adult/sleep_0.txt"),
+    ),
+    (
+        "adult/sleep_1",
+        include_str!("../../../assets/pack-default/adult/sleep_1.txt"),
+    ),
+    (
+        "adult/stretch_0",
+        include_str!("../../../assets/pack-default/adult/stretch_0.txt"),
+    ),
+    (
+        "adult/stretch_1",
+        include_str!("../../../assets/pack-default/adult/stretch_1.txt"),
     ),
     (
         "adult/walk_0",
@@ -822,48 +1140,12 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/adult/walk_3.txt"),
     ),
     (
-        "adult/sleep_0",
-        include_str!("../../../assets/pack-default/adult/sleep_0.txt"),
+        "adult/wiggle_0",
+        include_str!("../../../assets/pack-default/adult/wiggle_0.txt"),
     ),
     (
-        "adult/sleep_1",
-        include_str!("../../../assets/pack-default/adult/sleep_1.txt"),
-    ),
-    (
-        "adult/falling_0",
-        include_str!("../../../assets/pack-default/adult/falling_0.txt"),
-    ),
-    (
-        "adult/dragged_0",
-        include_str!("../../../assets/pack-default/adult/dragged_0.txt"),
-    ),
-    (
-        "adult/landing_0",
-        include_str!("../../../assets/pack-default/adult/landing_0.txt"),
-    ),
-    (
-        "adult/eating_0",
-        include_str!("../../../assets/pack-default/adult/eating_0.txt"),
-    ),
-    (
-        "adult/eating_1",
-        include_str!("../../../assets/pack-default/adult/eating_1.txt"),
-    ),
-    (
-        "adult/happy_0",
-        include_str!("../../../assets/pack-default/adult/happy_0.txt"),
-    ),
-    (
-        "adult/happy_1",
-        include_str!("../../../assets/pack-default/adult/happy_1.txt"),
-    ),
-    (
-        "adult/sad_0",
-        include_str!("../../../assets/pack-default/adult/sad_0.txt"),
-    ),
-    (
-        "adult/sick_0",
-        include_str!("../../../assets/pack-default/adult/sick_0.txt"),
+        "adult/wiggle_1",
+        include_str!("../../../assets/pack-default/adult/wiggle_1.txt"),
     ),
 ];
 
@@ -1094,6 +1376,49 @@ mod tests {
             });
         }
         v
+    }
+
+    /// Фаза G: встроенный пак несёт новые семейства на всех стадиях,
+    /// а SpriteSet отдаёт их кадры (не откат к базовым).
+    #[test]
+    fn default_pack_has_phase_g_families() {
+        let pack = default_pack().unwrap();
+        for stage in [Stage::Baby, Stage::Child, Stage::Teen, Stage::Adult] {
+            for anim in EXTRA_ANIMS {
+                assert!(
+                    pack.fps(stage, anim).is_some(),
+                    "{stage:?}/{anim}: нет в манифесте"
+                );
+            }
+        }
+        let set = pack.sprite_set(Stage::Adult, 96, DEFAULT_PET_COLOR);
+        assert_eq!(set.climb.len(), 4);
+        assert_eq!(set.cling.len(), 2);
+        assert_eq!(set.blink.len(), 1);
+        assert_eq!(set.dizzy.len(), 2);
+        assert!(!set.sit.is_empty() && !set.stretch.is_empty() && !set.wiggle.is_empty());
+    }
+
+    /// Совместимость: пак формата 1 БЕЗ новых семейств грузится как раньше,
+    /// а движок откатывается к базовым кадрам.
+    #[test]
+    fn pack_without_extra_families_still_loads() {
+        let pack = default_pack().unwrap();
+        let mut set = pack.sprite_set(Stage::Adult, 96, DEFAULT_PET_COLOR);
+        set.climb.clear();
+        set.cling.clear();
+        set.dizzy.clear();
+        let walk = set.frame_look(
+            &crate::sprite::Look {
+                state: crate::PetState::Climb,
+                ..crate::sprite::Look::simple(crate::PetState::Climb, Stage::Adult)
+            },
+            0.0,
+        );
+        assert!(
+            set.walk.iter().any(|f| core::ptr::eq(f, walk)),
+            "лазание откатывается к ходьбе"
+        );
     }
 
     #[test]

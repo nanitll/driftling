@@ -1,8 +1,10 @@
 //! Питомец и мир, в котором он живёт. Точка входа симуляции — `Pet::tick`.
 
-use crate::behavior::{next_state_after, BehaviorConfig, PetState};
+use crate::behavior::{
+    next_idle_action, next_state_after, next_state_off_floor, BehaviorConfig, IdleAction, PetState,
+};
 use crate::geometry::{Rect, Vec2};
-use crate::physics::{support_below, Platform, STEP_SNAP, SUPPORT_TOL};
+use crate::physics::{support_below, Orient, Platform, Surface, STEP_SNAP, SUPPORT_TOL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -80,10 +82,14 @@ pub enum PointerEvent {
 
 #[derive(Debug, Clone)]
 pub struct Pet {
-    /// Позиция опорной точки: центр нижней кромки спрайта.
+    /// Опорная точка: центр той кромки спрайта, которой питомец касается
+    /// поверхности (для пола — центр нижней кромки, как было до фазы G).
     pub pos: Vec2,
     pub vel: Vec2,
     pub facing: Direction,
+    /// Поверхность, к которой питомец прижат (фаза G). В воздухе
+    /// (Falling/Dragged) всегда [`Surface::Floor`]: опорная точка — «ноги».
+    pub surface: Surface,
     pub state: PetState,
     /// Сколько питомец уже находится в текущем состоянии, сек.
     pub state_time: f32,
@@ -101,11 +107,20 @@ pub struct Pet {
     /// но порог движения ещё не пройден. None — кнопка не зажата.
     pressed_at: Option<Vec2>,
     /// «Только на земле» (фаза B6): машина поведения не входит в Walk.
-    /// Включается демоном на стадии яйца — яйцо не ходит.
+    /// Включается демоном на стадии яйца — яйцо не ходит и не лазает.
     grounded_only: bool,
     /// Последний Release оказался кликом (нажатие без захвата, ТД-24);
     /// снимается чтением [`Pet::take_click`].
     clicked: bool,
+    /// Текущее мелкое занятие в Idle (фаза G).
+    idle_action: IdleAction,
+    /// Сколько занятие уже идёт, сек (фаза анимации кадра).
+    action_time: f32,
+    /// Сколько осталось до смены занятия, сек.
+    action_left: f32,
+    /// Уснуть сразу после приземления: команда «Уложить спать», отданная
+    /// на стене или потолке, сначала отцепляет питомца (фаза G).
+    sleep_on_land: bool,
 }
 
 /// Порог движения курсора, после которого нажатие становится захватом,
@@ -120,6 +135,7 @@ impl Pet {
             pos,
             vel: Vec2::default(),
             facing: Direction::Right,
+            surface: Surface::Floor,
             state: PetState::Falling,
             state_time: 0.0,
             state_left,
@@ -131,6 +147,10 @@ impl Pet {
             pressed_at: None,
             grounded_only: false,
             clicked: false,
+            idle_action: IdleAction::Stand,
+            action_time: 0.0,
+            action_left: 1.0,
+            sleep_on_land: false,
         }
     }
 
@@ -151,7 +171,12 @@ impl Pet {
     /// трогаем: физика (уронили яйцо — оно падает) важнее запрета ходьбы.
     pub fn set_grounded_only(&mut self, grounded: bool) {
         self.grounded_only = grounded;
-        if grounded && self.state == PetState::Walk {
+        if grounded && matches!(self.state, PetState::Walk | PetState::Climb) {
+            // Со стены яйцо честно падает: висеть ему тоже не положено.
+            if self.surface != Surface::Floor {
+                self.detach();
+                return;
+            }
             self.enter(PetState::Idle);
             self.state_left = self.roll(self.cfg.idle_range);
         }
@@ -160,15 +185,27 @@ impl Pet {
     /// Принудительно уложить спать (уход, фаза B5: команда «Уложить спать»).
     /// Питомец засыпает сразу на полную длительность `cfg.sleep_range.1`
     /// (максимум из настроек сна — явная команда даёт самый долгий сон).
-    /// В Dragged/Falling не действует (сон в воздухе ломал бы физику) —
+    /// В Dragged/Falling/Bonk не действует (сон в воздухе ломал бы физику) —
     /// возвращает false. Повторный вызов во сне перевзводит таймер заново.
+    ///
+    /// Со стены или потолка (фаза G) спать нельзя: питомец отцепляется и
+    /// засыпает, как только приземлится — команда всё равно принята (true).
     pub fn force_sleep(&mut self) -> bool {
-        if matches!(self.state, PetState::Dragged | PetState::Falling) {
+        if matches!(
+            self.state,
+            PetState::Dragged | PetState::Falling | PetState::Bonk
+        ) {
             return false;
+        }
+        if self.surface != Surface::Floor {
+            self.sleep_on_land = true;
+            self.detach();
+            return true;
         }
         self.state = PetState::Sleep;
         self.state_time = 0.0;
         self.state_left = self.cfg.sleep_range.1;
+        self.idle_action = IdleAction::Stand;
         true
     }
 
@@ -179,21 +216,42 @@ impl Pet {
         core::mem::take(&mut self.clicked)
     }
 
-    /// Прямоугольник спрайта (для рендера и input region).
+    /// Прямоугольник спрайта (для рендера и input region) — с учётом
+    /// поверхности: на стене питомец лежит поперёк, под потолком висит.
     pub fn bounds(&self) -> Rect {
-        Rect::new(
-            self.pos.x - self.size / 2.0,
-            self.pos.y - self.size,
-            self.size,
-            self.size,
-        )
+        self.surface.bounds(self.pos, self.size)
+    }
+
+    /// Ориентация кадра для рендера: поворот под поверхность + зеркало по
+    /// направлению взгляда (кадры пака нарисованы мордой вправо, ногами вниз).
+    pub fn orient(&self) -> Orient {
+        self.surface.orient(self.facing)
+    }
+
+    /// Текущее мелкое занятие в Idle (фаза G) — для выбора кадра.
+    pub fn idle_action(&self) -> IdleAction {
+        self.idle_action
+    }
+
+    /// Время для фазы анимации: у мелкого занятия — своё, иначе время
+    /// в состоянии.
+    pub fn anim_time(&self) -> f32 {
+        if self.idle_action == IdleAction::Stand {
+            self.state_time
+        } else {
+            self.action_time
+        }
     }
 
     /// Желаемый темп тика: адаптивный таймер бэкенда (ТД-3) спрашивает у
     /// симуляции, как часто её надо будить.
     pub fn pace(&self) -> SimPace {
         match self.state {
-            PetState::Falling | PetState::Dragged | PetState::Walk => SimPace::Active,
+            PetState::Falling
+            | PetState::Dragged
+            | PetState::Walk
+            | PetState::Climb
+            | PetState::Bonk => SimPace::Active,
             PetState::Idle | PetState::Landing => SimPace::Calm,
             PetState::Sleep => SimPace::Drowsy,
         }
@@ -207,70 +265,340 @@ impl Pet {
     pub fn tick(&mut self, world: &World, dt: f32) {
         let dt = dt.clamp(0.0, 1.5);
         self.state_time += dt;
+        self.advance_fidget(dt);
 
         match self.state {
             PetState::Dragged => {
                 // Позицию ведёт указатель (см. pointer()); физика выключена.
             }
-            PetState::Falling => {
-                // Падение при частом тике не случается с большим dt, но
-                // подстраховываем интегрирование: подшаги ≤0.05 с, иначе
-                // редкий тик протыкает землю и завышает скорость удара.
-                let mut left = dt;
-                while left > 0.0 && self.state == PetState::Falling {
-                    let step = left.min(0.05);
-                    left -= step;
-                    // Опору ищем от ног ДО подшага: быстрый подшаг не должен
-                    // протыкать кромку окна насквозь. Кромки выше исходной
-                    // позиции не считаются — на окно садимся только сверху.
-                    let feet_before = self.pos.y;
-                    self.vel.y += self.cfg.gravity * step;
-                    self.pos = self.pos + self.vel * step;
-                    self.clamp_horizontal(world);
-                    let support = support_below(world, self.pos.x, feet_before);
-                    if self.pos.y >= support {
-                        self.pos.y = support;
-                        let impact = self.vel.y;
-                        self.vel = Vec2::default();
-                        self.enter(if impact > self.cfg.hard_landing_speed {
-                            PetState::Landing
-                        } else {
-                            PetState::Idle
-                        });
-                        self.state_left = if self.state == PetState::Landing {
-                            self.cfg.landing_time
-                        } else {
-                            1.0 + self.rng.f32()
-                        };
-                    }
-                }
-            }
-            PetState::Walk => {
-                self.pos.x += self.cfg.walk_speed * self.facing.sign() * dt;
-                let b = self.bounds();
-                if b.x <= world.screen.x {
-                    self.pos.x = world.screen.x + self.size / 2.0;
-                    self.facing = Direction::Right;
-                } else if b.right() >= world.screen.right() {
-                    self.pos.x = world.screen.right() - self.size / 2.0;
-                    self.facing = Direction::Left;
-                }
-                // Пол под ногами на новой позиции: перепад в пределах
-                // STEP_SNAP перешагиваем («ступеньки» окон), обрыв вниз
-                // больше порога — сошли с кромки, падаем.
-                let feet = self.pos.y;
-                let support = support_below(world, self.pos.x, feet - STEP_SNAP);
-                if support - feet > STEP_SNAP {
-                    self.vel = Vec2::new(self.cfg.walk_speed * self.facing.sign(), 0.0);
+            PetState::Falling => self.tick_falling(world, dt),
+            PetState::Walk => self.tick_walk(world, dt),
+            PetState::Climb => self.tick_climb(world, dt),
+            PetState::Bonk => {
+                // Шишка о потолок: короткое оглушение в воздухе, дальше вниз.
+                if self.state_time >= self.state_left {
+                    self.vel = Vec2::new(self.vel.x * 0.3, 0.0);
                     self.enter(PetState::Falling);
-                    return;
+                    self.state_left = f32::INFINITY;
                 }
-                self.pos.y = support;
-                self.advance_timer();
             }
             PetState::Idle | PetState::Sleep | PetState::Landing => {
                 self.advance_timer();
             }
+        }
+    }
+
+    /// Падение: гравитация + сопротивление воздуха, потолок и стены экрана,
+    /// затем опора снизу. Подшаги ≤0.05 с — редкий тик не должен протыкать
+    /// кромку окна насквозь и завышать скорость удара.
+    fn tick_falling(&mut self, world: &World, dt: f32) {
+        let mut left = dt;
+        while left > 0.0 && self.state == PetState::Falling {
+            let step = left.min(0.05);
+            left -= step;
+            // Опору ищем от ног ДО подшага: кромки выше исходной позиции
+            // не считаются — на окно садимся только сверху.
+            let feet_before = self.pos.y;
+            self.vel.y += self.cfg.gravity * step;
+            // Затухание горизонтальной скорости: брошенный питомец
+            // тормозит в полёте, а не летит по прямой до стены.
+            self.vel.x *= 1.0 - (self.cfg.air_drag * step).min(1.0);
+            self.pos = self.pos + self.vel * step;
+
+            // Потолок (фаза G): за верхний край экрана питомец не улетает
+            // никогда — либо цепляется, либо набивает шишку.
+            if self.hit_ceiling(world) {
+                continue;
+            }
+            // Боковые стены: цепляемся, если влетели достаточно резво,
+            // иначе отскакиваем и падаем дальше.
+            self.hit_walls(world);
+            if self.state != PetState::Falling {
+                continue;
+            }
+
+            let support = support_below(world, self.pos.x, feet_before);
+            if self.pos.y >= support {
+                self.land_on(support);
+            }
+        }
+    }
+
+    /// Ходьба по полу (земля или кромка окна). У края экрана питомец либо
+    /// разворачивается, либо (фаза G) лезет на стену.
+    fn tick_walk(&mut self, world: &World, dt: f32) {
+        self.pos.x += self.cfg.walk_speed * self.facing.sign() * dt;
+        let b = self.bounds();
+        if b.x <= world.screen.x {
+            self.pos.x = world.screen.x + self.size / 2.0;
+            if self.try_wall_climb(world, Surface::WallLeft) {
+                return;
+            }
+            self.facing = Direction::Right;
+        } else if b.right() >= world.screen.right() {
+            self.pos.x = world.screen.right() - self.size / 2.0;
+            if self.try_wall_climb(world, Surface::WallRight) {
+                return;
+            }
+            self.facing = Direction::Left;
+        }
+        // Пол под ногами на новой позиции: перепад в пределах STEP_SNAP
+        // перешагиваем («ступеньки» окон), обрыв вниз больше порога —
+        // сошли с кромки, падаем.
+        let feet = self.pos.y;
+        let support = support_below(world, self.pos.x, feet - STEP_SNAP);
+        if support - feet > STEP_SNAP {
+            self.vel = Vec2::new(self.cfg.walk_speed * self.facing.sign(), 0.0);
+            self.enter(PetState::Falling);
+            return;
+        }
+        self.pos.y = support;
+        self.advance_timer();
+    }
+
+    /// Движение по стене или потолку (фаза G). На концах поверхности —
+    /// переход за угол: стена -> потолок -> другая стена -> пол.
+    fn tick_climb(&mut self, world: &World, dt: f32) {
+        if self.surface == Surface::Floor {
+            // Лазания по полу не бывает — это обычная ходьба.
+            self.enter(PetState::Walk);
+            return;
+        }
+        let step = self.surface.tangent() * (self.cfg.climb_speed() * self.facing.sign() * dt);
+        self.pos = self.pos + step;
+        match self.surface {
+            Surface::WallLeft | Surface::WallRight => {
+                let from_left = self.surface == Surface::WallLeft;
+                let b = self.bounds();
+                if b.y <= world.screen.y {
+                    // Дополз до потолка — уходим за угол прочь от своей стены.
+                    self.switch_surface(Surface::Ceiling);
+                    self.facing = if from_left {
+                        Direction::Right
+                    } else {
+                        Direction::Left
+                    };
+                    self.clamp_to_surface(world);
+                    return;
+                }
+                // Опора под ногами (земля или кромка окна у самой стены).
+                let support = support_below(world, b.x + b.w / 2.0, b.bottom() - 1.0);
+                if b.bottom() >= support {
+                    self.switch_surface(Surface::Floor);
+                    self.pos.y = support;
+                    self.vel = Vec2::default();
+                    self.enter(PetState::Idle);
+                    self.state_left = self.roll(self.cfg.idle_range);
+                    self.clamp_to_surface(world);
+                    return;
+                }
+            }
+            Surface::Ceiling => {
+                let b = self.bounds();
+                if b.x <= world.screen.x {
+                    self.switch_surface(Surface::WallLeft);
+                    self.facing = Direction::Right; // на левой стене Right = вниз
+                    self.clamp_to_surface(world);
+                    return;
+                }
+                if b.right() >= world.screen.right() {
+                    self.switch_surface(Surface::WallRight);
+                    self.facing = Direction::Left; // на правой стене Left = вниз
+                    self.clamp_to_surface(world);
+                    return;
+                }
+            }
+            Surface::Floor => unreachable!("отсеяно выше"),
+        }
+        self.advance_timer();
+    }
+
+    /// Удар о потолок экрана. Возвращает true, если состояние сменилось.
+    fn hit_ceiling(&mut self, world: &World) -> bool {
+        let b = self.bounds();
+        if b.y > world.screen.y || self.vel.y >= 0.0 {
+            return false;
+        }
+        // Прижать макушку к потолку.
+        self.pos.y += world.screen.y - b.y;
+        let speed = -self.vel.y;
+        if !self.grounded_only && speed <= self.cfg.ceiling_grab_speed {
+            // Зацепился: висит под потолком, мордой по ходу броска.
+            self.switch_surface(Surface::Ceiling);
+            if self.vel.x.abs() > 1.0 {
+                self.facing = if self.vel.x < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                };
+            }
+            self.vel = Vec2::default();
+            self.enter(PetState::Idle);
+            self.state_left = self.roll(self.cfg.idle_range);
+            self.clamp_to_surface(world);
+        } else {
+            // Слишком быстро — шишка и падение обратно.
+            self.vel = Vec2::new(self.vel.x * 0.5, 0.0);
+            self.enter(PetState::Bonk);
+            self.state_left = self.cfg.bonk_time;
+        }
+        true
+    }
+
+    /// Боковые стены экрана в падении: цепляние или отскок.
+    fn hit_walls(&mut self, world: &World) {
+        let b = self.bounds();
+        let (into_left, into_right) = (
+            b.x <= world.screen.x && self.vel.x < 0.0,
+            b.right() >= world.screen.right() && self.vel.x > 0.0,
+        );
+        if !into_left && !into_right {
+            self.clamp_horizontal(world);
+            return;
+        }
+        let wall = if into_left {
+            Surface::WallLeft
+        } else {
+            Surface::WallRight
+        };
+        self.clamp_horizontal(world);
+        if !self.grounded_only && self.vel.x.abs() >= self.cfg.wall_grab_speed {
+            self.switch_surface(wall);
+            self.vel = Vec2::default();
+            // Смотрим вверх: с зацепа приятнее лезть на потолок.
+            self.facing = match wall {
+                Surface::WallLeft => Direction::Left,
+                _ => Direction::Right,
+            };
+            self.enter(PetState::Idle);
+            self.state_left = self.roll(self.cfg.idle_range);
+            self.clamp_to_surface(world);
+        } else {
+            // Мягкий отскок от стены — падение продолжается.
+            self.vel.x = -self.vel.x * 0.35;
+        }
+    }
+
+    /// Приземление на опору `support` (пол или кромка окна).
+    fn land_on(&mut self, support: f32) {
+        self.pos.y = support;
+        let impact = self.vel.y;
+        self.vel = Vec2::default();
+        self.surface = Surface::Floor;
+        if self.sleep_on_land {
+            self.sleep_on_land = false;
+            self.enter(PetState::Sleep);
+            self.state_left = self.cfg.sleep_range.1;
+            return;
+        }
+        self.enter(if impact > self.cfg.hard_landing_speed {
+            PetState::Landing
+        } else {
+            PetState::Idle
+        });
+        self.state_left = if self.state == PetState::Landing {
+            self.cfg.landing_time
+        } else {
+            1.0 + self.rng.f32()
+        };
+    }
+
+    /// Попытка полезть на стену у края экрана (фаза G): бросок кубика по
+    /// `w_wall_climb`. Яйцо (grounded_only) не лазает.
+    fn try_wall_climb(&mut self, world: &World, wall: Surface) -> bool {
+        if self.grounded_only || self.rng.u32(0..100) >= self.cfg.w_wall_climb {
+            return false;
+        }
+        self.switch_surface(wall);
+        // Наверх: на левой стене это Left, на правой — Right.
+        self.facing = match wall {
+            Surface::WallLeft => Direction::Left,
+            _ => Direction::Right,
+        };
+        self.enter(PetState::Climb);
+        self.state_left = self.roll(self.cfg.climb_range);
+        self.clamp_to_surface(world);
+        true
+    }
+
+    /// Снять питомца со стены/потолка «на ноги», не трогая состояние:
+    /// сценарные пробежки демона (присутствие, фаза E) ведут его по полу.
+    /// Спрайт остаётся на месте — меняется только опорная точка.
+    pub fn detach_to_floor(&mut self) {
+        if self.surface != Surface::Floor {
+            self.switch_surface(Surface::Floor);
+        }
+    }
+
+    /// Отцепиться от поверхности и полететь вниз (сам отпустил, уронили
+    /// командой, яйцу запретили лазать).
+    fn detach(&mut self) {
+        self.switch_surface(Surface::Floor);
+        self.vel = Vec2::default();
+        self.enter(PetState::Falling);
+        self.state_left = f32::INFINITY;
+    }
+
+    /// Сменить поверхность, сохранив положение спрайта на экране:
+    /// опорная точка пересчитывается из текущего прямоугольника.
+    fn switch_surface(&mut self, surface: Surface) {
+        let b = self.bounds();
+        self.pos = match surface {
+            Surface::Floor => Vec2::new(b.x + b.w / 2.0, b.bottom()),
+            Surface::Ceiling => Vec2::new(b.x + b.w / 2.0, b.y),
+            Surface::WallLeft => Vec2::new(b.x, b.y + b.h / 2.0),
+            Surface::WallRight => Vec2::new(b.right(), b.y + b.h / 2.0),
+        };
+        self.surface = surface;
+        self.idle_action = IdleAction::Stand;
+    }
+
+    /// Прижать опорную точку к своей поверхности и удержать спрайт в
+    /// пределах экрана вдоль неё.
+    fn clamp_to_surface(&mut self, world: &World) {
+        let half = self.size / 2.0;
+        let (x_lo, x_hi) = (world.screen.x + half, world.screen.right() - half);
+        let (y_lo, y_hi) = (world.screen.y + half, world.ground_y() - half);
+        match self.surface {
+            Surface::Floor => self.pos.x = self.pos.x.clamp(x_lo, x_hi.max(x_lo)),
+            Surface::Ceiling => {
+                self.pos.x = self.pos.x.clamp(x_lo, x_hi.max(x_lo));
+                self.pos.y = world.screen.y;
+            }
+            Surface::WallLeft => {
+                self.pos.x = world.screen.x;
+                self.pos.y = self.pos.y.clamp(y_lo, y_hi.max(y_lo));
+            }
+            Surface::WallRight => {
+                self.pos.x = world.screen.right();
+                self.pos.y = self.pos.y.clamp(y_lo, y_hi.max(y_lo));
+            }
+        }
+    }
+
+    /// Мелкие занятия в Idle (фаза G): моргнуть, посидеть, потянуться.
+    /// Только на полу и только в покое — в остальных состояниях кадр
+    /// определяется самим состоянием.
+    fn advance_fidget(&mut self, dt: f32) {
+        if self.state != PetState::Idle || self.surface != Surface::Floor {
+            self.idle_action = IdleAction::Stand;
+            self.action_time = 0.0;
+            self.action_left = self.roll(self.cfg.fidget_range);
+            return;
+        }
+        self.action_time += dt;
+        self.action_left -= dt;
+        if self.action_left > 0.0 {
+            return;
+        }
+        self.action_time = 0.0;
+        if self.idle_action == IdleAction::Stand {
+            let (action, dur) = next_idle_action(&mut self.rng);
+            self.idle_action = action;
+            self.action_left = dur;
+        } else {
+            self.idle_action = IdleAction::Stand;
+            self.action_left = self.roll(self.cfg.fidget_range);
         }
     }
 
@@ -290,7 +618,17 @@ impl Pet {
     /// `fullscreen_active` он прячет сцену, продолжая тикать симуляцию;
     /// ядру для этого ничего не нужно — `tick` работает и «за кадром».
     pub fn world_changed(&mut self, world: &World) {
-        if matches!(self.state, PetState::Falling | PetState::Dragged) {
+        if matches!(
+            self.state,
+            PetState::Falling | PetState::Dragged | PetState::Bonk
+        ) {
+            return;
+        }
+        if self.surface != Surface::Floor {
+            // Стены и потолок принадлежат экрану, а не окнам: их геометрия
+            // от снапшота не зависит — достаточно удержать питомца в
+            // пределах выхода (экран мог смениться/пересчитаться).
+            self.clamp_to_surface(world);
             return;
         }
         let feet = self.pos.y;
@@ -325,17 +663,25 @@ impl Pet {
                         // Дрожание в пределах порога — всё ещё клик.
                         return true;
                     }
-                    // Порог пройден — это захват. Смещение от текущей позиции
-                    // питомца, чтобы он не прыгал под курсор.
+                    // Порог пройден — это захват. Со стены/потолка питомца
+                    // при этом снимаем: в руках он всегда «ногами вниз».
+                    self.switch_surface(Surface::Floor);
+                    self.sleep_on_land = false;
+                    // Смещение от текущей позиции питомца, чтобы он не
+                    // прыгал под курсор.
                     self.drag_offset = Vec2::new(self.pos.x - p.x, self.pos.y - p.y);
                     self.enter(PetState::Dragged);
                 }
                 self.drag_history.rotate_left(1);
                 self.drag_history[3] = (now, p);
                 self.pos = p + self.drag_offset;
-                // Не даём утащить за экран.
-                self.pos.x = self.pos.x.clamp(world.screen.x, world.screen.right());
-                self.pos.y = self.pos.y.clamp(world.screen.y, world.ground_y());
+                // Не даём утащить за экран: спрайт целиком остаётся видимым,
+                // в том числе макушка (за верхний край не уносится).
+                self.clamp_horizontal(world);
+                self.pos.y = self
+                    .pos
+                    .y
+                    .clamp(world.screen.y + self.size, world.ground_y());
                 true
             }
             PointerEvent::Release(_) => {
@@ -365,19 +711,35 @@ impl Pet {
     }
 
     fn advance_timer(&mut self) {
-        if self.state_time >= self.state_left {
-            let (mut next, mut dur) = next_state_after(self.state, &self.cfg, &mut self.rng);
-            if self.grounded_only && next == PetState::Walk {
-                // Яйцо не ходит (B6): решение «гулять» заменяется на Idle.
-                next = PetState::Idle;
-                dur = self.roll(self.cfg.idle_range);
+        if self.state_time < self.state_left {
+            return;
+        }
+        if self.surface != Surface::Floor {
+            // На стене и потолке свой набор решений (фаза G): ползти
+            // дальше, повисеть или отцепиться. Спать там нельзя.
+            let (next, dur) = next_state_off_floor(&self.cfg, &mut self.rng);
+            if next == PetState::Falling {
+                self.detach();
+                return;
             }
-            if next == PetState::Walk && self.rng.bool() {
+            if next == PetState::Climb && self.rng.u32(0..100) < 25 {
                 self.facing = self.facing.flip();
             }
             self.enter(next);
             self.state_left = dur;
+            return;
         }
+        let (mut next, mut dur) = next_state_after(self.state, &self.cfg, &mut self.rng);
+        if self.grounded_only && next == PetState::Walk {
+            // Яйцо не ходит (B6): решение «гулять» заменяется на Idle.
+            next = PetState::Idle;
+            dur = self.roll(self.cfg.idle_range);
+        }
+        if next == PetState::Walk && self.rng.bool() {
+            self.facing = self.facing.flip();
+        }
+        self.enter(next);
+        self.state_left = dur;
     }
 
     /// Случайная длительность из диапазона (lo, hi).
@@ -880,6 +1242,304 @@ mod tests {
             p.tick(&w, 1.0 / 60.0);
         }
         assert_eq!(p.pos.y, 500.0, "упал на кромку окна под точкой отпускания");
+    }
+
+    // ---- Фаза G: стены, потолок, воздух ---------------------------------
+
+    /// Опорная точка на каждой поверхности — точка касания: смена
+    /// поверхности не двигает спрайт по экрану.
+    #[test]
+    fn switching_surface_keeps_sprite_in_place() {
+        let mut p = pet();
+        p.pos = Vec2::new(500.0, 400.0);
+        let before = p.bounds();
+        for surface in [Surface::Ceiling, Surface::WallLeft, Surface::WallRight] {
+            p.switch_surface(surface);
+            let now = p.bounds();
+            assert_eq!(
+                (now.x, now.y, now.w, now.h),
+                (before.x, before.y, before.w, before.h),
+                "{surface:?}: спрайт не должен прыгать"
+            );
+        }
+    }
+
+    /// Брошенный вверх питомец НИКОГДА не улетает за верхний край экрана:
+    /// на умеренной скорости — цепляется за потолок.
+    #[test]
+    fn upward_throw_grabs_the_ceiling_instead_of_leaving_screen() {
+        let w = world();
+        let mut p = pet();
+        // Скорость подобрана так, чтобы долететь до потолка (подъём
+        // v^2/2g) и удариться мягче ceiling_grab_speed.
+        p.pos = Vec2::new(900.0, 900.0);
+        p.vel = Vec2::new(30.0, -1800.0);
+        p.state = PetState::Falling;
+        let mut min_top = f32::MAX;
+        for _ in 0..300 {
+            p.tick(&w, 1.0 / 60.0);
+            min_top = min_top.min(p.bounds().y);
+        }
+        assert!(min_top >= w.screen.y, "макушка ушла за экран: {min_top}");
+        assert_eq!(p.surface, Surface::Ceiling, "зацепился за потолок");
+        assert_eq!(p.bounds().y, w.screen.y, "висит вплотную к потолку");
+    }
+
+    /// Очень сильный бросок вверх — шишка (Bonk) и падение обратно,
+    /// но и тогда за экран питомец не уходит.
+    #[test]
+    fn very_hard_upward_throw_bonks_and_falls_back() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(900.0, 1000.0);
+        p.vel = Vec2::new(0.0, -2600.0);
+        p.state = PetState::Falling;
+        let mut bonked = false;
+        let mut min_top = f32::MAX;
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+            bonked |= p.state == PetState::Bonk;
+            min_top = min_top.min(p.bounds().y);
+        }
+        assert!(bonked, "быстрый удар о потолок — это Bonk");
+        assert!(
+            min_top >= w.screen.y,
+            "и всё равно не за экраном: {min_top}"
+        );
+        assert_eq!(p.pos.y, w.ground_y(), "вернулся на землю");
+        assert_eq!(p.surface, Surface::Floor);
+    }
+
+    /// Бросок вбок в стену: питомец цепляется за неё, а не отскакивает.
+    #[test]
+    fn sideways_throw_grabs_the_wall() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(300.0, 400.0);
+        p.vel = Vec2::new(-600.0, -50.0);
+        p.state = PetState::Falling;
+        for _ in 0..120 {
+            p.tick(&w, 1.0 / 60.0);
+            if p.surface == Surface::WallLeft {
+                break;
+            }
+        }
+        assert_eq!(p.surface, Surface::WallLeft, "зацепился за левую стену");
+        assert_eq!(p.pos.x, w.screen.x);
+        assert_eq!(p.state, PetState::Idle);
+        // Прямоугольник спрайта целиком на экране.
+        let b = p.bounds();
+        assert!(b.x >= w.screen.x && b.right() <= w.screen.right());
+    }
+
+    /// Полный обход экрана: со стены на потолок, с потолка на другую стену,
+    /// оттуда — на пол. Питомец всё время внутри экрана.
+    #[test]
+    fn climb_walks_around_the_screen_box() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 800.0);
+        p.surface = Surface::WallLeft;
+        p.facing = Direction::Left; // вверх по левой стене
+        p.state = PetState::Climb;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        let mut seen = Vec::new();
+        for _ in 0..20_000 {
+            p.tick(&w, 1.0 / 60.0);
+            if seen.last() != Some(&p.surface) {
+                seen.push(p.surface);
+            }
+            let b = p.bounds();
+            assert!(
+                b.x >= w.screen.x - 0.01
+                    && b.right() <= w.screen.right() + 0.01
+                    && b.y >= w.screen.y - 0.01,
+                "вышел за экран: {b:?}"
+            );
+            // Держим питомца в режиме лазания, чтобы обойти весь периметр.
+            if p.state != PetState::Climb && p.surface != Surface::Floor {
+                p.state = PetState::Climb;
+                p.state_left = f32::INFINITY;
+                p.state_time = 0.0;
+            }
+            if p.surface == Surface::Floor && seen.len() > 1 {
+                break;
+            }
+        }
+        assert!(
+            seen.contains(&Surface::Ceiling),
+            "перешёл на потолок: {seen:?}"
+        );
+        assert!(
+            seen.contains(&Surface::WallRight),
+            "и на правую стену: {seen:?}"
+        );
+        assert_eq!(p.surface, Surface::Floor, "спустился на пол: {seen:?}");
+        assert_eq!(p.pos.y, w.ground_y());
+    }
+
+    /// Ориентация кадра: на полу — обычная, на потолке — вверх ногами,
+    /// на стенах — поворот на четверть.
+    #[test]
+    fn orient_follows_surface() {
+        let mut p = pet();
+        p.facing = Direction::Right;
+        assert_eq!(p.orient(), Orient::IDENTITY);
+        p.facing = Direction::Left;
+        assert!(p.orient().flip_x);
+        p.surface = Surface::Ceiling;
+        assert!(p.orient().flip_y, "под потолком ногами вверх");
+        p.surface = Surface::WallLeft;
+        assert_eq!(p.orient().quarter_turns, 1);
+        p.surface = Surface::WallRight;
+        assert_eq!(p.orient().quarter_turns, 3);
+    }
+
+    /// «Уложить спать» на стене: питомец отцепляется и засыпает,
+    /// как только приземлится.
+    #[test]
+    fn force_sleep_on_wall_drops_then_sleeps() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 300.0);
+        p.surface = Surface::WallLeft;
+        p.state = PetState::Idle;
+        p.state_left = 1000.0;
+        assert!(p.force_sleep(), "команда принята");
+        assert_eq!(p.state, PetState::Falling);
+        assert_eq!(p.surface, Surface::Floor);
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        assert_eq!(p.state, PetState::Sleep, "уснул после приземления");
+        assert_eq!(p.pos.y, w.ground_y());
+    }
+
+    /// Захват мышью снимает питомца со стены: в руках он всегда ногами вниз.
+    #[test]
+    fn dragging_detaches_from_wall() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 300.0);
+        p.surface = Surface::WallLeft;
+        p.state = PetState::Idle;
+        let grab = Vec2::new(p.bounds().x + 5.0, p.bounds().y + 5.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(600.0, 500.0)), 0.1));
+        assert_eq!(p.state, PetState::Dragged);
+        assert_eq!(p.surface, Surface::Floor);
+    }
+
+    /// Яйцо (grounded_only) не лазает: ни по стенам, ни по потолку —
+    /// брошенное вверх, оно набивает шишку и падает.
+    #[test]
+    fn egg_never_climbs() {
+        let w = world();
+        let mut p = pet();
+        p.set_grounded_only(true);
+        p.pos = Vec2::new(900.0, 900.0);
+        p.vel = Vec2::new(-400.0, -600.0);
+        p.state = PetState::Falling;
+        for _ in 0..1200 {
+            p.tick(&w, 1.0 / 60.0);
+            assert_eq!(p.surface, Surface::Floor, "яйцо не цепляется");
+            assert_ne!(p.state, PetState::Climb);
+            assert!(p.bounds().y >= w.screen.y, "и не улетает за экран");
+        }
+        assert_eq!(p.pos.y, w.ground_y());
+    }
+
+    /// Питомца, стоящего на стене, снапшот worldsense не роняет: стены
+    /// принадлежат экрану, а не окнам.
+    #[test]
+    fn world_changes_do_not_drop_a_wall_climber() {
+        let mut w = world_with(&[(0.0, 500.0, 1920.0)]);
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 300.0);
+        p.surface = Surface::WallLeft;
+        p.state = PetState::Idle;
+        p.state_left = 1000.0;
+        w.platforms.clear();
+        p.world_changed(&w);
+        assert_eq!(p.state, PetState::Idle);
+        assert_eq!(p.surface, Surface::WallLeft);
+    }
+
+    /// Сопротивление воздуха гасит бросок: при равном старте питомец с
+    /// драгом улетает ближе, чем при чистой баллистике.
+    #[test]
+    fn air_drag_shortens_a_throw() {
+        let w = world();
+        let mut dragged = pet();
+        let mut ballistic = pet();
+        ballistic.cfg.air_drag = 0.0;
+        for p in [&mut dragged, &mut ballistic] {
+            p.pos = Vec2::new(400.0, 200.0);
+            p.vel = Vec2::new(300.0, 0.0);
+            p.state = PetState::Falling;
+        }
+        for _ in 0..40 {
+            dragged.tick(&w, 1.0 / 60.0);
+            ballistic.tick(&w, 1.0 / 60.0);
+        }
+        assert!(
+            dragged.pos.x < ballistic.pos.x - 5.0,
+            "драг обязан тормозить: {} vs {}",
+            dragged.pos.x,
+            ballistic.pos.x
+        );
+    }
+
+    /// Мелкие занятия в покое (фаза G): за долгий idle питомец успевает
+    /// и моргнуть, и посидеть, и потянуться — но только на полу.
+    #[test]
+    fn idle_actions_cycle_on_the_floor_only() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..60_000 {
+            p.tick(&w, 1.0 / 60.0);
+            if p.state == PetState::Idle {
+                seen.insert(format!("{:?}", p.idle_action()));
+            }
+        }
+        assert!(seen.len() >= 3, "покой должен быть живым: {seen:?}");
+
+        // На стене мелких занятий нет — там своя поза (cling).
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 300.0);
+        p.surface = Surface::WallLeft;
+        p.state = PetState::Idle;
+        p.state_left = 1000.0;
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+            assert_eq!(p.idle_action(), IdleAction::Stand);
+        }
+    }
+
+    /// Питомец не бегает без остановки: за длинный прогон доля времени
+    /// в движении заметно меньше половины (жалоба «слишком часто бегает»).
+    #[test]
+    fn walking_is_a_minority_of_the_time() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let (mut moving, mut total) = (0u32, 0u32);
+        for _ in 0..120_000 {
+            p.tick(&w, 1.0 / 60.0);
+            total += 1;
+            if matches!(p.state, PetState::Walk | PetState::Climb) {
+                moving += 1;
+            }
+        }
+        let share = moving as f32 / total as f32;
+        assert!(share < 0.45, "питомец слишком непоседлив: {share:.2}");
     }
 
     /// Dragged не трогается world_changed: позицию ведёт указатель.
