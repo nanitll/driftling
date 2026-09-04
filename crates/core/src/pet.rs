@@ -175,6 +175,9 @@ impl Pet {
     /// трогаем: физика (уронили яйцо — оно падает) важнее запрета ходьбы.
     pub fn set_grounded_only(&mut self, grounded: bool) {
         self.grounded_only = grounded;
+        if grounded {
+            self.wall_trip = false;
+        }
         if grounded && matches!(self.state, PetState::Walk | PetState::Climb) {
             // Со стены яйцо честно падает: висеть ему тоже не положено.
             if self.surface != Surface::Floor {
@@ -333,18 +336,29 @@ impl Pet {
     fn tick_walk(&mut self, world: &World, dt: f32) {
         self.pos.x += self.cfg.walk_speed * self.facing.sign() * dt;
         let b = self.bounds();
-        if b.x <= world.screen.x {
+        let at_edge = if b.x <= world.screen.x {
             self.pos.x = world.screen.x + self.size / 2.0;
             if self.try_wall_climb(world, Surface::WallLeft) {
                 return;
             }
             self.facing = Direction::Right;
+            true
         } else if b.right() >= world.screen.right() {
             self.pos.x = world.screen.right() - self.size / 2.0;
             if self.try_wall_climb(world, Surface::WallRight) {
                 return;
             }
             self.facing = Direction::Left;
+            true
+        } else {
+            false
+        };
+        // Поход к стене закончился разворотом (например, яйцу запретили
+        // лазать по дороге): возвращаем обычный таймер прогулки, иначе
+        // питомец ходил бы от края до края вечно.
+        if at_edge && self.wall_trip {
+            self.wall_trip = false;
+            self.state_left = self.state_time + self.roll(self.cfg.walk_range);
         }
         // Пол под ногами на новой позиции: перепад в пределах STEP_SNAP
         // перешагиваем («ступеньки» окон), обрыв вниз больше порога —
@@ -1571,6 +1585,30 @@ mod tests {
             p.tick(&w, 1.0 / 60.0);
             assert_eq!(p.idle_action(), IdleAction::Stand);
         }
+    }
+
+    /// Яйцу запретили лазать посреди похода к стене — вечной ходьбы от
+    /// края до края не случается: таймер прогулки восстанавливается.
+    #[test]
+    fn cancelled_wall_trip_does_not_walk_forever() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(200.0, w.ground_y());
+        p.state = PetState::Walk;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        p.facing = Direction::Left;
+        p.wall_trip = true;
+        p.set_grounded_only(true);
+        let mut walked = 0;
+        for _ in 0..3_000 {
+            p.tick(&w, 1.0 / 60.0);
+            if p.state == PetState::Walk {
+                walked += 1;
+            }
+        }
+        assert!(p.state_left.is_finite(), "таймер прогулки вернулся");
+        assert!(walked < 3_000, "ходьба закончилась");
     }
 
     /// Питомец не бегает без остановки: за длинный прогон доля времени
