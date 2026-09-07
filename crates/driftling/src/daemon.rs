@@ -2804,9 +2804,10 @@ mod tests {
         let p = app.pet.as_ref().unwrap().pos;
         let click = Vec2::new(p.x, p.y - 10.0);
         let facing_before = app.pet.as_ref().unwrap().facing;
-        // Шесть кликов за 1.2 с (интервал > двойного клика).
+        // Шесть кликов с шагом 0.4 с (реже двойного клика, чаще порога
+        // раздражения: пять из них попадают в окно 2 с).
         for i in 0..6 {
-            let t = now + 0.5 * i as f64;
+            let t = now + 0.4 * i as f64;
             app.event(Event::PointerPress(click), t);
             app.event(Event::PointerRelease(click), t + 0.05);
         }
@@ -2818,7 +2819,7 @@ mod tests {
         );
         // Ещё три подряд (время строго вперёд) — обиделся: пробежка за край.
         for i in 0..3 {
-            let t = now + 2.8 + 0.3 * i as f64;
+            let t = now + 2.4 + 0.3 * i as f64;
             app.event(Event::PointerPress(click), t);
             app.event(Event::PointerRelease(click), t + 0.05);
         }
