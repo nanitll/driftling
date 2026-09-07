@@ -297,3 +297,51 @@ frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
 [stages.adult.anims.dizzy]
 fps = 4.0
 frames = ["dizzy_0", "dizzy_1"]
+
+[stages.baby.anims.hang]
+fps = 1.5
+frames = ["hang_0", "hang_1"]
+
+[stages.baby.anims.swing]
+fps = 5.0
+frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
+
+[stages.baby.anims.vomit]
+fps = 3.0
+frames = ["vomit_0", "vomit_1"]
+
+[stages.child.anims.hang]
+fps = 1.5
+frames = ["hang_0", "hang_1"]
+
+[stages.child.anims.swing]
+fps = 5.0
+frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
+
+[stages.child.anims.vomit]
+fps = 3.0
+frames = ["vomit_0", "vomit_1"]
+
+[stages.teen.anims.hang]
+fps = 1.5
+frames = ["hang_0", "hang_1"]
+
+[stages.teen.anims.swing]
+fps = 5.0
+frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
+
+[stages.teen.anims.vomit]
+fps = 3.0
+frames = ["vomit_0", "vomit_1"]
+
+[stages.adult.anims.hang]
+fps = 1.5
+frames = ["hang_0", "hang_1"]
+
+[stages.adult.anims.swing]
+fps = 5.0
+frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
+
+[stages.adult.anims.vomit]
+fps = 3.0
+frames = ["vomit_0", "vomit_1"]

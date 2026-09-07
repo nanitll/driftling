@@ -406,8 +406,8 @@ pub const BODY_ANIMS: [&str; 10] = [
 /// Необязательные семейства фазы G: если пак их не содержит, движок
 /// откатывается к базовым (climb -> walk, cling/blink/sit/... -> idle,
 /// dizzy -> landing). Внешние паки формата 1 остаются валидными.
-pub const EXTRA_ANIMS: [&str; 7] = [
-    "blink", "sit", "stretch", "wiggle", "cling", "climb", "dizzy",
+pub const EXTRA_ANIMS: [&str; 10] = [
+    "blink", "sit", "stretch", "wiggle", "cling", "climb", "dizzy", "hang", "swing", "vomit",
 ];
 /// Обязательные семейства стадии яйца.
 pub const EGG_ANIMS: [&str; 2] = ["egg", "hatch"];
@@ -587,6 +587,9 @@ impl Pack {
                 cling: Vec::new(),
                 climb: Vec::new(),
                 dizzy: Vec::new(),
+                hang: Vec::new(),
+                swing: Vec::new(),
+                vomit: Vec::new(),
                 grip_inset: Default::default(),
                 feet_inset: Default::default(),
             }
@@ -613,6 +616,9 @@ impl Pack {
             cling: opt(&st.anims, "cling"),
             climb: opt(&st.anims, "climb"),
             dizzy: opt(&st.anims, "dizzy"),
+            hang: opt(&st.anims, "hang"),
+            swing: opt(&st.anims, "swing"),
+            vomit: opt(&st.anims, "vomit"),
             grip_inset: Default::default(),
             feet_inset: Default::default(),
         }
@@ -699,6 +705,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/baby/falling_0.txt"),
     ),
     (
+        "baby/hang_0",
+        include_str!("../../../assets/pack-default/baby/hang_0.txt"),
+    ),
+    (
+        "baby/hang_1",
+        include_str!("../../../assets/pack-default/baby/hang_1.txt"),
+    ),
+    (
         "baby/happy_0",
         include_str!("../../../assets/pack-default/baby/happy_0.txt"),
     ),
@@ -757,6 +771,30 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "baby/stretch_1",
         include_str!("../../../assets/pack-default/baby/stretch_1.txt"),
+    ),
+    (
+        "baby/swing_0",
+        include_str!("../../../assets/pack-default/baby/swing_0.txt"),
+    ),
+    (
+        "baby/swing_1",
+        include_str!("../../../assets/pack-default/baby/swing_1.txt"),
+    ),
+    (
+        "baby/swing_2",
+        include_str!("../../../assets/pack-default/baby/swing_2.txt"),
+    ),
+    (
+        "baby/swing_3",
+        include_str!("../../../assets/pack-default/baby/swing_3.txt"),
+    ),
+    (
+        "baby/vomit_0",
+        include_str!("../../../assets/pack-default/baby/vomit_0.txt"),
+    ),
+    (
+        "baby/vomit_1",
+        include_str!("../../../assets/pack-default/baby/vomit_1.txt"),
     ),
     (
         "baby/walk_0",
@@ -835,6 +873,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/child/falling_0.txt"),
     ),
     (
+        "child/hang_0",
+        include_str!("../../../assets/pack-default/child/hang_0.txt"),
+    ),
+    (
+        "child/hang_1",
+        include_str!("../../../assets/pack-default/child/hang_1.txt"),
+    ),
+    (
         "child/happy_0",
         include_str!("../../../assets/pack-default/child/happy_0.txt"),
     ),
@@ -893,6 +939,30 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "child/stretch_1",
         include_str!("../../../assets/pack-default/child/stretch_1.txt"),
+    ),
+    (
+        "child/swing_0",
+        include_str!("../../../assets/pack-default/child/swing_0.txt"),
+    ),
+    (
+        "child/swing_1",
+        include_str!("../../../assets/pack-default/child/swing_1.txt"),
+    ),
+    (
+        "child/swing_2",
+        include_str!("../../../assets/pack-default/child/swing_2.txt"),
+    ),
+    (
+        "child/swing_3",
+        include_str!("../../../assets/pack-default/child/swing_3.txt"),
+    ),
+    (
+        "child/vomit_0",
+        include_str!("../../../assets/pack-default/child/vomit_0.txt"),
+    ),
+    (
+        "child/vomit_1",
+        include_str!("../../../assets/pack-default/child/vomit_1.txt"),
     ),
     (
         "child/walk_0",
@@ -971,6 +1041,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/teen/falling_0.txt"),
     ),
     (
+        "teen/hang_0",
+        include_str!("../../../assets/pack-default/teen/hang_0.txt"),
+    ),
+    (
+        "teen/hang_1",
+        include_str!("../../../assets/pack-default/teen/hang_1.txt"),
+    ),
+    (
         "teen/happy_0",
         include_str!("../../../assets/pack-default/teen/happy_0.txt"),
     ),
@@ -1029,6 +1107,30 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "teen/stretch_1",
         include_str!("../../../assets/pack-default/teen/stretch_1.txt"),
+    ),
+    (
+        "teen/swing_0",
+        include_str!("../../../assets/pack-default/teen/swing_0.txt"),
+    ),
+    (
+        "teen/swing_1",
+        include_str!("../../../assets/pack-default/teen/swing_1.txt"),
+    ),
+    (
+        "teen/swing_2",
+        include_str!("../../../assets/pack-default/teen/swing_2.txt"),
+    ),
+    (
+        "teen/swing_3",
+        include_str!("../../../assets/pack-default/teen/swing_3.txt"),
+    ),
+    (
+        "teen/vomit_0",
+        include_str!("../../../assets/pack-default/teen/vomit_0.txt"),
+    ),
+    (
+        "teen/vomit_1",
+        include_str!("../../../assets/pack-default/teen/vomit_1.txt"),
     ),
     (
         "teen/walk_0",
@@ -1107,6 +1209,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/adult/falling_0.txt"),
     ),
     (
+        "adult/hang_0",
+        include_str!("../../../assets/pack-default/adult/hang_0.txt"),
+    ),
+    (
+        "adult/hang_1",
+        include_str!("../../../assets/pack-default/adult/hang_1.txt"),
+    ),
+    (
         "adult/happy_0",
         include_str!("../../../assets/pack-default/adult/happy_0.txt"),
     ),
@@ -1165,6 +1275,30 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "adult/stretch_1",
         include_str!("../../../assets/pack-default/adult/stretch_1.txt"),
+    ),
+    (
+        "adult/swing_0",
+        include_str!("../../../assets/pack-default/adult/swing_0.txt"),
+    ),
+    (
+        "adult/swing_1",
+        include_str!("../../../assets/pack-default/adult/swing_1.txt"),
+    ),
+    (
+        "adult/swing_2",
+        include_str!("../../../assets/pack-default/adult/swing_2.txt"),
+    ),
+    (
+        "adult/swing_3",
+        include_str!("../../../assets/pack-default/adult/swing_3.txt"),
+    ),
+    (
+        "adult/vomit_0",
+        include_str!("../../../assets/pack-default/adult/vomit_0.txt"),
+    ),
+    (
+        "adult/vomit_1",
+        include_str!("../../../assets/pack-default/adult/vomit_1.txt"),
     ),
     (
         "adult/walk_0",

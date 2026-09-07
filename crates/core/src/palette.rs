@@ -103,3 +103,15 @@ mod tests {
         }
     }
 }
+
+/// Смешать два непрозрачных цвета: `k` — доля `b` (0 — только `a`).
+/// Альфа результата 0xff.
+pub fn mix(a: u32, b: u32, k: f32) -> u32 {
+    let k = k.clamp(0.0, 1.0);
+    let ch = |sh: u32| {
+        let ca = ((a >> sh) & 0xff) as f32;
+        let cb = ((b >> sh) & 0xff) as f32;
+        ((ca + (cb - ca) * k).round() as u32) & 0xff
+    };
+    0xff00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+}

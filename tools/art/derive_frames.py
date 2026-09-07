@@ -417,6 +417,69 @@ def climb_pose(grid: Grid, paw_up: int, feet: list[int]) -> Grid:
     return shift_feet(out, feet)
 
 
+def arm_up(grid: Grid, on_left: bool, hand_row: int) -> None:
+    """Рука, поднятая вверх: от плеча до `hand_row` (0 — держится за потолок),
+    с кулачком наверху. Рисуется поверх пустоты, тело не трогает."""
+    an = anatomy(grid)
+    height = len(grid)
+    width = len(grid[0])
+    shoulder = an.body_top + max(2, (an.body_bottom - an.body_top) // 5)
+    left, right = side_margin(grid, shoulder)
+    if left < 0:
+        return
+    x = (left + 2) if on_left else (right - 3)
+    x = max(1, min(width - 3, x))
+    for r in range(max(0, hand_row + 2), shoulder + 1):
+        for dx in (0, 1):
+            if grid[r][x + dx] == EMPTY:
+                grid[r][x + dx] = BODY
+        for dx in (-1, 2):
+            if 0 <= x + dx < width and grid[r][x + dx] == EMPTY:
+                grid[r][x + dx] = "O"
+    # Кулачок: 4x2 сверху.
+    for r in range(max(0, hand_row), min(height, hand_row + 2)):
+        for dx in (-1, 0, 1, 2):
+            if 0 <= x + dx < width and grid[r][x + dx] == EMPTY:
+                grid[r][x + dx] = "O" if r == hand_row or dx in (-1, 2) else BODY
+    if hand_row + 2 < height:
+        for dx in (0, 1):
+            if grid[hand_row + 2][x + dx] == EMPTY:
+                grid[hand_row + 2][x + dx] = BODY
+
+
+def hang_pose(grid: Grid, left_hand: int, right_hand: int, sway: int) -> Grid:
+    """Висит под потолком на лапках, как обезьянка: тело качается (`sway`
+    px вбок), руки тянутся к потолку; `*_hand` — ряд кулачка (0 — держит)."""
+    an = anatomy(grid)
+    body = shift_rows(grid, list(range(0, len(grid))), sway)
+    # Ноги болтаются: чуть в противофазе к телу.
+    body = shift_rows(body, an.legs, -sway)
+    arm_up(body, on_left=True, hand_row=left_hand)
+    arm_up(body, on_left=False, hand_row=right_hand)
+    return body
+
+
+def vomit_pose(grid: Grid, splash: bool) -> Grid:
+    """Тошнит: глаза зажмурены, рот распахнут; на втором кадре — струйка."""
+    out = close_eyes(grid)
+    clusters = eye_clusters(grid)
+    eye_cells = {c for cluster in clusters for c in cluster}
+    mouth = [(y, x) for y, x in cells_of(grid, EYE) if (y, x) not in eye_cells]
+    if not mouth:
+        return out
+    cy = sum(y for y, _ in mouth) // len(mouth)
+    cx = sum(x for _, x in mouth) // len(mouth)
+    for y in range(cy - 1, cy + 3):
+        for x in range(cx - 2, cx + 3):
+            if 0 <= y < len(out) and 0 <= x < len(out[0]) and out[y][x] in (BODY, EYE, "D", "W"):
+                out[y][x] = "X"
+    if splash:
+        for y, x in ((cy + 3, cx), (cy + 4, cx - 1), (cy + 4, cx + 1), (cy + 5, cx)):
+            if 0 <= y < len(out) and 0 <= x < len(out[0]) and out[y][x] in (BODY, "W", "D", EMPTY):
+                out[y][x] = "A"
+    return out
+
+
 def add_stars(grid: Grid, centers: list[tuple[int, int]]) -> Grid:
     """Звёздочки-крестики над головой (кадры оглушения).
 
@@ -465,6 +528,17 @@ def derive(stage: str) -> dict[str, Grid]:
     out["climb_1"] = climb_profile(src["idle_1"], near_up=1, far_up=1)
     out["climb_2"] = climb_profile(idle, near_up=0, far_up=2)
     out["climb_3"] = climb_profile(src["idle_1"], near_up=1, far_up=1)
+    # Под потолком — обезьянка: висит на лапках и качается; при движении
+    # перехватывается рука за рукой.
+    out["hang_0"] = hang_pose(idle, left_hand=0, right_hand=0, sway=0)
+    out["hang_1"] = hang_pose(src["idle_1"], left_hand=0, right_hand=0, sway=1)
+    out["swing_0"] = hang_pose(idle, left_hand=0, right_hand=3, sway=-1)
+    out["swing_1"] = hang_pose(src["idle_1"], left_hand=0, right_hand=0, sway=0)
+    out["swing_2"] = hang_pose(idle, left_hand=3, right_hand=0, sway=1)
+    out["swing_3"] = hang_pose(src["idle_1"], left_hand=0, right_hand=0, sway=0)
+    # Укачало: тошнит (зелёный оттенок добавляет демон перекраской).
+    out["vomit_0"] = vomit_pose(idle, splash=False)
+    out["vomit_1"] = vomit_pose(idle, splash=True)
     # Звёздочки после удара о потолок.
     dizzy = close_eyes(src["landing_0"])
     out["dizzy_0"] = add_stars(dizzy, [(2, -7), (5, 4)])
@@ -500,6 +574,18 @@ frames = ["climb_0", "climb_1", "climb_2", "climb_3"]
 [stages.{stage}.anims.dizzy]
 fps = 4.0
 frames = ["dizzy_0", "dizzy_1"]
+
+[stages.{stage}.anims.hang]
+fps = 1.5
+frames = ["hang_0", "hang_1"]
+
+[stages.{stage}.anims.swing]
+fps = 5.0
+frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
+
+[stages.{stage}.anims.vomit]
+fps = 3.0
+frames = ["vomit_0", "vomit_1"]
 """
 
 
@@ -508,7 +594,13 @@ def sync_manifest() -> None:
     path = PACK / "pack.toml"
     text = path.read_text()
     for stage in STAGES:
+        if f"[stages.{stage}.anims.hang]" in text:
+            continue
         if f"[stages.{stage}.anims.blink]" in text:
+            # Блок фазы G уже есть — дописываем только новые семейства.
+            extra = MANIFEST_BLOCK.format(stage=stage)
+            extra = extra[extra.index(f"[stages.{stage}.anims.hang]"):]
+            text = text.rstrip("\n") + "\n\n" + extra
             continue
         text = text.rstrip("\n") + "\n" + MANIFEST_BLOCK.format(stage=stage)
     path.write_text(text.rstrip("\n") + "\n")

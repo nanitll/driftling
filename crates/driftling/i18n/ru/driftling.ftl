@@ -128,6 +128,14 @@ menu-dismiss = Убрать с экрана
 
 # --- Речевые пузыри (B5/B6) ---
 bubble-hello = Привет!
+bubble-heart = ♥
+bubble-annoyed = !
+bubble-hiccup = Ик!
+bubble-sneeze = Апчхи!
+bubble-bye = Пока!
+bubble-birthday = С днём рождения!
+bubble-wheee = Уиии!
+bubble-yuck = Бэ-э…
 
 # --- Питомец ---
 # Дефолтное имя записывается в Genesis-событие журнала ровно один раз,

@@ -154,17 +154,13 @@ impl Surface {
     /// движения (вверх/вниз) на зеркало не влияет: иначе питомец
     /// перекидывался бы лицом от стены на каждом развороте.
     ///
-    /// Под потолком кадр отражается по вертикали: питомец ходит вверх
-    /// ногами, на лапках, как обычно — только вниз головой.
+    /// Под потолком питомец ВИСИТ на лапках, как обезьянка (кадры `hang`/
+    /// `swing`): тело внизу, руки держатся за потолок — поэтому кадр не
+    /// переворачивается, только зеркалится по направлению.
     pub fn orient(self, facing: Direction) -> Orient {
         let flip_x = facing == Direction::Left;
         match self {
-            Surface::Floor => Orient::mirrored(flip_x),
-            Surface::Ceiling => Orient {
-                flip_x,
-                flip_y: true,
-                quarter_turns: 0,
-            },
+            Surface::Floor | Surface::Ceiling => Orient::mirrored(flip_x),
             // Профиль нарисован мордой вправо: к правой стене он повёрнут
             // как есть, к левой — зеркально.
             Surface::WallLeft => Orient::mirrored(true),

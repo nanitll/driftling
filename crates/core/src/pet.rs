@@ -132,6 +132,16 @@ pub struct Pet {
     pending_bounce: Option<Vec2>,
     /// Подскок уже был: мягкое тело прыгает один раз, дальше только катится.
     bounced: bool,
+    /// Укачивание (фаза G5), 0..1.5: растёт от рывков мышью туда-сюда,
+    /// тает со временем. Выше 0.4 — питомца мутит (зеленеет, шатается),
+    /// достигло 1 — на полу его вырвет.
+    nausea: f32,
+    /// Знак горизонтальной скорости последнего рывка (для счёта разворотов).
+    shake_sign: f32,
+    /// Предыдущая точка/время движения при захвате — для скорости рывка.
+    last_motion: Option<(f32, Vec2)>,
+    /// Пора тошнить: снимается демоном через [`Pet::take_vomit`].
+    vomit_pending: bool,
     /// Угол кувырка, рад (фаза G3): тело в полёте и при качении вращается.
     spin: f32,
     /// Угловая скорость, рад/с.
@@ -170,6 +180,10 @@ impl Pet {
             sleep_scale: 1.0,
             pending_bounce: None,
             bounced: false,
+            nausea: 0.0,
+            shake_sign: 0.0,
+            last_motion: None,
+            vomit_pending: false,
             spin: 0.0,
             spin_vel: 0.0,
         }
@@ -233,11 +247,76 @@ impl Pet {
         true
     }
 
+    /// Степень укачивания 0..1 (фаза G5): демон по ней зеленит спрайт.
+    pub fn nausea(&self) -> f32 {
+        self.nausea.clamp(0.0, 1.0)
+    }
+
+    /// Питомца мутит: пора менять вид на зеленоватый.
+    pub fn queasy(&self) -> bool {
+        self.nausea > 0.4
+    }
+
+    /// Пора ли тошнить (укачало до предела и питомец на полу). Флаг
+    /// снимается чтением: демон играет анимацию и оставляет лужицу.
+    pub fn take_vomit(&mut self) -> bool {
+        core::mem::take(&mut self.vomit_pending)
+    }
+
+    /// Подпрыгнуть на месте (реакция на двойной клик, фаза G5): невысокий
+    /// радостный прыжок с пола. В воздухе/на стене — ничего (false).
+    pub fn hop(&mut self) -> bool {
+        if self.surface != Surface::Floor
+            || !matches!(
+                self.state,
+                PetState::Idle | PetState::Walk | PetState::Landing
+            )
+        {
+            return false;
+        }
+        let h = self.cfg.body.mps_to_px(0.0) + self.cfg.body.px_per_m * 0.35;
+        self.vel = Vec2::new(self.vel.x * 0.3, -(2.0 * self.cfg.gravity() * h).sqrt());
+        self.bounced = true; // приземление с прыжка — без подскока
+        self.enter(PetState::Falling);
+        self.state_left = f32::INFINITY;
+        true
+    }
+
     /// Насколько дольше обычного спать (фаза G3): демон считает по энергии —
     /// уставший питомец не дремлет полминуты, а укладывается на несколько
     /// минут и просыпается заряженным. Значение клампится в 1..=10.
     pub fn set_sleep_scale(&mut self, scale: f32) {
         self.sleep_scale = scale.clamp(1.0, 10.0);
+    }
+
+    /// Учёт тряски при захвате: каждый резкий разворот хода мыши (смена
+    /// знака скорости на скорости выше порога) добавляет укачивания.
+    /// Плавное перетаскивание не считается — только «трясти как грушу».
+    fn note_shake(&mut self, now: f32, p: Vec2) {
+        let Some((t0, p0)) = self.last_motion.replace((now, p)) else {
+            return;
+        };
+        let dt = now - t0;
+        if dt <= 1e-4 {
+            return;
+        }
+        let vx = (p.x - p0.x) / dt;
+        let vy = (p.y - p0.y) / dt;
+        let speed = vx.hypot(vy);
+        let threshold = self.cfg.body.mps_to_px(1.2);
+        if speed < threshold {
+            return;
+        }
+        let sign = if vx.abs() >= vy.abs() {
+            vx.signum()
+        } else {
+            vy.signum() * 2.0 // вертикальные развороты считаем отдельно
+        };
+        if self.shake_sign != 0.0 && sign != self.shake_sign {
+            // Разворот на скорости: чем резче, тем сильнее укачивает.
+            self.nausea = (self.nausea + 0.09 * (speed / threshold).min(3.0)).min(1.5);
+        }
+        self.shake_sign = sign;
     }
 
     /// Завершить перетаскивание БЕЗ броска (фаза G3): захват потерян не по
@@ -325,6 +404,7 @@ impl Pet {
         let dt = dt.clamp(0.0, 1.5);
         self.state_time += dt;
         self.advance_fidget(dt);
+        self.settle_stomach(dt);
 
         match self.state {
             PetState::Dragged => {
@@ -353,6 +433,30 @@ impl Pet {
                 self.advance_timer();
             }
         }
+    }
+
+    /// Укачивание проходит со временем; дошло до предела на твёрдой земле —
+    /// тошнит (демон разыграет), после чего остаётся лёгкая дурнота.
+    fn settle_stomach(&mut self, dt: f32) {
+        if self.state == PetState::Dragged {
+            return; // в руках не отпускает
+        }
+        self.last_motion = None;
+        self.shake_sign = 0.0;
+        if self.nausea >= 1.0
+            && self.surface == Surface::Floor
+            && matches!(
+                self.state,
+                PetState::Idle | PetState::Walk | PetState::Landing
+            )
+        {
+            self.vomit_pending = true;
+            self.nausea = 0.45;
+            self.enter(PetState::Idle);
+            self.state_left = 2.5;
+            return;
+        }
+        self.nausea = (self.nausea - 0.12 * dt).max(0.0);
     }
 
     /// Падение: гравитация + сопротивление воздуха, потолок и стены экрана,
@@ -401,7 +505,11 @@ impl Pet {
     /// Ходьба по полу (земля или кромка окна). У края экрана питомец либо
     /// разворачивается, либо (фаза G) лезет на стену.
     fn tick_walk(&mut self, world: &World, dt: f32) {
-        self.pos.x += self.cfg.walk_speed * self.facing.sign() * dt;
+        // Укачанного шатает: идёт медленнее и виляет.
+        let queasy = self.nausea.clamp(0.0, 1.0);
+        let speed = self.cfg.walk_speed * (1.0 - 0.5 * queasy);
+        let sway = (self.state_time * 6.0).sin() * 28.0 * queasy;
+        self.pos.x += (speed * self.facing.sign() + sway) * dt;
         let b = self.bounds();
         let at_edge = if b.x <= world.screen.x {
             self.pos.x = world.screen.x + self.size / 2.0;
@@ -847,6 +955,7 @@ impl Pet {
                 }
                 self.drag_history.rotate_left(1);
                 self.drag_history[3] = (now, p);
+                self.note_shake(now, p);
                 self.pos = p + self.drag_offset;
                 // Не даём утащить за экран: спрайт целиком остаётся видимым,
                 // в том числе макушка (за верхний край не уносится).
@@ -1697,6 +1806,104 @@ mod tests {
         );
     }
 
+    // ---- Фаза G5: укачивание --------------------------------------------
+
+    /// Трясти питомца в руках (резкие развороты на скорости) — укачивает;
+    /// плавно носить — нет.
+    #[test]
+    fn shaking_makes_the_pet_queasy_but_carrying_does_not() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        // Плавный перенос: 60 шагов по 4 px за 1 с.
+        let mut t = 0.0;
+        let mut x = grab.x;
+        for _ in 0..60 {
+            t += 1.0 / 60.0;
+            x += 4.0;
+            p.pointer(&w, PointerEvent::Motion(Vec2::new(x, grab.y - 200.0)), t);
+        }
+        assert!(!p.queasy(), "плавный перенос не укачивает: {}", p.nausea());
+
+        // Тряска: туда-сюда по 120 px за кадр (7200 px/s), 40 разворотов.
+        for i in 0..40 {
+            t += 1.0 / 60.0;
+            let dx = if i % 2 == 0 { 120.0 } else { -120.0 };
+            p.pointer(
+                &w,
+                PointerEvent::Motion(Vec2::new(x + dx, grab.y - 200.0)),
+                t,
+            );
+        }
+        assert!(p.queasy(), "тряска обязана укачать: {}", p.nausea());
+        assert!(p.nausea() >= 0.99, "до предела: {}", p.nausea());
+
+        // Отпустили: в руках рвоты нет, на полу — есть, потом отпускает.
+        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(x, grab.y - 200.0)), t));
+        let mut vomited = false;
+        for _ in 0..900 {
+            p.tick(&w, 1.0 / 60.0);
+            vomited |= p.take_vomit();
+        }
+        assert!(vomited, "укачанного на полу должно вырвать");
+        assert!(!p.take_vomit(), "флаг снимается чтением");
+        assert!(p.nausea() < 0.5, "после — лёгкая дурнота, не предел");
+    }
+
+    /// Укачанный питомец идёт медленнее и виляет.
+    #[test]
+    fn queasy_pet_staggers() {
+        let w = world();
+        let mut sober = pet();
+        let mut queasy = pet();
+        for p in [&mut sober, &mut queasy] {
+            p.cfg.w_wall_climb = 0;
+            p.cfg.w_wall_trip = 0;
+            p.pos = Vec2::new(500.0, w.ground_y());
+            p.state = PetState::Walk;
+            p.facing = Direction::Right;
+            p.state_left = f32::INFINITY;
+        }
+        queasy.nausea = 1.0;
+        queasy.state = PetState::Walk; // settle_stomach сработает только при <1.0 на полу...
+        queasy.nausea = 0.95;
+        for _ in 0..120 {
+            sober.tick(&w, 1.0 / 60.0);
+            queasy.tick(&w, 1.0 / 60.0);
+        }
+        assert!(queasy.pos.x < sober.pos.x - 20.0, "шатающийся отстаёт");
+    }
+
+    /// Двойной клик — радостный прыжок с пола; в воздухе и на стене — нет.
+    #[test]
+    fn hop_jumps_from_the_floor_only() {
+        let w = world();
+        let mut p = pet();
+        assert!(!p.hop(), "в падении не прыгает");
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let y0 = p.pos.y;
+        assert!(p.hop());
+        assert_eq!(p.state, PetState::Falling);
+        let mut top = y0;
+        for _ in 0..300 {
+            p.tick(&w, 1.0 / 60.0);
+            top = top.min(p.pos.y);
+        }
+        let rose = y0 - top;
+        let want = p.cfg.body.px_per_m * 0.35;
+        assert!(
+            (rose - want).abs() < want * 0.2,
+            "прыжок {rose} против {want}"
+        );
+        assert_eq!(p.pos.y, w.ground_y(), "вернулся на пол");
+    }
+
     /// Тело отскакивает от пола и катится: удар не гасит движение
     /// мгновенно, как раньше (фаза G3, «больше физики тела»).
     #[test]
@@ -1828,8 +2035,13 @@ mod tests {
         assert_eq!(p.orient(), Orient::IDENTITY);
         p.facing = Direction::Left;
         assert!(p.orient().flip_x);
+        // Под потолком висит на лапках, как обезьянка: кадр не переворачивается.
         p.surface = Surface::Ceiling;
-        assert!(p.orient().flip_y, "под потолком ногами вверх");
+        assert!(
+            !p.orient().flip_y,
+            "под потолком тело внизу, руки держат потолок"
+        );
+        assert!(p.orient().flip_x, "зеркало по направлению сохраняется");
         // На стенах питомец нарисован в профиль и смотрит НА свою стену;
         // направление движения (вверх/вниз) на зеркало не влияет, иначе он
         // перекидывался бы лицом от стены при каждом развороте.

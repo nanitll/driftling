@@ -33,6 +33,10 @@ pub enum MoodTier {
 pub enum ActionLook {
     Eating,
     Hatching,
+    /// Укачало и тошнит (фаза G5).
+    Vomiting,
+    /// Чихает (фаза G5): короткое сжатие — кадр приземления.
+    Sneezing,
 }
 
 /// Полное описание внешнего вида питомца в кадре: состояние поведения,
@@ -174,6 +178,12 @@ pub struct SpriteSet {
     pub climb: Vec<Frame>,
     /// Звёздочки после удара о потолок.
     pub dizzy: Vec<Frame>,
+    /// Висит под потолком на лапках (обезьянка), покачиваясь.
+    pub hang: Vec<Frame>,
+    /// Перебирается по потолку рука за рукой.
+    pub swing: Vec<Frame>,
+    /// Тошнит после укачивания.
+    pub vomit: Vec<Frame>,
     /// Прозрачные поля поз хвата (climb/cling) — ими питомец прижимается
     /// к стене: спереди (морда и лапки) это правое поле кадра.
     pub grip_inset: Inset,
@@ -194,7 +204,10 @@ impl SpriteSet {
             &self.walk
         };
         self.grip_inset = frames_inset(grip);
-        self.feet_inset = frames_inset(if self.walk.is_empty() {
+        // К потолку обращён ВЕРХ кадров hang (руки); откат — верх idle.
+        self.feet_inset = frames_inset(if !self.hang.is_empty() {
+            &self.hang
+        } else if self.walk.is_empty() {
             &self.idle
         } else {
             &self.walk
@@ -213,16 +226,22 @@ impl SpriteSet {
             return match action {
                 ActionLook::Eating => pick(&self.eating, 4.0, t),
                 ActionLook::Hatching => pick(&self.hatching, 2.0, t),
+                ActionLook::Vomiting => pick_or(&self.vomit, &self.sick, 3.0, t),
+                ActionLook::Sneezing => pick(&self.landing, 6.0, t),
             };
         }
         if look.stage == Stage::Egg {
             return pick(&self.egg, 1.5, t);
         }
         match look.state {
-            // Под потолком питомец ходит вверх ногами обычными кадрами:
-            // рендер отражает их по вертикали, и он идёт «на лапках».
-            PetState::Idle if look.surface == Surface::Ceiling => pick(&self.idle, 2.0, t),
-            PetState::Climb if look.surface == Surface::Ceiling => pick(&self.walk, 6.0, t),
+            // Под потолком — обезьянка: висит на лапках и перебирается
+            // рука за рукой (откат — обычные кадры, если пак без них).
+            PetState::Idle if look.surface == Surface::Ceiling => {
+                pick_or(&self.hang, &self.idle, 1.5, t)
+            }
+            PetState::Climb if look.surface == Surface::Ceiling => {
+                pick_or(&self.swing, &self.walk, 5.0, t)
+            }
             // На стене — своя поза хвата, повёрнутая рендером на четверть.
             PetState::Idle if look.surface != Surface::Floor => {
                 pick_or(&self.cling, &self.idle, 1.5, t)
@@ -586,6 +605,9 @@ pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet
                 c,
             ),
         ],
+        hang: Vec::new(),
+        swing: Vec::new(),
+        vomit: Vec::new(),
         grip_inset: Inset::default(),
         feet_inset: Inset::default(),
     }

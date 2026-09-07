@@ -72,6 +72,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
+use driftling_core::palette;
 use driftling_core::physics::{self, Platform};
 use driftling_core::radial;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
@@ -110,6 +111,20 @@ const HAPPY_PLAY_SECS: f64 = 2.0;
 const HAPPY_PET_SECS: f64 = 1.2;
 /// Длительность анимации вылупления (B6), сек.
 const HATCH_SECS: f64 = 3.0;
+/// Реакции (фаза G5): удержание до мурлыканья, интервал сердечек,
+/// окно двойного клика, пороги раздражения, лужица, икота.
+const HOLD_PURR_SECS: f64 = 1.2;
+const HEART_EVERY_SECS: f64 = 0.8;
+const DOUBLE_CLICK_SECS: f64 = 0.35;
+const ANNOYED_CLICKS: usize = 5;
+const SULK_CLICKS: usize = 8;
+const SULK_SECS: f64 = 15.0;
+const PUDDLE_SECS: f64 = 25.0;
+const VOMIT_SECS: f64 = 1.6;
+const HICCUP_SECS: f64 = 30.0;
+/// Зелень укачанного: доля подмеса в цвет тела.
+const QUEASY_GREEN: u32 = 0xff_6f_c2_74;
+const QUEASY_MIX: f32 = 0.55;
 /// Пузырь «Привет!» после вылупления (B6), сек.
 const HELLO_HATCH_SECS: f64 = 4.0;
 /// Пузырь-приветствие при старте демона с призванным питомцем (B5), сек.
@@ -499,6 +514,13 @@ struct Overlay {
     until: f64,
 }
 
+/// Лужица на полу после тошноты (фаза G5).
+struct Puddle {
+    frame: Frame,
+    origin: Vec2,
+    until: f64,
+}
+
 /// Речевой пузырь над питомцем (без хит-области).
 struct Bubble {
     frame: Frame,
@@ -648,6 +670,22 @@ fn slept_minutes(since: f64, now: f64) -> Option<f32> {
 }
 
 /// Пузырь «Привет!» с окном показа [from, from + secs).
+/// Пузырь с произвольным текстом (реакции фазы G5).
+fn text_bubble(text: &str, from: f64, secs: f64) -> Bubble {
+    Bubble {
+        frame: text::bubble_frame(text, BUBBLE_PX),
+        from,
+        until: from + secs,
+    }
+}
+
+/// Детерминированный «шум» 0..1 от времени — для редких событий без RNG
+/// в демоне (симуляция и так воспроизводима, демону хватит хэша).
+fn noise(t: f64) -> f64 {
+    let x = (t * 12.9898).sin() * 43_758.547;
+    x - x.floor()
+}
+
 fn hello_bubble(from: f64, secs: f64) -> Bubble {
     Bubble {
         frame: text::bubble_frame(&fl!("bubble-hello"), BUBBLE_PX),
@@ -827,6 +865,35 @@ struct DaemonApp {
     /// которого выводятся настоящие 9.81 м/с² и вес. Перечитывается
     /// `ctl reload`.
     physics: PhysicsConfig,
+
+    // ---- Характер и реакции (фаза G5, docs/REACTIONS.md) ----
+    /// Зеленоватый набор кадров укачанного питомца: (стадия, база, цвет, набор).
+    queasy_sprites: Option<(Stage, u32, u32, SpriteSet)>,
+    /// Лужица после тошноты — лежит на полу, пока не высохнет.
+    puddle: Option<Puddle>,
+    /// ЛКМ зажата на питомце без захвата — с этого момента (мурлыканье).
+    press_since: Option<f64>,
+    /// Когда всплыло последнее сердечко.
+    last_heart: f64,
+    /// За это удержание поглаживание уже записано в журнал.
+    hold_rewarded: bool,
+    /// Моменты последних кликов: двойной клик и раздражение от частых.
+    click_times: Vec<f64>,
+    /// Моменты последних вкусняшек: перекорм -> икота.
+    treat_times: Vec<f64>,
+    /// Икота длится до этого момента; следующий «Ик!» — в hiccup_next.
+    hiccup_until: Option<f64>,
+    hiccup_next: f64,
+    /// Раздражён до этого момента: отворачивается один раз за серию кликов.
+    annoyed_until: Option<f64>,
+    /// Обиделся и убежал; вернётся в этот момент.
+    sulk_return_at: Option<f64>,
+    /// «Убрать с экрана» через пробежку: событие Dismissed — после неё.
+    dismiss_after_run: bool,
+    /// День (от рождения), в который уже поздравляли.
+    birthday_greeted: Option<i64>,
+    /// Следующая проверка «не чихнуть ли».
+    sneeze_check_at: f64,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -943,6 +1010,20 @@ impl DaemonApp {
             folder_poll: FOLDER_POLL,
             folder_merged_at: None,
             sig_exit: Arc::new(AtomicBool::new(false)),
+            queasy_sprites: None,
+            puddle: None,
+            press_since: None,
+            last_heart: 0.0,
+            hold_rewarded: false,
+            click_times: Vec::new(),
+            treat_times: Vec::new(),
+            hiccup_until: None,
+            hiccup_next: 0.0,
+            annoyed_until: None,
+            sulk_return_at: None,
+            dismiss_after_run: false,
+            birthday_greeted: None,
+            sneeze_check_at: 30.0,
         }
     }
 
@@ -1048,6 +1129,17 @@ impl DaemonApp {
                 from: now,
                 until: now + EATING_SECS,
             });
+            // Перекорм вкусняшками (фаза G5): три за минуту — икота.
+            if treat {
+                self.treat_times.retain(|t| now - t <= 60.0);
+                self.treat_times.push(now);
+                if self.treat_times.len() >= 3 && self.hiccup_until.is_none() {
+                    log::info!("реакция: перекормили — икота");
+                    self.hiccup_until = Some(now + EATING_SECS + HICCUP_SECS);
+                    self.hiccup_next = now + EATING_SECS + 1.0;
+                    self.treat_times.clear();
+                }
+            }
         }
         resp
     }
@@ -1302,7 +1394,7 @@ impl DaemonApp {
                 spawn_settings_detached();
                 Response::Ok
             }
-            MenuAction::Dismiss => self.dismiss(now),
+            MenuAction::Dismiss => self.dismiss_with_wave(now),
         };
         if let Response::Error(e) = resp {
             log::warn!("меню: действие {action:?} не удалось: {e}");
@@ -1342,6 +1434,7 @@ impl DaemonApp {
             pet.set_sleep_scale(sleep_scale_for(self.derived.stats.energy));
             self.pet = Some(pet);
             log::info!("summon: питомец появился в ({:.0}, {:.0})", pos.x, pos.y);
+            self.birthday_check(now);
         }
         Response::Ok
     }
@@ -1534,7 +1627,13 @@ impl DaemonApp {
                     self.presence_anim = None;
                     self.clear_effects();
                     self.close_sleep(now);
-                    log::info!("присутствие: питомец убежал за край (журнал не тронут)");
+                    if self.dismiss_after_run {
+                        self.dismiss_after_run = false;
+                        let _ = self.dismiss(now);
+                        log::info!("реакция: помахал и ушёл — убран с экрана");
+                    } else {
+                        log::info!("присутствие: питомец убежал за край (журнал не тронут)");
+                    }
                 }
             }
             PresenceAnim::RunIn { dir, target_x } => {
@@ -1679,9 +1778,13 @@ impl DaemonApp {
                 // Косметика уровня пользователя: цвет — событие журнала,
                 // альфа принудительно ff; спрайты догонит sync_visuals
                 // этого же тика.
-                self.care(EventKind::Recolored {
+                let resp = self.care(EventKind::Recolored {
                     argb: 0xff00_0000 | (argb & 0x00ff_ffff),
-                })
+                });
+                if resp == Response::Ok && self.pet_visible_reactive() {
+                    self.happy_until = Some(now + HAPPY_PLAY_SECS); // нравится обновка
+                }
+                resp
             }
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
@@ -1804,14 +1907,257 @@ impl DaemonApp {
     /// (нажатие без захвата) — поглаживание (B5).
     fn pointer(&mut self, ev: PointerEvent, now: f64) -> bool {
         let mut clicked = false;
+        let mut consumed = false;
+        let mut dragged = false;
+        let mut thrown_speed = 0.0f32;
         if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
-            pet.pointer(world, ev, now as f32);
+            consumed = pet.pointer(world, ev, now as f32);
             clicked = pet.take_click();
+            dragged = pet.state == PetState::Dragged;
+            if matches!(ev, PointerEvent::Release(_)) && pet.state == PetState::Falling {
+                thrown_speed = pet.vel.x.hypot(pet.vel.y) / pet.config().body.px_per_m;
+            }
+        }
+        match ev {
+            PointerEvent::Press(_) if consumed && !dragged => {
+                self.press_since = Some(now);
+                self.hold_rewarded = false;
+            }
+            PointerEvent::Motion(_) if dragged => self.press_since = None,
+            PointerEvent::Release(_) => {
+                self.press_since = None;
+                // Сильный бросок — визг восторга (3 м/с и выше).
+                if thrown_speed >= 3.0 {
+                    self.bubble = Some(text_bubble(&fl!("bubble-wheee"), now, 0.9));
+                }
+            }
+            _ => {}
         }
         if clicked {
-            self.petted(now);
+            self.clicked(now);
         }
         true
+    }
+
+    /// Клик по питомцу (фаза G5): двойной — прыжок, частые — раздражение и
+    /// обида, обычный — поглаживание.
+    fn clicked(&mut self, now: f64) {
+        self.click_times.retain(|t| now - t <= 3.0);
+        let double = self
+            .click_times
+            .last()
+            .is_some_and(|t| now - t <= DOUBLE_CLICK_SECS);
+        self.click_times.push(now);
+        let recent2 = self.click_times.iter().filter(|t| now - **t <= 2.0).count();
+        let recent3 = self.click_times.len();
+
+        if recent3 >= SULK_CLICKS && self.sulk_return_at.is_none() {
+            log::info!("реакция: совсем достали — обиделся, убегает на {SULK_SECS:.0} с");
+            self.click_times.clear();
+            self.bubble = Some(text_bubble(&fl!("bubble-annoyed"), now, 0.8));
+            self.sulk_off(now);
+            return;
+        }
+        if recent2 >= ANNOYED_CLICKS {
+            self.happy_until = None;
+            self.bubble = Some(text_bubble(&fl!("bubble-annoyed"), now, 0.9));
+            // Отворачивается один раз за серию (окно скользит, и порог
+            // держался бы на каждом клике — питомец крутился бы туда-сюда).
+            if self.annoyed_until.is_none_or(|t| now >= t) {
+                if let Some(pet) = &mut self.pet {
+                    pet.facing = pet.facing.flip();
+                }
+            }
+            self.annoyed_until = Some(now + 2.5);
+            return;
+        }
+        if double {
+            if let Some(pet) = &mut self.pet {
+                if pet.hop() {
+                    self.happy_until = Some(now + HAPPY_PET_SECS);
+                    return;
+                }
+            }
+        }
+        self.petted(now);
+    }
+
+    /// Обида (фаза G5): убегает за ближайший край без событий журнала и
+    /// возвращается через SULK_SECS. Присутствие/lease не трогаем.
+    fn sulk_off(&mut self, now: f64) {
+        let (Some(pet), Some(world)) = (&mut self.pet, &self.world) else {
+            return;
+        };
+        pet.detach_to_floor();
+        let dir = if pet.pos.x - world.screen.x <= world.screen.right() - pet.pos.x {
+            -1.0
+        } else {
+            1.0
+        };
+        pet.state = PetState::Walk;
+        pet.state_time = 0.0;
+        pet.vel = Vec2::default();
+        self.menu = None;
+        self.presence_anim = Some(PresenceAnim::RunOff { dir });
+        self.sulk_return_at = Some(now + SULK_SECS);
+    }
+
+    /// «Убрать с экрана» по-человечески (фаза G5): помахал «Пока!», убежал
+    /// за край, и только потом — Dismissed в журнал. Яйцо и невидимый
+    /// питомец уходят сразу.
+    fn dismiss_with_wave(&mut self, now: f64) -> Response {
+        let can_run = self.pet_visible_reactive()
+            && self.derived.stage != Stage::Egg
+            && self.presence_anim.is_none();
+        if !can_run {
+            return self.dismiss(now);
+        }
+        let (Some(pet), Some(world)) = (&mut self.pet, &self.world) else {
+            return self.dismiss(now);
+        };
+        pet.detach_to_floor();
+        let dir = if pet.pos.x - world.screen.x <= world.screen.right() - pet.pos.x {
+            -1.0
+        } else {
+            1.0
+        };
+        pet.state = PetState::Walk;
+        pet.state_time = 0.0;
+        pet.vel = Vec2::default();
+        self.bubble = Some(text_bubble(&fl!("bubble-bye"), now, 1.4));
+        self.presence_anim = Some(PresenceAnim::RunOff { dir });
+        self.dismiss_after_run = true;
+        Response::Ok
+    }
+
+    /// Реакции, живущие по времени (фаза G5): мурлыканье при удержании,
+    /// тошнота после тряски, икота, возвращение обиженного, чих, лужица.
+    fn reactions_tick(&mut self, now: f64) {
+        // Удержание без движения — мурлыканье: сердечки и радость.
+        let holding = self.press_since.is_some_and(|t| now - t >= HOLD_PURR_SECS)
+            && self
+                .pet
+                .as_ref()
+                .is_some_and(|p| p.state != PetState::Dragged);
+        if holding && now - self.last_heart >= HEART_EVERY_SECS {
+            self.last_heart = now;
+            self.bubble = Some(text_bubble(&fl!("bubble-heart"), now, 0.7));
+            self.happy_until = Some(now + 1.0);
+            if !self.hold_rewarded {
+                self.hold_rewarded = true;
+                let _ = self.care(EventKind::Petted);
+            }
+        }
+
+        // Укачало до тошноты: анимация, лужица, запись в журнал.
+        if self.pet.as_mut().is_some_and(|p| p.take_vomit()) {
+            log::info!("реакция: укачали — тошнит");
+            self.overlay = Some(Overlay {
+                look: ActionLook::Vomiting,
+                from: now,
+                until: now + VOMIT_SECS,
+            });
+            self.bubble = Some(text_bubble(&fl!("bubble-yuck"), now + 0.4, 1.4));
+            if let Some(pet) = &self.pet {
+                let b = pet.bounds();
+                let w = (b.w * 0.6) as u32;
+                let frame = radial::puddle_frame(w, QUEASY_GREEN);
+                let dir = pet.facing.sign();
+                self.puddle = Some(Puddle {
+                    origin: Vec2::new(
+                        b.x + b.w / 2.0 + dir * b.w * 0.25 - w as f32 / 2.0,
+                        b.bottom() - frame.h as f32 * 0.7,
+                    ),
+                    frame,
+                    until: now + PUDDLE_SECS,
+                });
+            }
+            let _ = self.care(EventKind::Shaken);
+        }
+        if self.puddle.as_ref().is_some_and(|p| now >= p.until) {
+            self.puddle = None;
+        }
+
+        // Икота после перекорма.
+        if let Some(until) = self.hiccup_until {
+            if now >= until {
+                self.hiccup_until = None;
+            } else if now >= self.hiccup_next {
+                self.bubble = Some(text_bubble(&fl!("bubble-hiccup"), now, 0.6));
+                self.hiccup_next = now + 2.4 + 2.2 * noise(now);
+            }
+        }
+
+        // Обиженный возвращается.
+        if self.sulk_return_at.is_some_and(|t| now >= t) && self.pet.is_none() {
+            self.sulk_return_at = None;
+            if self.derived.summoned {
+                let _ = self.summon_run_in(now);
+            }
+        }
+
+        // Чих: редкий, только в покое на полу и без других эффектов.
+        if now >= self.sneeze_check_at {
+            self.sneeze_check_at = now + 30.0;
+            let calm = self.overlay.is_none()
+                && self.bubble.is_none()
+                && self.presence_anim.is_none()
+                && self
+                    .pet
+                    .as_ref()
+                    .is_some_and(|p| p.state == PetState::Idle && p.surface == Surface::Floor);
+            if calm && noise(now * 3.7) < 0.05 {
+                self.overlay = Some(Overlay {
+                    look: ActionLook::Sneezing,
+                    from: now,
+                    until: now + 0.45,
+                });
+                self.bubble = Some(text_bubble(&fl!("bubble-sneeze"), now + 0.2, 1.0));
+            }
+        }
+
+        // Зеленоватый набор для укачанного — лениво, под текущие спрайты.
+        let queasy = self.pet.as_ref().is_some_and(|p| p.queasy());
+        if queasy {
+            let key = (self.sprite_stage, self.sprite_base, self.sprite_color);
+            let stale = self
+                .queasy_sprites
+                .as_ref()
+                .is_none_or(|(st, b, c, _)| (*st, *b, *c) != key);
+            if stale {
+                let tint = palette::mix(self.sprite_color, QUEASY_GREEN, QUEASY_MIX);
+                let set = stage_sprites(self.sprite_base, self.sprite_stage, tint);
+                self.queasy_sprites = Some((key.0, key.1, key.2, set));
+            }
+        } else if self.queasy_sprites.is_some()
+            && self.pet.as_ref().is_none_or(|p| p.nausea() == 0.0)
+        {
+            self.queasy_sprites = None; // выздоровел — память назад
+        }
+    }
+
+    /// День рождения (годовщина Genesis): поздравить раз в день при появлении.
+    fn birthday_check(&mut self, now: f64) {
+        let Some(born) = self.events.iter().find_map(|e| match e.kind {
+            EventKind::Genesis { .. } => Some(e.id.wall_ms),
+            _ => None,
+        }) else {
+            return;
+        };
+        let days = (wall_now_ms().saturating_sub(born)) as f64 / 86_400_000.0;
+        if days < 365.0 {
+            return;
+        }
+        let day = days.floor() as i64;
+        if days % 365.25 < 1.0 && self.birthday_greeted != Some(day) {
+            self.birthday_greeted = Some(day);
+            log::info!(
+                "реакция: у питомца день рождения ({} лет)",
+                (days / 365.25) as i64
+            );
+            self.bubble = Some(text_bubble(&fl!("bubble-birthday"), now + 0.5, 4.0));
+            self.happy_until = Some(now + 3600.0);
+        }
     }
 
     /// Опрос worldsense (фаза D): свежий снапшот -> платформы и пол в World,
@@ -2019,6 +2365,8 @@ impl App for DaemonApp {
         self.note_sleep(now);
         // Радиальное меню едет за питомцем и дорастает (G4).
         self.menu_tick(now);
+        // Характер и реакции (G5).
+        self.reactions_tick(now);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -2028,6 +2376,11 @@ impl App for DaemonApp {
                 input_rects: Vec::new(),
             },
             (Some(pet), Some(world)) => {
+                // Укачанного рисуем зеленоватым набором (G5).
+                let set: &SpriteSet = match &self.queasy_sprites {
+                    Some((_, _, _, set)) if pet.queasy() => set,
+                    _ => &self.sprites,
+                };
                 // На стене и под потолком рисунок прижимается к поверхности:
                 // пустое поле кадра иначе оставило бы питомца висеть в
                 // паре пикселей от неё. Хит-область едет вместе с рисунком.
@@ -2053,12 +2406,21 @@ impl App for DaemonApp {
                     Some(o) => (now - o.from) as f32,
                     None => pet.anim_time(),
                 };
-                let mut sprites = vec![SpriteInstance {
-                    frame: self.sprites.frame_look(&look, t),
+                let mut sprites = Vec::with_capacity(4);
+                // Лужица — под питомцем (рисуется первой).
+                if let Some(puddle) = &self.puddle {
+                    sprites.push(SpriteInstance {
+                        frame: &puddle.frame,
+                        origin: puddle.origin,
+                        orient: Orient::IDENTITY,
+                    });
+                }
+                sprites.push(SpriteInstance {
+                    frame: set.frame_look(&look, t),
                     origin: Vec2::new(bounds.x, bounds.y),
                     // Поворот под поверхность + зеркало по взгляду (фаза G).
                     orient: pet.orient(),
-                }];
+                });
                 // Пробегающего мимо (run-off/run-in, фаза E) не поймать:
                 // хит-области нет, указатель проходит насквозь.
                 let mut input_rects = if self.presence_anim.is_some() {
@@ -2407,6 +2769,167 @@ mod tests {
             1,
             "нормализация не повторяется"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Фаза G5: характер и реакции ------------------------------------
+
+    /// Двойной клик — прыжок (Falling вверх), одиночный — поглаживание.
+    #[test]
+    fn double_click_makes_the_pet_hop() {
+        let (mut app, _tx, dir) = adult_app("react-hop");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let p = app.pet.as_ref().unwrap().pos;
+        let click = Vec2::new(p.x, p.y - 10.0);
+        app.event(Event::PointerPress(click), now);
+        app.event(Event::PointerRelease(click), now + 0.05);
+        app.event(Event::PointerPress(click), now + 0.2);
+        app.event(Event::PointerRelease(click), now + 0.25);
+        let pet = app.pet.as_ref().unwrap();
+        assert_eq!(pet.state, PetState::Falling, "прыгнул");
+        assert!(pet.vel.y < 0.0, "вверх");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Частые клики раздражают («!», отворачивается), совсем частые —
+    /// обида: убегает за край и возвращается через SULK_SECS.
+    #[test]
+    fn rapid_clicks_annoy_then_sulk_and_return() {
+        let (mut app, _tx, dir) = adult_app("react-sulk");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let p = app.pet.as_ref().unwrap().pos;
+        let click = Vec2::new(p.x, p.y - 10.0);
+        let facing_before = app.pet.as_ref().unwrap().facing;
+        // Шесть кликов за 1.2 с (интервал > двойного клика).
+        for i in 0..6 {
+            let t = now + 0.5 * i as f64;
+            app.event(Event::PointerPress(click), t);
+            app.event(Event::PointerRelease(click), t + 0.05);
+        }
+        assert!(app.bubble.is_some(), "«!» показан");
+        assert_ne!(
+            app.pet.as_ref().unwrap().facing,
+            facing_before,
+            "отвернулся"
+        );
+        // Ещё три подряд (время строго вперёд) — обиделся: пробежка за край.
+        for i in 0..3 {
+            let t = now + 2.8 + 0.3 * i as f64;
+            app.event(Event::PointerPress(click), t);
+            app.event(Event::PointerRelease(click), t + 0.05);
+        }
+        assert!(app.sulk_return_at.is_some(), "обиделся");
+        assert!(matches!(
+            app.presence_anim,
+            Some(PresenceAnim::RunOff { .. })
+        ));
+        now += 3.0;
+        settle(&mut app, &mut now, 8.0);
+        assert!(app.pet.is_none(), "убежал за край");
+        // Журнал: обида — не уход, Dismissed не записан.
+        assert!(!matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Dismissed
+        ));
+        now += SULK_SECS + 1.0;
+        app.tick(now);
+        assert!(app.pet.is_some(), "вернулся");
+        assert!(matches!(
+            app.presence_anim,
+            Some(PresenceAnim::RunIn { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Три вкусняшки за минуту — икота: пузыри «Ик!» какое-то время.
+    #[test]
+    fn overfeeding_treats_causes_hiccups() {
+        let (mut app, _tx, dir) = adult_app("react-hiccup");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        for i in 0..3 {
+            assert_eq!(app.feed(true, now + i as f64), Response::Ok);
+        }
+        assert!(app.hiccup_until.is_some(), "икота началась");
+        let mut hiccups = 0;
+        let mut t = now + 3.0;
+        for _ in 0..600 {
+            t += 0.1;
+            app.tick(t);
+            if app.bubble.is_some() {
+                hiccups += 1;
+                app.bubble = None;
+            }
+        }
+        assert!(hiccups >= 3, "икал редко: {hiccups}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Тряска в руках: питомца укачивает, на полу его тошнит — лужица,
+    /// оверлей и Shaken в журнале, настроение просело.
+    #[test]
+    fn shaking_ends_in_vomit_puddle_and_journal_entry() {
+        let (mut app, _tx, dir) = adult_app("react-shake");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let mood_before = app.derived.stats.mood;
+        let p = app.pet.as_ref().unwrap().pos;
+        let grab = Vec2::new(p.x, p.y - 10.0);
+        app.event(Event::PointerPress(grab), now);
+        let mut x = grab.x;
+        let y = grab.y - 300.0;
+        // Начали захват плавно, потом трясём.
+        for _ in 0..10 {
+            now += 1.0 / 60.0;
+            x += 3.0;
+            app.event(Event::PointerMotion(Vec2::new(x, y)), now);
+        }
+        for i in 0..60 {
+            now += 1.0 / 60.0;
+            let dx = if i % 2 == 0 { 140.0 } else { -140.0 };
+            app.event(Event::PointerMotion(Vec2::new(x + dx, y)), now);
+        }
+        assert!(app.pet.as_ref().unwrap().queasy(), "укачало");
+        app.event(Event::PointerRelease(Vec2::new(x, y)), now);
+        settle(&mut app, &mut now, 6.0);
+        assert!(app.puddle.is_some(), "лужица на полу");
+        assert!(
+            journal_kinds(&dir)
+                .iter()
+                .any(|k| matches!(k, EventKind::Shaken)),
+            "Shaken в журнале"
+        );
+        assert!(app.derived.stats.mood < mood_before, "настроение просело");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// «Убрать» из меню: сперва «Пока!» и пробежка, Dismissed — после неё.
+    #[test]
+    fn dismiss_waves_goodbye_then_records_dismissed() {
+        let (mut app, _tx, dir) = adult_app("react-bye");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.dismiss_with_wave(now), Response::Ok);
+        assert!(app.pet.is_some(), "ещё убегает");
+        assert!(app.bubble.is_some(), "машет «Пока!»");
+        assert!(!matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Dismissed
+        ));
+        settle(&mut app, &mut now, 8.0);
+        assert!(app.pet.is_none());
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Dismissed
+        ));
+        assert!(!app.derived.summoned);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

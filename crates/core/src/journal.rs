@@ -168,6 +168,8 @@ pub enum EventKind {
     /// Демон пишет по окончании периода сна: сколько минут проспал
     /// (восстановление энергии).
     Slept { minutes: f32 },
+    /// Укачали до тошноты (фаза G5): настроение и здоровье страдают.
+    Shaken,
     /// Погладили (настроение↑ с часовым потолком — анти-фарм).
     Petted,
     /// Переименовали.
@@ -243,6 +245,9 @@ pub struct FoldCfg {
     pub pet_mood: f32,
     /// ...но не больше этого за скользящий час (анти-фарм).
     pub pet_mood_cap_hourly: f32,
+    /// Укачали до тошноты: сколько снять настроения и здоровья.
+    pub shaken_mood_cost: f32,
+    pub shaken_health_cost: f32,
     /// Сон: энергия за минуту сна. Сон на экране короткий (десятки секунд),
     /// поэтому темп высокий: полный заряд — около семи минут сна суммарно,
     /// иначе питомец вечно ходил бы с нулевой энергией (так и было).
@@ -278,6 +283,8 @@ impl Default for FoldCfg {
             pet_mood: 4.0,
             pet_mood_cap_hourly: 12.0,
             sleep_energy_per_min: 15.0,
+            shaken_mood_cost: 12.0,
+            shaken_health_cost: 3.0,
             health_drop_per_hour: 6.0,
             health_regen_per_hour: 3.0,
             health_regen_above: 60.0,
@@ -465,6 +472,10 @@ fn apply(st: &mut FoldState, ev: &Event, cfg: &FoldCfg) {
         }
         // Сам факт укладывания; энергию вернёт Slept по окончании сна.
         EventKind::PutToSleep => {}
+        EventKind::Shaken => {
+            st.stats.mood = (st.stats.mood - cfg.shaken_mood_cost).max(0.0);
+            st.stats.health = (st.stats.health - cfg.shaken_health_cost).max(0.0);
+        }
         EventKind::Slept { minutes } => {
             let gain = minutes.max(0.0) * cfg.sleep_energy_per_min;
             st.stats.energy = (st.stats.energy + gain).min(100.0);
@@ -1336,6 +1347,30 @@ mod tests {
         events.push(ev(542 * MIN, EventKind::Slept { minutes: -5.0 }));
         let pet = fold(&events, 542 * MIN, &cfg);
         assert!(approx(pet.stats.energy, 100.0 - 100.0 / 600.0, 0.01));
+    }
+
+    /// Укачали до тошноты — настроение и здоровье просели, но не ниже нуля.
+    #[test]
+    fn shaken_costs_mood_and_health() {
+        let cfg = FoldCfg::default();
+        let events = vec![genesis(0), ev(MIN, EventKind::Shaken)];
+        let pet = fold(&events, MIN, &cfg);
+        let base = fold(&[genesis(0)], MIN, &cfg);
+        assert!(approx(
+            pet.stats.mood,
+            base.stats.mood - cfg.shaken_mood_cost,
+            0.01
+        ));
+        assert!(approx(
+            pet.stats.health,
+            base.stats.health - cfg.shaken_health_cost,
+            0.01
+        ));
+        let many: Vec<_> = std::iter::once(genesis(0))
+            .chain((1..40).map(|i| ev(i * MIN, EventKind::Shaken)))
+            .collect();
+        let pet = fold(&many, 40 * MIN, &cfg);
+        assert_eq!(pet.stats.mood, 0.0, "пол нуля");
     }
 
     /// Дефолтный темп сна: короткий экранный сон реально заряжает —

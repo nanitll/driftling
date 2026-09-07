@@ -127,6 +127,14 @@ menu-dismiss = Remove from screen
 
 # --- speech bubbles (B5/B6) ---
 bubble-hello = Hi!
+bubble-heart = ♥
+bubble-annoyed = !
+bubble-hiccup = Hic!
+bubble-sneeze = Achoo!
+bubble-bye = Bye!
+bubble-birthday = Happy birthday!
+bubble-wheee = Wheee!
+bubble-yuck = Blergh…
 
 # --- pet ---
 # The default name is written into the journal's Genesis event exactly
