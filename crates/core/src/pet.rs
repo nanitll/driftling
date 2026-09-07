@@ -124,6 +124,9 @@ pub struct Pet {
     /// Текущая прогулка — «поход к стене» (фаза G): питомец идёт до края
     /// экрана не сворачивая и лезет наверх. Снимается на выходе из Walk.
     wall_trip: bool,
+    /// Множитель длительности сна (фаза G3): уставший питомец спит дольше.
+    /// Ставит демон по энергии (`set_sleep_scale`); 1.0 — обычная дрёма.
+    sleep_scale: f32,
     /// Угол кувырка, рад (фаза G3): тело в полёте и при качении вращается.
     spin: f32,
     /// Угловая скорость, рад/с.
@@ -159,6 +162,7 @@ impl Pet {
             action_left: 1.0,
             sleep_on_land: false,
             wall_trip: false,
+            sleep_scale: 1.0,
             spin: 0.0,
             spin_vel: 0.0,
         }
@@ -217,8 +221,30 @@ impl Pet {
         }
         self.state = PetState::Sleep;
         self.state_time = 0.0;
-        self.state_left = self.cfg.sleep_range.1;
+        self.state_left = self.cfg.sleep_range.1 * self.sleep_scale;
         self.idle_action = IdleAction::Stand;
+        true
+    }
+
+    /// Насколько дольше обычного спать (фаза G3): демон считает по энергии —
+    /// уставший питомец не дремлет полминуты, а укладывается на несколько
+    /// минут и просыпается заряженным. Значение клампится в 1..=10.
+    pub fn set_sleep_scale(&mut self, scale: f32) {
+        self.sleep_scale = scale.clamp(1.0, 10.0);
+    }
+
+    /// Завершить перетаскивание БЕЗ броска (фаза G3): захват потерян не по
+    /// воле пользователя, значит бросать нельзя — питомец выпадает из руки
+    /// с нулевой скоростью и просто падает вниз.
+    pub fn cancel_drag(&mut self) -> bool {
+        self.pressed_at = None;
+        if self.state != PetState::Dragged {
+            return false;
+        }
+        self.vel = Vec2::default();
+        self.spin_vel = 0.0;
+        self.enter(PetState::Falling);
+        self.state_left = f32::INFINITY;
         true
     }
 
@@ -556,7 +582,7 @@ impl Pet {
             self.spin_vel = 0.0;
             self.spin = 0.0;
             self.enter(PetState::Sleep);
-            self.state_left = self.cfg.sleep_range.1;
+            self.state_left = self.cfg.sleep_range.1 * self.sleep_scale;
             return;
         }
 
@@ -827,16 +853,18 @@ impl Pet {
                     .find(|(t, _)| t1 - t <= 0.12)
                     .unwrap_or(self.drag_history[2]);
                 let span = (t1 - t0).max(1e-3);
-                let mut v = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
-                // Скорость вылета ограничена импульсом руки, делённым на
-                // массу тела (фаза G3): тяжёлого питомца так далеко не
-                // зашвырнёшь, как лёгкого.
+                let v = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
+                // Сила броска идёт от скорости руки, но упирается в предел
+                // тела (импульс руки / масса). Не жёсткий обрез, а мягкое
+                // насыщение: медленный мах отрабатывает один в один, резкий
+                // — сильнее вялого, просто прибавка тает у предела.
                 let speed = v.x.hypot(v.y);
                 let limit = self.cfg.body.throw_limit_px();
-                if speed > limit {
-                    v = v * (limit / speed);
-                }
-                self.vel = v;
+                self.vel = if speed > 1e-3 {
+                    v * (limit * (speed / limit).tanh() / speed)
+                } else {
+                    Vec2::default()
+                };
                 // Брошенное тело кувыркается: закрутка от горизонтальной
                 // составляющей броска, как у брошенного мяча.
                 self.spin_vel = self.vel.x / (self.size / 2.0).max(1.0) * 0.6;
@@ -866,6 +894,10 @@ impl Pet {
             return;
         }
         let (mut next, mut dur) = next_state_after(self.state, &self.cfg, &mut self.rng);
+        if next == PetState::Sleep {
+            // Уставший спит дольше — это и есть путь к полному заряду.
+            dur *= self.sleep_scale;
+        }
         if self.grounded_only && next == PetState::Walk {
             // Яйцо не ходит (B6): решение «гулять» заменяется на Idle.
             next = PetState::Idle;
@@ -1566,6 +1598,78 @@ mod tests {
         assert!(
             max_height < w.ground_y() - 200.0,
             "и забраться заметно выше пола: {max_height}"
+        );
+    }
+
+    /// Потерянный захват (курсор ушёл при зажатой кнопке) — НЕ бросок:
+    /// питомец выпадает из руки с нулевой скоростью, даже если рука
+    /// двигалась быстро.
+    #[test]
+    fn cancelled_drag_drops_without_a_throw() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(1200.0, 500.0)), 0.01));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(1500.0, 300.0)), 0.02));
+        assert_eq!(p.state, PetState::Dragged);
+        assert!(p.cancel_drag());
+        assert_eq!(p.state, PetState::Falling);
+        assert_eq!((p.vel.x, p.vel.y), (0.0, 0.0), "выпал, а не улетел");
+        // Повторная отмена вне захвата ничего не делает.
+        assert!(!p.cancel_drag());
+    }
+
+    /// Сила броска растёт со скоростью руки монотонно, а не обрубается:
+    /// резкий мах сильнее вялого, даже когда оба за пределом тела.
+    #[test]
+    fn throw_strength_follows_hand_speed() {
+        let w = world();
+        let mut speeds = Vec::new();
+        for hand in [200.0f32, 800.0, 2000.0, 5000.0] {
+            let mut p = pet();
+            for _ in 0..600 {
+                p.tick(&w, 1.0 / 60.0);
+            }
+            let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+            assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+            // Два движения вправо со скоростью `hand` px/s.
+            let step = hand * 0.01;
+            let a = Vec2::new(grab.x + step, grab.y);
+            let b = Vec2::new(grab.x + 2.0 * step, grab.y);
+            assert!(p.pointer(&w, PointerEvent::Motion(a), 0.01));
+            assert!(p.pointer(&w, PointerEvent::Motion(b), 0.02));
+            assert!(p.pointer(&w, PointerEvent::Release(b), 0.02));
+            speeds.push(p.vel.x);
+        }
+        for pair in speeds.windows(2) {
+            assert!(pair[1] > pair[0], "сила не растёт с рукой: {speeds:?}");
+        }
+        let limit = pet().cfg.body.throw_limit_px();
+        assert!(speeds[3] <= limit, "предел тела: {} > {limit}", speeds[3]);
+        assert!(
+            speeds[0] > 150.0,
+            "слабый мах отрабатывает почти один в один"
+        );
+    }
+
+    /// Уставший питомец спит дольше: та же дрёма с множителем.
+    #[test]
+    fn tired_pet_sleeps_scaled() {
+        let mut p = pet();
+        p.set_sleep_scale(4.0);
+        p.pos.y = 1080.0;
+        p.state = PetState::Idle;
+        assert!(p.force_sleep());
+        assert_eq!(p.state_left, p.cfg.sleep_range.1 * 4.0);
+        p.set_sleep_scale(0.2);
+        assert!(p.force_sleep());
+        assert_eq!(
+            p.state_left, p.cfg.sleep_range.1,
+            "меньше единицы не бывает"
         );
     }
 

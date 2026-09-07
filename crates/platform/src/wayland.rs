@@ -855,13 +855,17 @@ impl PointerHandler for Backend {
                     self.last_pointer = pos;
                     Event::PointerMenu(pos)
                 }
-                // Уход курсора при зажатой кнопке = отпускание в последней
-                // точке: если композитор разорвал implicit grab (input region
-                // уехал из-под курсора между кадрами), Motion/Release уже не
-                // придут — без этого питомец вечно висел бы в Dragged (ТД-5).
+                // Уход курсора при зажатой кнопке: если композитор разорвал
+                // implicit grab (input region уехал из-под курсора между
+                // кадрами), Motion/Release уже не придут — без этого питомец
+                // вечно висел бы в Dragged (ТД-5). Но и БРОСАТЬ его нельзя:
+                // пользователь кнопку не отпускал, а питомец улетал бы сам
+                // (жалоба «держу мышкой — не должна вылетать»). Поэтому
+                // отмена, а не отпускание: выпадает из руки на месте.
                 PointerEventKind::Leave { .. } if self.pressed => {
                     self.pressed = false;
-                    Event::PointerRelease(self.last_pointer)
+                    log::debug!("указатель ушёл при зажатой кнопке — захват отменён");
+                    Event::PointerCancel(self.last_pointer)
                 }
                 _ => continue,
             };

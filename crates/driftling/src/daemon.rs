@@ -608,6 +608,12 @@ fn hello_bubble(from: f64, secs: f64) -> Bubble {
     }
 }
 
+/// Множитель длительности сна по энергии: бодрый дремлет как обычно,
+/// вымотанный (0) спит вшестеро дольше. Линейно между.
+fn sleep_scale_for(energy: f32) -> f32 {
+    1.0 + 5.0 * (1.0 - energy.clamp(0.0, 100.0) / 100.0)
+}
+
 /// Пересечение прямоугольников (пустое — нулевой размер).
 fn intersect(a: Rect, b: Rect) -> Rect {
     let x = a.x.max(b.x);
@@ -896,6 +902,11 @@ impl DaemonApp {
     fn refold(&mut self) {
         self.derived = fold(&self.events, wall_now_ms(), &self.fold_cfg);
         self.last_fold = Instant::now();
+        // Усталость -> длина сна (фаза G3): при нулевой энергии питомец
+        // спит вшестеро дольше обычной дрёмы и просыпается заряженным.
+        if let Some(pet) = &mut self.pet {
+            pet.set_sleep_scale(sleep_scale_for(self.derived.stats.energy));
+        }
     }
 
     /// Разовое «успокоение» характеристик (фаза G).
@@ -1251,6 +1262,7 @@ impl DaemonApp {
             );
             // Яйцо не ходит (B6) — стоит, где вылупится.
             pet.set_grounded_only(self.derived.stage == Stage::Egg);
+            pet.set_sleep_scale(sleep_scale_for(self.derived.stats.energy));
             self.pet = Some(pet);
             log::info!("summon: питомец появился в ({:.0}, {:.0})", pos.x, pos.y);
         }
@@ -1300,6 +1312,7 @@ impl DaemonApp {
             pet.state = PetState::Walk;
             pet.vel = Vec2::default();
             pet.facing = Direction::Right;
+            pet.set_sleep_scale(sleep_scale_for(self.derived.stats.energy));
             self.pet = Some(pet);
             self.presence_anim = Some(PresenceAnim::RunIn {
                 dir: 1.0,
@@ -2085,6 +2098,16 @@ impl App for DaemonApp {
                 }
                 self.pointer(PointerEvent::Release(p), now)
             }
+            // Захват потерян не по воле пользователя: питомец выпадает из
+            // руки на месте, БЕЗ броска (фаза G3).
+            Event::PointerCancel(_) => {
+                if let Some(pet) = &mut self.pet {
+                    if pet.cancel_drag() {
+                        log::debug!("захват отменён — питомец выпал из руки, без броска");
+                    }
+                }
+                true
+            }
             // ПКМ по питомцу — открыть меню (B3); повторный ПКМ закрывает.
             Event::PointerMenu(p) => {
                 self.user_claim();
@@ -2309,6 +2332,16 @@ mod tests {
             "нормализация не повторяется"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Фаза G3: усталый питомец спит дольше — множитель растёт линейно
+    /// от 1 (бодрый) до 6 (энергия на нуле).
+    #[test]
+    fn tired_pet_sleeps_longer() {
+        assert_eq!(sleep_scale_for(100.0), 1.0);
+        assert_eq!(sleep_scale_for(0.0), 6.0);
+        assert!((sleep_scale_for(50.0) - 3.5).abs() < 1e-6);
+        assert_eq!(sleep_scale_for(-20.0), 6.0, "мусор клампится");
     }
 
     /// Фаза G2: к стене питомец прижимается ПЕРЕДОМ (переднее поле

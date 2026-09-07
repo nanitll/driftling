@@ -243,7 +243,9 @@ pub struct FoldCfg {
     pub pet_mood: f32,
     /// ...но не больше этого за скользящий час (анти-фарм).
     pub pet_mood_cap_hourly: f32,
-    /// Сон: энергия за минуту сна.
+    /// Сон: энергия за минуту сна. Сон на экране короткий (десятки секунд),
+    /// поэтому темп высокий: полный заряд — около семи минут сна суммарно,
+    /// иначе питомец вечно ходил бы с нулевой энергией (так и было).
     pub sleep_energy_per_min: f32,
     /// Здоровье: падение в час, пока сытость == 0 или настроение == 0.
     pub health_drop_per_hour: f32,
@@ -275,7 +277,7 @@ impl Default for FoldCfg {
             play_energy_cost: 15.0,
             pet_mood: 4.0,
             pet_mood_cap_hourly: 12.0,
-            sleep_energy_per_min: 0.8,
+            sleep_energy_per_min: 15.0,
             health_drop_per_hour: 6.0,
             health_regen_per_hour: 3.0,
             health_regen_above: 60.0,
@@ -1322,7 +1324,10 @@ mod tests {
             1,
             EventKind::Slept { minutes: 50.0 },
         ));
-        let cfg = FoldCfg::default();
+        let cfg = FoldCfg {
+            sleep_energy_per_min: 0.8,
+            ..FoldCfg::default()
+        };
         let pet = fold(&events, 540 * MIN, &cfg);
         // Один большой разрыв упёр энергию в пол 20, сон вернул 50*0.8.
         assert_eq!(pet.stats.energy, 60.0);
@@ -1331,6 +1336,34 @@ mod tests {
         events.push(ev(542 * MIN, EventKind::Slept { minutes: -5.0 }));
         let pet = fold(&events, 542 * MIN, &cfg);
         assert!(approx(pet.stats.energy, 100.0 - 100.0 / 600.0, 0.01));
+    }
+
+    /// Дефолтный темп сна: короткий экранный сон реально заряжает —
+    /// полминуты дают ощутимую прибавку, семь минут суммарно — полный бак.
+    #[test]
+    fn default_sleep_rate_charges_fast() {
+        let cfg = FoldCfg::default();
+        let mut events = vec![genesis(0), ev(540 * MIN, EventKind::PutToSleep)];
+        events.push(ev_on(
+            "test",
+            540 * MIN,
+            1,
+            EventKind::Slept { minutes: 0.5 },
+        ));
+        let pet = fold(&events, 540 * MIN, &cfg);
+        assert!(
+            pet.stats.energy >= 27.0,
+            "полминуты сна: {}",
+            pet.stats.energy
+        );
+        events.push(ev_on(
+            "test",
+            540 * MIN,
+            2,
+            EventKind::Slept { minutes: 7.0 },
+        ));
+        let pet = fold(&events, 540 * MIN, &cfg);
+        assert_eq!(pet.stats.energy, 100.0, "семь минут — полный заряд");
     }
 
     // ---- fold: здоровье и болезнь ----
