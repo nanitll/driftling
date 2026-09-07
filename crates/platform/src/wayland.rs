@@ -91,6 +91,10 @@ use crate::render::{compose, content_key, local_input_rects, scene_bounds, Conte
 use crate::supervise::{self, pace_delay, Outcome};
 use crate::{App, Event, Scene};
 
+/// Сколько ждать возвращения курсора после Leave при зажатой кнопке,
+/// прежде чем счесть захват потерянным.
+const LEAVE_GRACE: Duration = Duration::from_millis(150);
+
 /// Страховка от голодания frame callback'ов: дросселирование перерисовок
 /// по callback'у экономит энергию, но KWin 6.3 на выходе, целиком накрытом
 /// максимизированным окном (режим прямого сканаута), может вообще не слать
@@ -221,6 +225,7 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
         current_output: None,
         last_geometry: None,
         pressed: false,
+        leave_pending: None,
         last_pointer: Vec2::default(),
         exit: false,
         lost: None,
@@ -240,6 +245,7 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
             last_content: None,
             last_pos: None,
             last_input: Vec::new(),
+            anchor_input_full: false,
         },
     };
 
@@ -288,6 +294,11 @@ struct Backend {
 
     /// Кнопка (BTN_LEFT) зажата — идёт implicit grab.
     pressed: bool,
+    /// Курсор ушёл с наших поверхностей при зажатой кнопке. Это ещё не
+    /// потеря захвата: при быстром махе указатель перескакивает со
+    /// спрайта на якорь (Leave + Enter в соседних кадрах). Отмена — только
+    /// если за LEAVE_GRACE никто не вернулся.
+    leave_pending: Option<Instant>,
     /// Последняя позиция указателя в логических экранных координатах —
     /// точка синтетического Release при Leave во время grab.
     last_pointer: Vec2,
@@ -327,6 +338,9 @@ struct Renderer {
     last_content: Option<ContentKey>,
     /// Последняя выставленная позиция субповерхности (логические координаты).
     last_pos: Option<(i32, i32)>,
+    /// Якорь ловит мышь на всём выходе (только на время захвата, см.
+    /// set_anchor_input).
+    anchor_input_full: bool,
     /// Последний выставленный input region в локальных координатах питомца.
     last_input: Vec<(i32, i32, i32, i32)>,
 }
@@ -351,6 +365,32 @@ impl Renderer {
     }
 
     /// Переключить режим якоря (весь выход <-> 1x1). Новый буфер придёт
+    /// Input region якоря: на время перетаскивания — весь выход, иначе
+    /// пусто. Смысл: спрайт едет за курсором с опозданием на кадр, и при
+    /// резком махе указатель выскакивает из его input region — композитор
+    /// уводит фокус, Motion/Release больше не приходят, бросок теряется.
+    /// Пока кнопка зажата, под курсором всегда наша поверхность — события
+    /// идут непрерывно, и «пулять» можно как угодно резко. Вне захвата
+    /// якорь по-прежнему прозрачен для мыши.
+    fn set_anchor_input(&mut self, full: bool) {
+        if self.anchor_input_full == full || !self.parent_mapped {
+            return;
+        }
+        self.anchor_input_full = full;
+        match Region::new(&self.compositor) {
+            Ok(region) => {
+                if full {
+                    region.add(0, 0, i32::MAX / 2, i32::MAX / 2);
+                }
+                self.layer
+                    .wl_surface()
+                    .set_input_region(Some(region.wl_region()));
+                self.layer.commit();
+            }
+            Err(e) => log::error!("wl_region якоря: {e}"),
+        }
+    }
+
     /// со следующим configure (anchor_configured); вызов идемпотентен.
     fn set_anchor_full(&mut self, full: bool) {
         if self.anchor_full == full {
@@ -561,6 +601,18 @@ impl Backend {
         if self.exit || self.lost.is_some() {
             self.loop_signal.stop();
             return;
+        }
+        // Захват потерян по-настоящему: курсор ушёл и не вернулся.
+        if self.pressed
+            && self
+                .leave_pending
+                .is_some_and(|t| t.elapsed() >= LEAVE_GRACE)
+        {
+            self.pressed = false;
+            self.leave_pending = None;
+            self.renderer.set_anchor_input(false);
+            log::debug!("указатель ушёл при зажатой кнопке и не вернулся — захват отменён");
+            self.deliver(Event::PointerCancel(self.last_pointer));
         }
         let now = self.now();
         // Scene заимствует self.app; renderer — отдельное поле, конфликта нет.
@@ -823,14 +875,24 @@ impl PointerHandler for Backend {
         events: &[PointerEvent],
     ) {
         for event in events {
-            // Мышь ловит только поверхность питомца (у якоря пустой регион).
-            if event.surface != self.renderer.pet_surface {
+            // Мышь ловит поверхность питомца, а на время захвата — и якорь
+            // (см. Renderer::set_anchor_input). Якорь растянут на весь
+            // выход от (0, 0): его локальные координаты и есть экранные.
+            let on_pet = event.surface == self.renderer.pet_surface;
+            let on_anchor = event.surface == *self.renderer.layer.wl_surface();
+            if !on_pet && !on_anchor {
                 continue;
             }
-            let pos = to_screen(event.position, self.renderer.last_pos.unwrap_or((0, 0)));
+            let pos = if on_pet {
+                to_screen(event.position, self.renderer.last_pos.unwrap_or((0, 0)))
+            } else {
+                Vec2::new(event.position.0 as f32, event.position.1 as f32)
+            };
             let ev = match event.kind {
-                // Enter несёт позицию — отдаём как движение.
+                // Enter несёт позицию — отдаём как движение. Вернулся на
+                // наши поверхности — уход отменяется.
                 PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                    self.leave_pending = None;
                     self.last_pointer = pos;
                     Event::PointerMotion(pos)
                 }
@@ -838,14 +900,18 @@ impl PointerHandler for Backend {
                     button: BTN_LEFT, ..
                 } => {
                     self.pressed = true;
+                    self.leave_pending = None;
                     self.last_pointer = pos;
+                    self.renderer.set_anchor_input(true);
                     Event::PointerPress(pos)
                 }
                 PointerEventKind::Release {
                     button: BTN_LEFT, ..
                 } => {
                     self.pressed = false;
+                    self.leave_pending = None;
                     self.last_pointer = pos;
+                    self.renderer.set_anchor_input(false);
                     Event::PointerRelease(pos)
                 }
                 // ПКМ — контекстное меню (ТД-9; само меню — фаза B).
@@ -855,17 +921,16 @@ impl PointerHandler for Backend {
                     self.last_pointer = pos;
                     Event::PointerMenu(pos)
                 }
-                // Уход курсора при зажатой кнопке: если композитор разорвал
-                // implicit grab (input region уехал из-под курсора между
-                // кадрами), Motion/Release уже не придут — без этого питомец
-                // вечно висел бы в Dragged (ТД-5). Но и БРОСАТЬ его нельзя:
-                // пользователь кнопку не отпускал, а питомец улетал бы сам
-                // (жалоба «держу мышкой — не должна вылетать»). Поэтому
-                // отмена, а не отпускание: выпадает из руки на месте.
+                // Уход курсора при зажатой кнопке. Обычно это перескок со
+                // спрайта на якорь — следом придёт Enter, и всё продолжится.
+                // Настоящая потеря захвата (композитор увёл фокус) решается
+                // по таймеру в tick_and_draw: отмена без броска (ТД-5 +
+                // «держу мышкой — не должна вылетать сама»).
                 PointerEventKind::Leave { .. } if self.pressed => {
-                    self.pressed = false;
-                    log::debug!("указатель ушёл при зажатой кнопке — захват отменён");
-                    Event::PointerCancel(self.last_pointer)
+                    if self.leave_pending.is_none() {
+                        self.leave_pending = Some(Instant::now());
+                    }
+                    continue;
                 }
                 _ => continue,
             };

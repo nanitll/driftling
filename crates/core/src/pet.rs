@@ -127,6 +127,11 @@ pub struct Pet {
     /// Множитель длительности сна (фаза G3): уставший питомец спит дольше.
     /// Ставит демон по энергии (`set_sleep_scale`); 1.0 — обычная дрёма.
     sleep_scale: f32,
+    /// Подскок после удара, ожидающий конца сплющивания (Landing): тело
+    /// сначала сминается о пол и лишь потом отпружинивает. None — не ждём.
+    pending_bounce: Option<Vec2>,
+    /// Подскок уже был: мягкое тело прыгает один раз, дальше только катится.
+    bounced: bool,
     /// Угол кувырка, рад (фаза G3): тело в полёте и при качении вращается.
     spin: f32,
     /// Угловая скорость, рад/с.
@@ -163,6 +168,8 @@ impl Pet {
             sleep_on_land: false,
             wall_trip: false,
             sleep_scale: 1.0,
+            pending_bounce: None,
+            bounced: false,
             spin: 0.0,
             spin_vel: 0.0,
         }
@@ -331,6 +338,13 @@ impl Pet {
                 // Шишка о потолок: короткое оглушение в воздухе, дальше вниз.
                 if self.state_time >= self.state_left {
                     self.vel = Vec2::new(self.vel.x * 0.3, 0.0);
+                    self.enter(PetState::Falling);
+                    self.state_left = f32::INFINITY;
+                }
+            }
+            PetState::Landing if self.pending_bounce.is_some() => {
+                if self.state_time >= self.state_left {
+                    self.vel = self.pending_bounce.take().unwrap_or_default();
                     self.enter(PetState::Falling);
                     self.state_left = f32::INFINITY;
                 }
@@ -563,17 +577,24 @@ impl Pet {
         let impact = self.vel.y;
         self.surface = Surface::Floor;
 
-        // Отскок: доля скорости возвращается назад, пока удар достаточно
-        // силён. Команда «спать» отскоки отменяет — питомца кладут.
+        // Подскок: мягкое тело сминается о пол и один раз невысоко
+        // отпружинивает — только после сильного удара, и не повторно
+        // (иначе получается резиновый мяч). Команда «спать» подскок
+        // отменяет — питомца кладут.
         let bounce = impact * self.cfg.body.restitution;
         let bounce_floor = self.cfg.body.mps_to_px(self.cfg.body.bounce_floor_mps);
-        if !self.sleep_on_land && bounce > bounce_floor {
-            self.vel.y = -bounce;
-            // Часть горизонтального хода съедает удар о пол.
-            self.vel.x *= 0.82;
-            self.spin_vel *= 0.8;
-            return; // остаёмся в Falling — это ещё полёт
+        if !self.sleep_on_land && !self.bounced && bounce > bounce_floor {
+            self.bounced = true;
+            // Сначала сплющивание (кадр Landing), подскок — по его окончании.
+            self.pending_bounce = Some(Vec2::new(self.vel.x * 0.7, -bounce));
+            self.vel = Vec2::default();
+            self.spin_vel = 0.0;
+            self.spin = 0.0;
+            self.enter(PetState::Landing);
+            self.state_left = 0.09;
+            return;
         }
+        self.bounced = false;
 
         self.vel.y = 0.0;
         if self.sleep_on_land {
@@ -817,6 +838,8 @@ impl Pet {
                     // при этом снимаем: в руках он всегда «ногами вниз».
                     self.switch_surface(Surface::Floor);
                     self.sleep_on_land = false;
+                    self.pending_bounce = None;
+                    self.bounced = false;
                     // Смещение от текущей позиции питомца, чтобы он не
                     // прыгал под курсор.
                     self.drag_offset = Vec2::new(self.pos.x - p.x, self.pos.y - p.y);
@@ -1108,13 +1131,14 @@ mod tests {
         // Два одинаковых питомца: один тикает крупно, другой мелко.
         let mut coarse = pet();
         let mut fine = pet();
-        for _ in 0..2 {
+        for _ in 0..4 {
             coarse.tick(&w, 1.5);
         }
-        for _ in 0..60 {
+        for _ in 0..120 {
             fine.tick(&w, 0.05);
         }
-        // За 3 с падения оба обязаны долететь до земли без пролёта.
+        // За 6 с оба обязаны долететь до земли без пролёта и осесть после
+        // подскока (крупный шаг проводит подскок на тик позже мелкого).
         assert_eq!(coarse.pos.y, w.ground_y());
         assert_eq!(fine.pos.y, w.ground_y());
         // Состояния после приземления сравнивать нельзя: у крупного шага
@@ -1682,9 +1706,9 @@ mod tests {
         p.cfg.w_wall_climb = 0;
         p.cfg.w_wall_trip = 0;
         p.cfg.wall_grab_mps = f32::INFINITY;
-        // Бросок вбок с высоты: должен быть отскок, потом качение.
+        // Сильный бросок вбок и вниз: должен быть один подскок, потом качение.
         p.pos = Vec2::new(600.0, 300.0);
-        p.vel = Vec2::new(500.0, 200.0);
+        p.vel = Vec2::new(500.0, 1400.0);
         p.state = PetState::Falling;
         let ground = w.ground_y();
         let (mut bounced, mut rolled) = (false, false);
@@ -1700,7 +1724,7 @@ mod tests {
             }
             rolled |= p.state == PetState::Roll;
         }
-        assert!(bounced, "тело не отскочило от пола");
+        assert!(bounced, "тело не подскочило после удара");
         assert!(rolled, "тело не покатилось после удара");
         assert_eq!(p.pos.y, ground, "в итоге лежит на полу");
         assert!(

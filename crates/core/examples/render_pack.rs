@@ -137,7 +137,7 @@ impl Canvas {
 /// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
 /// наведённой кнопкой и мини-шкалами, плюс фаза появления.
 fn radial(pack: &Pack, out: &Path) {
-    use driftling_core::radial::{radial_frame, radial_layout, Icon, RadialItem};
+    use driftling_core::radial::{radial_frame, Icon, RadialItem};
     const PET: u32 = 96;
     let items: Vec<RadialItem> = [
         (Icon::Cookie, "Покормить"),
@@ -153,24 +153,58 @@ fn radial(pack: &Pack, out: &Path) {
         label: l.to_string(),
     })
     .collect();
-    let layout = radial_layout(items.len(), PET as f32);
+    use driftling_core::radial::radial_layout_in;
+    use driftling_core::{Rect, Vec2};
     let idle = pack.frames(Stage::Adult, "idle", PET, DEFAULT_PET_COLOR);
     let accent = DEFAULT_PET_COLOR;
     let stats = Some([72.0, 35.0, 88.0]);
-    for (name, bg, hovered, grow) in [
-        ("radial_light", LIGHT_BG, Some(0usize), 1.0f32),
-        ("radial_dark", DARK_BG, Some(3), 1.0),
-        ("radial_grow", DARK_BG, None, 0.45),
+    let half = PET as f32 / 2.0;
+    // Экран-«комната» 520x400: питомец в чистом поле, у пола, в углу и под
+    // потолком — меню обязано красиво уместиться в каждом случае.
+    let room = Rect::new(0.0, 0.0, 520.0, 400.0);
+    for (name, bg, center, hovered, grow) in [
+        (
+            "radial_light",
+            LIGHT_BG,
+            Vec2::new(260.0, 200.0),
+            Some(0usize),
+            1.0f32,
+        ),
+        (
+            "radial_dark",
+            DARK_BG,
+            Vec2::new(260.0, 200.0),
+            Some(3),
+            1.0,
+        ),
+        ("radial_grow", DARK_BG, Vec2::new(260.0, 200.0), None, 0.45),
+        (
+            "radial_floor",
+            DARK_BG,
+            Vec2::new(260.0, 400.0 - half),
+            Some(2),
+            1.0,
+        ),
+        (
+            "radial_corner",
+            DARK_BG,
+            Vec2::new(half, 400.0 - half),
+            Some(1),
+            1.0,
+        ),
+        (
+            "radial_ceiling",
+            DARK_BG,
+            Vec2::new(260.0, half),
+            Some(4),
+            1.0,
+        ),
     ] {
-        let mut c = Canvas::new(layout.side, layout.side, bg);
-        // Питомец в центре кольца (опорная точка — низ спрайта).
-        c.blit(
-            &idle[0],
-            (layout.center.x - PET as f32 / 2.0) as u32,
-            (layout.center.y - PET as f32 / 2.0) as u32,
-        );
+        let layout = radial_layout_in(items.len(), PET as f32, center, room);
+        let mut c = Canvas::new(room.w as u32, room.h as u32, bg);
+        c.blit(&idle[0], (center.x - half) as u32, (center.y - half) as u32);
         let menu = radial_frame(&layout, &items, hovered, grow, stats, 13.0, accent);
-        c.blit_alpha(&menu, 0, 0);
+        c.blit_alpha(&menu, layout.origin.x as u32, layout.origin.y as u32);
         c.save(&out.join(format!("{name}.png")));
     }
     println!("пруф радиального меню записан в {}", out.display());

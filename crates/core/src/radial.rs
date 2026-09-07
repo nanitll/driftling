@@ -45,64 +45,241 @@ pub struct RadialItem {
     pub label: String,
 }
 
-/// Геометрия кольца в координатах кадра меню.
+/// Геометрия меню в координатах кадра. Кадр — прямоугольник на экране
+/// (`origin`, `w`×`h`), уже уместившийся в экран; питомец может быть и вне
+/// кадра (у стены кольцо превращается в дугу с его стороны).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadialLayout {
-    /// Сторона квадратного кадра, px.
-    pub side: u32,
-    /// Центр кольца (он же центр питомца) в координатах кадра.
+    /// Левый верх кадра на экране.
+    pub origin: Vec2,
+    pub w: u32,
+    pub h: u32,
+    /// Центр питомца в координатах кадра (из него растут кнопки).
     pub center: Vec2,
-    /// Радиус кольца до центров кнопок.
+    /// Радиус дуги до центров кнопок.
     pub ring_r: f32,
     /// Радиус кнопки.
     pub petal_r: f32,
-    /// Центры кнопок (полностью выросшего кольца).
+    /// Центры кнопок (полностью выросшего меню), координаты кадра.
     pub petals: Vec<Vec2>,
+    /// Левый верх капсулы мини-шкал (координаты кадра); None — места нет.
+    pub stats_at: Option<Vec2>,
 }
 
-/// Отступ под подписи и шкалы вокруг кольца, px.
-const MARGIN: f32 = 34.0;
+/// Отступ под подписи вокруг кнопок, px.
+const MARGIN: f32 = 30.0;
 /// Зазор между питомцем и кнопками, px.
 const GAP: f32 = 10.0;
+/// Отступ от края экрана, ближе которого кнопки не ставим, px.
+const EDGE_PAD: f32 = 4.0;
+/// Направлений для поиска свободного сектора вокруг питомца.
+const DIRECTIONS: usize = 72;
 
-// Палитра в языке дизайна настроек (см. text.rs) + цвета иконок.
-const PETAL_BG: u32 = 0xff_23_23_2e;
-const PETAL_STROKE: u32 = 0xff_3a_3a_4a;
-const TEXT: u32 = 0xff_e8_e8_f0;
-const COOKIE: u32 = 0xff_d9_a0_66;
-const COOKIE_DOT: u32 = 0xff_5a_3a_22;
-const CANDY: u32 = 0xff_f0_8a_b8;
-const BALL: u32 = 0xff_f4_f4_f8;
-const MOON: u32 = 0xff_f2_d4_7a;
-const GEAR: u32 = 0xff_b8_b8_c8;
-const CROSS: u32 = 0xff_e0_6a_6a;
-const BAR_TRACK: u32 = 0xff_3a_3a_4a;
-const BAR_SATIETY: u32 = 0xff_d9_a0_66;
-const BAR_ENERGY: u32 = 0xff_f2_d4_7a;
-const BAR_MOOD: u32 = 0xff_f0_8a_b8;
+/// Размер капсулы мини-шкал (ширина, высота) при радиусе кнопки `petal_r`.
+fn stats_pill_size(petal_r: f32) -> (f32, f32) {
+    let bar_w = (petal_r * 2.8).round();
+    (bar_w + 12.0, 3.0 * 4.0 + 2.0 * 3.0 + 10.0)
+}
 
-/// Разложить `n` кнопок кольцом вокруг питомца размера `pet_size`.
-/// Кольцо начинается сверху и идёт по часовой — первая кнопка над головой.
-pub fn radial_layout(n: usize, pet_size: f32) -> RadialLayout {
+fn inside(screen: Rect, c: Vec2, r: f32) -> bool {
+    c.x - r >= screen.x + EDGE_PAD
+        && c.x + r <= screen.right() - EDGE_PAD
+        && c.y - r >= screen.y + EDGE_PAD
+        && c.y + r <= screen.bottom() - EDGE_PAD
+}
+
+/// Самый длинный круговой отрезок свободных направлений: (начало, длина)
+/// в индексах массива `free`. None — свободных нет.
+fn longest_free_run(free: &[bool]) -> Option<(usize, usize)> {
+    let n = free.len();
+    if free.iter().all(|f| *f) {
+        return Some((0, n));
+    }
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < n {
+        if !free[i] {
+            i += 1;
+            continue;
+        }
+        // Начинаем только с направления, перед которым занято, чтобы
+        // круговые отрезки не считались дважды.
+        if free[(i + n - 1) % n] {
+            i += 1;
+            continue;
+        }
+        let mut len = 0;
+        while len < n && free[(i + len) % n] {
+            len += 1;
+        }
+        if best.is_none_or(|(_, l)| len > l) {
+            best = Some((i, len));
+        }
+        i += 1;
+    }
+    best
+}
+
+/// Разложить `n` кнопок вокруг питомца с центром `pet_center` (экранные
+/// координаты) размера `pet_size`, не вылезая за `screen`.
+///
+/// В чистом поле — полное кольцо, первая кнопка над головой. У стены или
+/// в углу свободного места на кольцо нет: кнопки раскладываются ДУГОЙ в
+/// самом широком свободном секторе, а радиус дуги растёт, пока соседние
+/// кнопки не перестанут наезжать друг на друга. Так меню у пола — веер
+/// над питомцем, в углу — четверть окружности наружу.
+pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect) -> RadialLayout {
+    let n = n.max(1);
     let petal_r = (pet_size * 0.26).clamp(15.0, 24.0);
-    let ring_r = pet_size * 0.72 + GAP + petal_r;
-    let half = ring_r + petal_r + MARGIN;
-    let side = (half * 2.0).ceil() as u32;
-    let center = Vec2::new(half, half);
-    let petals = (0..n.max(1))
-        .map(|i| {
-            let a =
-                -core::f32::consts::FRAC_PI_2 + i as f32 * core::f32::consts::TAU / n.max(1) as f32;
-            Vec2::new(center.x + ring_r * a.cos(), center.y + ring_r * a.sin())
+    let base_r = pet_size * 0.72 + GAP + petal_r;
+    let step = core::f32::consts::TAU / DIRECTIONS as f32;
+    let start_angle = -core::f32::consts::FRAC_PI_2;
+
+    let mut chosen: Option<(f32, Vec<f32>)> = None;
+    let mut fallback: Option<(f32, Vec<f32>)> = None;
+    for k in [1.0f32, 1.15, 1.3, 1.5, 1.75, 2.0, 2.3] {
+        let r = base_r * k;
+        let free: Vec<bool> = (0..DIRECTIONS)
+            .map(|i| {
+                let a = start_angle + i as f32 * step;
+                let c = Vec2::new(pet_center.x + r * a.cos(), pet_center.y + r * a.sin());
+                inside(screen, c, petal_r + 2.0)
+            })
+            .collect();
+        let Some((from, len)) = longest_free_run(&free) else {
+            continue;
+        };
+        let angles: Vec<f32> = if len == DIRECTIONS {
+            (0..n)
+                .map(|i| start_angle + i as f32 * core::f32::consts::TAU / n as f32)
+                .collect()
+        } else {
+            let span = len as f32 * step;
+            let a0 = start_angle + from as f32 * step;
+            (0..n)
+                .map(|i| a0 + (i as f32 + 0.5) * span / n as f32)
+                .collect()
+        };
+        // Соседние кнопки не должны наезжать: хорда между центрами.
+        let spacing = if len == DIRECTIONS {
+            core::f32::consts::TAU / n as f32
+        } else {
+            len as f32 * step / n as f32
+        };
+        let chord = 2.0 * r * (spacing / 2.0).sin();
+        if fallback.is_none() || len == DIRECTIONS {
+            fallback = Some((r, angles.clone()));
+        }
+        if chord >= petal_r * 2.15 {
+            chosen = Some((r, angles));
+            break;
+        }
+        fallback = Some((r, angles));
+    }
+    let (ring_r, angles) = chosen.or(fallback).unwrap_or_else(|| {
+        (
+            base_r,
+            (0..n)
+                .map(|i| start_angle + i as f32 * core::f32::consts::TAU / n as f32)
+                .collect(),
+        )
+    });
+
+    // Центры кнопок в экранных координатах.
+    let screen_petals: Vec<Vec2> = angles
+        .iter()
+        .map(|a| {
+            Vec2::new(
+                pet_center.x + ring_r * a.cos(),
+                pet_center.y + ring_r * a.sin(),
+            )
         })
         .collect();
+
+    // Капсула шкал: над питомцем внутри кольца, иначе под ним, иначе — за
+    // дугой по её середине (у потолка дуга смотрит вниз — и капсула под
+    // ней). Берётся первое место, где она умещается в экран и не ложится
+    // на кнопки.
+    let (pw, ph) = stats_pill_size(petal_r);
+    let half = pet_size / 2.0;
+    let mid_angle = if angles.len() == n
+        && angles
+            .last()
+            .is_some_and(|a| a - angles[0] > core::f32::consts::PI * 1.5)
+    {
+        start_angle // полное кольцо: середина — над головой
+    } else {
+        (angles[0] + angles[n - 1]) / 2.0
+    };
+    let beyond = ring_r + petal_r + 10.0 + ph.max(pw) / 2.0;
+    let behind_arc = Vec2::new(
+        pet_center.x + beyond * mid_angle.cos() - pw / 2.0,
+        pet_center.y + beyond * mid_angle.sin() - ph / 2.0,
+    );
+    let candidates = [
+        Vec2::new(pet_center.x - pw / 2.0, pet_center.y - half - ph - 8.0),
+        Vec2::new(pet_center.x - pw / 2.0, pet_center.y + half + 8.0),
+        behind_arc,
+        Vec2::new(pet_center.x - half - pw - 8.0, pet_center.y - ph / 2.0),
+        Vec2::new(pet_center.x + half + 8.0, pet_center.y - ph / 2.0),
+    ];
+    let stats_screen = candidates.into_iter().find(|p| {
+        let rect = Rect::new(p.x, p.y, pw, ph);
+        let in_screen = rect.x >= screen.x + EDGE_PAD
+            && rect.y >= screen.y + EDGE_PAD
+            && rect.right() <= screen.right() - EDGE_PAD
+            && rect.bottom() <= screen.bottom() - EDGE_PAD;
+        let clear = screen_petals.iter().all(|c| {
+            // Ближайшая точка прямоугольника к центру кнопки.
+            let nx = c.x.clamp(rect.x, rect.right());
+            let ny = c.y.clamp(rect.y, rect.bottom());
+            (c.x - nx).hypot(c.y - ny) > petal_r * 1.2 + 2.0
+        });
+        in_screen && clear
+    });
+
+    // Кадр: охват кнопок (с запасом на рост при наведении и подписи) и
+    // капсулы, обрезанный по экрану.
+    let reach = petal_r * 1.15 + MARGIN;
+    let mut x0 = f32::MAX;
+    let mut y0 = f32::MAX;
+    let mut x1 = f32::MIN;
+    let mut y1 = f32::MIN;
+    for c in &screen_petals {
+        x0 = x0.min(c.x - reach);
+        y0 = y0.min(c.y - reach);
+        x1 = x1.max(c.x + reach);
+        y1 = y1.max(c.y + reach);
+    }
+    if let Some(p) = stats_screen {
+        x0 = x0.min(p.x - 2.0);
+        y0 = y0.min(p.y - 2.0);
+        x1 = x1.max(p.x + pw + 2.0);
+        y1 = y1.max(p.y + ph + 2.0);
+    }
+    x0 = x0.max(screen.x).floor();
+    y0 = y0.max(screen.y).floor();
+    x1 = x1.min(screen.right()).ceil();
+    y1 = y1.min(screen.bottom()).ceil();
+    let origin = Vec2::new(x0, y0);
+    let to_frame = |p: Vec2| Vec2::new(p.x - origin.x, p.y - origin.y);
+
     RadialLayout {
-        side,
-        center,
+        origin,
+        w: (x1 - x0).max(1.0) as u32,
+        h: (y1 - y0).max(1.0) as u32,
+        center: to_frame(pet_center),
         ring_r,
         petal_r,
-        petals,
+        petals: screen_petals.into_iter().map(to_frame).collect(),
+        stats_at: stats_screen.map(to_frame),
     }
+}
+
+/// Раскладка в чистом поле (без ограничений экрана) — для превью и тестов.
+pub fn radial_layout(n: usize, pet_size: f32) -> RadialLayout {
+    let big = Rect::new(-1.0e5, -1.0e5, 2.0e5, 2.0e5);
+    radial_layout_in(n, pet_size, Vec2::new(0.0, 0.0), big)
 }
 
 /// Плавное появление: ease-out, чтобы кольцо «выстреливало» и мягко
@@ -123,7 +300,7 @@ fn petal_at(layout: &RadialLayout, i: usize, grow: f32) -> (Vec2, f32) {
     )
 }
 
-/// Индекс кнопки под точкой `local` (координаты кадра) у выросшего кольца.
+/// Индекс кнопки под точкой `local` (координаты кадра) у выросшего меню.
 /// Захват чуть шире самой кнопки — попадать пальцем/мышью должно быть легко.
 pub fn radial_hit(layout: &RadialLayout, local: Vec2) -> Option<usize> {
     let reach = layout.petal_r * 1.35;
@@ -136,6 +313,22 @@ pub fn radial_hit(layout: &RadialLayout, local: Vec2) -> Option<usize> {
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i)
 }
+
+// Палитра в языке дизайна настроек (см. text.rs) + цвета иконок.
+const PETAL_BG: u32 = 0xff_23_23_2e;
+const PETAL_STROKE: u32 = 0xff_3a_3a_4a;
+const TEXT: u32 = 0xff_e8_e8_f0;
+const COOKIE: u32 = 0xff_d9_a0_66;
+const COOKIE_DOT: u32 = 0xff_5a_3a_22;
+const CANDY: u32 = 0xff_f0_8a_b8;
+const BALL: u32 = 0xff_f4_f4_f8;
+const MOON: u32 = 0xff_f2_d4_7a;
+const GEAR: u32 = 0xff_b8_b8_c8;
+const CROSS: u32 = 0xff_e0_6a_6a;
+const BAR_TRACK: u32 = 0xff_3a_3a_4a;
+const BAR_SATIETY: u32 = 0xff_d9_a0_66;
+const BAR_ENERGY: u32 = 0xff_f2_d4_7a;
+const BAR_MOOD: u32 = 0xff_f0_8a_b8;
 
 // ---- Примитивы -----------------------------------------------------------
 
@@ -365,17 +558,16 @@ fn draw_icon(frame: &mut Frame, icon: Icon, c: Vec2, s: f32, accent: u32) {
     }
 }
 
-/// Пилюля с текстом: тёмная капсула, текст по центру. Возвращает её рамку.
-fn label_pill(frame: &mut Frame, text: &str, px: f32, anchor: Vec2, below: bool) -> Rect {
+/// Пилюля с текстом: тёмная капсула, текст по центру, центр капсулы в
+/// `at` (прижимается внутрь кадра). Возвращает её рамку.
+fn label_pill(frame: &mut Frame, text: &str, px: f32, at: Vec2) -> Rect {
     let (tw, th) = measure(text, px);
     let pad_x = (px * 0.6).round();
     let pad_y = (px * 0.3).round();
     let w = tw + 2.0 * pad_x;
     let h = th + 2.0 * pad_y;
-    let x = (anchor.x - w / 2.0).clamp(1.0, (frame.w as f32 - w - 1.0).max(1.0));
-    let y =
-        if below { anchor.y } else { anchor.y - h }.clamp(1.0, (frame.h as f32 - h - 1.0).max(1.0));
-    // Капсула: два диска + линия между ними.
+    let x = (at.x - w / 2.0).clamp(1.0, (frame.w as f32 - w - 1.0).max(1.0));
+    let y = (at.y - h / 2.0).clamp(1.0, (frame.h as f32 - h - 1.0).max(1.0));
     let r = h / 2.0;
     line(
         frame,
@@ -388,15 +580,13 @@ fn label_pill(frame: &mut Frame, text: &str, px: f32, anchor: Vec2, below: bool)
     Rect::new(x, y, w, h)
 }
 
-/// Мини-шкалы над кольцом: три полоски в капсуле.
-fn stats_pill(frame: &mut Frame, layout: &RadialLayout, stats: [f32; 3], accent: u32) {
+/// Мини-шкалы: три полоски в капсуле там, куда их положила раскладка.
+fn stats_pill(frame: &mut Frame, layout: &RadialLayout, at: Vec2, stats: [f32; 3], accent: u32) {
     let bar_w = (layout.petal_r * 2.8).round();
     let bar_h = 4.0;
     let gap = 3.0;
-    let w = bar_w + 12.0;
-    let h = 3.0 * bar_h + 2.0 * gap + 10.0;
-    let x = layout.center.x - w / 2.0;
-    let y = (layout.center.y - layout.ring_r - layout.petal_r - h - 6.0).max(1.0);
+    let (w, h) = stats_pill_size(layout.petal_r);
+    let (x, y) = (at.x, at.y);
     let r = 6.0;
     line(
         frame,
@@ -448,7 +638,7 @@ pub fn radial_frame(
     px: f32,
     accent: u32,
 ) -> Frame {
-    let mut frame = transparent(layout.side, layout.side);
+    let mut frame = transparent(layout.w.max(1), layout.h.max(1));
     let grown = grow >= 1.0;
     for (i, item) in items.iter().enumerate().take(layout.petals.len()) {
         let (c, mut r) = petal_at(layout, i, grow);
@@ -487,13 +677,20 @@ pub fn radial_frame(
     if grown {
         if let Some(i) = hovered.filter(|&i| i < items.len()) {
             let (c, r) = petal_at(layout, i, 1.0);
-            // Подпись снаружи кольца: у верхних кнопок — над, у нижних — под.
-            let below = c.y >= layout.center.y;
-            let anchor = Vec2::new(c.x, if below { c.y + r + 4.0 } else { c.y - r - 4.0 });
-            label_pill(&mut frame, &items[i].label, px, anchor, below);
+            // Подпись снаружи, по лучу от питомца через кнопку; у стены
+            // луч упирается в край — пилюля прижмётся внутрь кадра.
+            let (dx, dy) = (c.x - layout.center.x, c.y - layout.center.y);
+            let len = dx.hypot(dy).max(1.0);
+            let (ux, uy) = (dx / len, dy / len);
+            let (tw, th) = measure(&items[i].label, px);
+            // Полуразмер пилюли вдоль луча: чтобы она не легла на кнопку.
+            let half_along = ux.abs() * (tw / 2.0 + px * 0.6) + uy.abs() * (th / 2.0 + px * 0.3);
+            let off = r + 6.0 + half_along;
+            let at = Vec2::new(c.x + ux * off, c.y + uy * off);
+            label_pill(&mut frame, &items[i].label, px, at);
         }
-        if let Some(s) = stats {
-            stats_pill(&mut frame, layout, s, accent);
+        if let (Some(s), Some(at)) = (stats, layout.stats_at) {
+            stats_pill(&mut frame, layout, at, s, accent);
         }
     }
     frame
@@ -540,6 +737,69 @@ mod tests {
         assert!(l.petals[0].y < l.center.y);
     }
 
+    /// У пола кольцу места нет: кнопки ложатся веером НАД питомцем, все
+    /// внутри экрана и не наезжают друг на друга.
+    #[test]
+    fn near_the_floor_buttons_fan_out_above() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let pet = 96.0;
+        let center = Vec2::new(960.0, 1080.0 - pet / 2.0);
+        let l = radial_layout_in(6, pet, center, screen);
+        assert_eq!(l.petals.len(), 6);
+        for p in &l.petals {
+            let sp = Vec2::new(p.x + l.origin.x, p.y + l.origin.y);
+            assert!(sp.y + l.petal_r <= 1080.0, "кнопка ниже экрана: {sp:?}");
+            assert!(sp.y < center.y, "у пола кнопки должны быть над питомцем");
+        }
+        for w in l.petals.windows(2) {
+            let d = (w[0].x - w[1].x).hypot(w[0].y - w[1].y);
+            assert!(d >= l.petal_r * 2.0, "кнопки наезжают: {d}");
+        }
+        // Кадр целиком в экране.
+        assert!(l.origin.y >= 0.0 && l.origin.y + l.h as f32 <= 1080.0);
+    }
+
+    /// В углу — четверть дуги наружу, радиус подрастает, чтобы шесть
+    /// кнопок поместились; ничего не уходит за экран.
+    #[test]
+    fn in_a_corner_buttons_arc_outward() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let pet = 96.0;
+        let center = Vec2::new(pet / 2.0, 1080.0 - pet / 2.0);
+        let l = radial_layout_in(6, pet, center, screen);
+        let ring_free = radial_layout(6, pet).ring_r;
+        assert!(l.ring_r > ring_free, "радиус в углу должен вырасти");
+        for p in &l.petals {
+            let sp = Vec2::new(p.x + l.origin.x, p.y + l.origin.y);
+            assert!(
+                sp.x - l.petal_r >= 0.0 && sp.y + l.petal_r <= 1080.0,
+                "{sp:?}"
+            );
+            // Дуга смотрит вправо-вверх (крайние кнопки могут чуть заходить
+            // за вертикаль/горизонталь — это середина свободного сектора).
+            assert!(
+                sp.x >= center.x - l.petal_r && sp.y <= center.y + l.petal_r,
+                "дуга должна смотреть вправо-вверх: {sp:?}"
+            );
+        }
+        for w in l.petals.windows(2) {
+            let d = (w[0].x - w[1].x).hypot(w[0].y - w[1].y);
+            assert!(d >= l.petal_r * 2.0, "кнопки наезжают: {d}");
+        }
+    }
+
+    /// Капсула шкал ищет свободное место: над питомцем, а у потолка — под.
+    #[test]
+    fn stats_pill_finds_free_room() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let mid = radial_layout_in(6, 96.0, Vec2::new(960.0, 540.0), screen);
+        let at = mid.stats_at.expect("в центре место есть");
+        assert!(at.y < mid.center.y, "в чистом поле — над головой");
+        let top = radial_layout_in(6, 96.0, Vec2::new(960.0, 48.0), screen);
+        let at = top.stats_at.expect("под потолком место тоже есть");
+        assert!(at.y > top.center.y, "у потолка — под питомцем");
+    }
+
     /// Попадание: точка у центра кнопки — она; между кнопками и в центре
     /// кольца (на питомце) — ничего.
     #[test]
@@ -560,6 +820,7 @@ mod tests {
         let small = radial_frame(&l, &it, None, 0.2, None, 13.0, 0xff_b0_a2_94);
         let full = radial_frame(&l, &it, None, 1.0, None, 13.0, 0xff_b0_a2_94);
         assert!(ink(&small) > 0 && ink(&full) > ink(&small), "кольцо растёт");
+        assert_eq!((full.w, full.h), (l.w, l.h));
         let hovered = radial_frame(&l, &it, Some(3), 1.0, None, 13.0, 0xff_b0_a2_94);
         assert!(ink(&hovered) > ink(&full), "подпись добавила чернил");
         let hovered_early = radial_frame(&l, &it, Some(3), 0.5, None, 13.0, 0xff_b0_a2_94);

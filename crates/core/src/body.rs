@@ -66,8 +66,10 @@ impl Default for Body {
             // весит около 3.5 кг — как упитанный кот.
             density: 250.0,
             drag_coeff: 1.0,
-            restitution: 0.42,
-            bounce_floor_mps: 0.8,
+            // Мягкое тело, а не резиновый мяч: один невысокий подскок после
+            // сильного удара, и только он.
+            restitution: 0.22,
+            bounce_floor_mps: 1.6,
             roll_friction: 2.6,
             roll_stop_mps: 0.25,
             // Импульс броска рукой: 3.5 кг разгоняются примерно до 6 м/с —

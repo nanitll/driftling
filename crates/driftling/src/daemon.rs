@@ -522,6 +522,10 @@ struct Menu {
     accent: u32,
     /// Момент открытия — от него считается фаза появления кольца.
     opened_at: f64,
+    /// Центр питомца, под который посчитана раскладка (экранные координаты).
+    pet_center: Vec2,
+    /// Размер спрайта питомца на момент открытия (радиус кнопок и кольца).
+    pet_size: f32,
     /// Под какие фазу/шкалы испечён кадр (чтобы не перепекать зря).
     baked: (f32, [i32; 3]),
 }
@@ -535,8 +539,8 @@ impl Menu {
         Rect::new(
             self.origin.x,
             self.origin.y,
-            self.frame.w as f32,
-            self.frame.h as f32,
+            self.layout.w as f32,
+            self.layout.h as f32,
         )
     }
 
@@ -566,14 +570,21 @@ impl Menu {
         true
     }
 
-    /// Поставить кольцо центром на питомца, не вылезая за экран.
-    fn follow(&mut self, pet_center: Vec2, screen: &Rect) {
-        let side = self.layout.side as f32;
-        let want = Vec2::new(
-            pet_center.x - self.layout.center.x,
-            pet_center.y - self.layout.center.y,
-        );
-        self.origin = clamp_menu_origin(want, (side, side), screen);
+    /// Переложить меню вокруг питомца: у стены кольцо становится дугой,
+    /// у пола — веером над головой (core::radial). Пересчёт — только при
+    /// заметном сдвиге питомца; смена раскладки требует перепечь кадр.
+    fn relayout(&mut self, pet_center: Vec2, screen: &Rect) {
+        let moved = (pet_center.x - self.pet_center.x).hypot(pet_center.y - self.pet_center.y);
+        if moved < 1.5 && self.layout.w > 0 {
+            return;
+        }
+        self.pet_center = pet_center;
+        let layout = radial::radial_layout_in(self.items.len(), self.pet_size, pet_center, *screen);
+        if layout != self.layout {
+            self.layout = layout;
+            self.baked.0 = -1.0;
+        }
+        self.origin = self.layout.origin;
     }
 }
 
@@ -627,15 +638,6 @@ fn menu_items() -> Vec<radial::RadialItem> {
         .zip(MENU_ICONS)
         .map(|(label, icon)| radial::RadialItem { icon, label })
         .collect()
-}
-
-/// Прижать левый верхний угол меню к экрану так, чтобы меню целиком
-/// влезло (меню больше экрана — прижимаем к левому/верхнему краю).
-fn clamp_menu_origin(p: Vec2, (w, h): (f32, f32), screen: &Rect) -> Vec2 {
-    Vec2::new(
-        p.x.clamp(screen.x, (screen.right() - w).max(screen.x)),
-        p.y.clamp(screen.y, (screen.bottom() - h).max(screen.y)),
-    )
 }
 
 /// Минуты сна между моментами приложения `since` и `now`; None — сон
@@ -1231,11 +1233,12 @@ impl DaemonApp {
         if pet.state == PetState::Dragged {
             return;
         }
-        let layout = radial::radial_layout(MENU_ACTIONS.len(), self.sprites.size as f32);
+        let pet_size = self.sprites.size as f32;
         let b = pet.bounds();
         let center = Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
+        let layout = radial::radial_layout_in(MENU_ACTIONS.len(), pet_size, center, world.screen);
         let mut menu = Menu {
-            origin: Vec2::default(),
+            origin: layout.origin,
             layout,
             items: menu_items(),
             frame: Frame {
@@ -1247,9 +1250,10 @@ impl DaemonApp {
             // Подсветка — сам цвет питомца (иконки и кольцо — в его тоне).
             accent: self.derived.color,
             opened_at: now,
+            pet_center: center,
+            pet_size,
             baked: (-1.0, [0; 3]),
         };
-        menu.follow(center, &world.screen);
         menu.rebake(now, self.menu_stats());
         self.menu = Some(menu);
     }
@@ -1313,7 +1317,7 @@ impl DaemonApp {
             return;
         };
         let b = pet.bounds();
-        menu.follow(Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0), &world.screen);
+        menu.relayout(Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0), &world.screen);
         menu.rebake(now, stats);
     }
 
@@ -2895,23 +2899,6 @@ mod tests {
                 MenuAction::Settings,
                 MenuAction::Dismiss,
             ]
-        );
-    }
-
-    /// Чистая математика меню: прижатие к экрану (попадание по кнопкам
-    /// проверяется в core::radial).
-    #[test]
-    fn hover_and_clamp_math() {
-        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
-        // Правый нижний угол: меню прижимается внутрь экрана.
-        assert_eq!(
-            clamp_menu_origin(Vec2::new(1900.0, 1070.0), (200.0, 150.0), &screen),
-            Vec2::new(1720.0, 930.0)
-        );
-        // Левый верхний: не уезжает в минус.
-        assert_eq!(
-            clamp_menu_origin(Vec2::new(-5.0, -5.0), (200.0, 150.0), &screen),
-            Vec2::new(0.0, 0.0)
         );
     }
 
