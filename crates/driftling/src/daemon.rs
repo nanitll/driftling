@@ -614,14 +614,16 @@ fn intersect(a: Rect, b: Rect) -> Rect {
 }
 
 /// Сдвиг рисунка к поверхности на прозрачное поле кадра (фаза G2):
-/// на стене лапки должны касаться кромки экрана, под потолком — потолка.
-/// Под потолком кадр перевёрнут, поэтому к поверхности обращён НИЗ исходного.
+/// лапки должны касаться стены и потолка, а не висеть в пикселе от них.
+/// К поверхности всегда обращён НИЗ кадра (на стене он повёрнут, под
+/// потолком отражён), поэтому берётся нижнее поле.
 fn grip_shift(bounds: Rect, surface: Surface, inset: sprite::Inset) -> Rect {
+    let pad = inset.bottom as f32;
     let (dx, dy) = match surface {
         Surface::Floor => (0.0, 0.0),
-        Surface::WallLeft => (-(inset.left as f32), 0.0),
-        Surface::WallRight => (inset.right as f32, 0.0),
-        Surface::Ceiling => (0.0, -(inset.bottom as f32)),
+        Surface::WallLeft => (-pad, 0.0),
+        Surface::WallRight => (pad, 0.0),
+        Surface::Ceiling => (0.0, -pad),
     };
     Rect::new(bounds.x + dx, bounds.y + dy, bounds.w, bounds.h)
 }
@@ -2278,7 +2280,8 @@ mod tests {
     }
 
     /// Фаза G2: на стене и под потолком рисунок прижимается к поверхности
-    /// на прозрачное поле кадра, а на полу не сдвигается.
+    /// на нижнее поле кадра (к поверхности всегда обращены ноги), а на полу
+    /// не сдвигается.
     #[test]
     fn grip_shift_hugs_the_surface() {
         let inset = sprite::Inset {
@@ -2289,9 +2292,8 @@ mod tests {
         };
         let b = Rect::new(100.0, 200.0, 64.0, 64.0);
         assert_eq!(grip_shift(b, Surface::Floor, inset), b);
-        assert_eq!(grip_shift(b, Surface::WallLeft, inset).x, 97.0);
-        assert_eq!(grip_shift(b, Surface::WallRight, inset).x, 104.0);
-        // Под потолком кадр перевёрнут: к нему обращён низ исходного кадра.
+        assert_eq!(grip_shift(b, Surface::WallLeft, inset).x, 95.0);
+        assert_eq!(grip_shift(b, Surface::WallRight, inset).x, 105.0);
         assert_eq!(grip_shift(b, Surface::Ceiling, inset).y, 195.0);
     }
 

@@ -306,13 +306,15 @@ def shift_feet(grid: Grid, offsets: list[int]) -> Grid:
 
 
 def climb_pose(grid: Grid, paw_up: int, feet: list[int]) -> Grid:
-    """Кадр лазания: спина к нам, четыре лапки держатся за поверхность,
-    шаг по диагонали (передняя лапка тянется вверх, задняя с другой стороны
-    подтягивается).
+    """Кадр лазания по СТЕНЕ. Кадр рисуется как обычно (мордой к зрителю,
+    ногами вниз), а на стене рендер поворачивает его на четверть — питомец
+    оказывается боком, упираясь лапками в стену. Поэтому лицо здесь на
+    месте: со спины, без морды, это выглядело как чужое существо.
 
-    `paw_up`: -1 — тянется левая передняя, +1 — правая, 0 — обе вровень.
+    Лапки на кадре — «передние» (те, что после поворота тянутся вверх по
+    стене): одна цепляется выше другой, чтобы шаг читался.
     """
-    out = back_view(grid)
+    out = [row[:] for row in grid]
     an = anatomy(out)
     height = max(2, an.body_bottom - an.body_top)
     # Лапки крепим в верхней трети корпуса, где силуэт уже.
@@ -361,15 +363,16 @@ def derive(stage: str) -> dict[str, Grid]:
     # Топчется и водит антенной.
     out["wiggle_0"] = shift_rows(idle, antenna, +1)
     out["wiggle_1"] = shift_rows(src["idle_1"], antenna, -1)
-    # Держится за поверхность: спина к нам, все лапки на месте.
+    # Висит на стене без движения: все четыре лапки держат.
     out["cling_0"] = climb_pose(idle, paw_up=0, feet=[0, 0])
-    out["cling_1"] = shift_rows(climb_pose(idle, paw_up=0, feet=[0, 0]), antenna, +1)
-    # Ползёт: диагональный шаг — левая передняя с правой задней и наоборот.
-    # Лапки двигаются только вверх: вниз им некуда — там край кадра.
-    out["climb_0"] = climb_pose(idle, paw_up=-1, feet=[0, -1])
-    out["climb_1"] = climb_pose(idle, paw_up=0, feet=[0, 0])
-    out["climb_2"] = climb_pose(idle, paw_up=+1, feet=[-1, 0])
-    out["climb_3"] = climb_pose(idle, paw_up=0, feet=[0, 0])
+    out["cling_1"] = climb_pose(src["idle_1"], paw_up=0, feet=[0, 0])
+    # Лезет по стене: шаг берём из готового цикла ходьбы, добавляя
+    # цепляющиеся передние лапки. Задние двигаются только вверх — вниз
+    # им некуда, там край кадра.
+    out["climb_0"] = climb_pose(src["walk_0"], paw_up=-1, feet=[0, -1])
+    out["climb_1"] = climb_pose(src["walk_1"], paw_up=0, feet=[0, 0])
+    out["climb_2"] = climb_pose(src["walk_2"], paw_up=+1, feet=[-1, 0])
+    out["climb_3"] = climb_pose(src["walk_3"], paw_up=0, feet=[0, 0])
     # Звёздочки после удара о потолок.
     dizzy = close_eyes(src["landing_0"])
     out["dizzy_0"] = add_stars(dizzy, [(2, -7), (5, 4)])

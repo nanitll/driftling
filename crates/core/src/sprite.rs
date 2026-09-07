@@ -181,6 +181,8 @@ pub struct SpriteSet {
 
 impl SpriteSet {
     /// Пересчитать поля хвата по кадрам лазания (или отката к ходьбе).
+    /// К поверхности всегда обращены НОГИ, то есть низ кадра, — значит
+    /// прижимать питомца нужно на нижнее поле (`Inset::bottom`).
     pub fn with_grip_inset(mut self) -> Self {
         let frames = if !self.climb.is_empty() {
             &self.climb
@@ -210,6 +212,11 @@ impl SpriteSet {
             return pick(&self.egg, 1.5, t);
         }
         match look.state {
+            // Под потолком питомец ходит вверх ногами обычными кадрами:
+            // рендер отражает их по вертикали, и он идёт «на лапках».
+            PetState::Idle if look.surface == Surface::Ceiling => pick(&self.idle, 2.0, t),
+            PetState::Climb if look.surface == Surface::Ceiling => pick(&self.walk, 6.0, t),
+            // На стене — своя поза хвата, повёрнутая рендером на четверть.
             PetState::Idle if look.surface != Surface::Floor => {
                 pick_or(&self.cling, &self.idle, 1.5, t)
             }
