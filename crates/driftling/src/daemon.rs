@@ -32,10 +32,11 @@
 //!   выбирается через [`SpriteSet::frame_look`] по полному виду
 //!   ([`Look`]: состояние + стадия + настроение + оверлей). Яйцо не ходит —
 //!   [`Pet::set_grounded_only`].
-//! - **Меню ПКМ (B3)** — главный интерфейс: покормить/вкусняшка/поиграть/
-//!   уложить/настройки/убрать. Кадр меню — [`driftling_core::text::menu_frame`],
-//!   перепекается только при смене подсвеченной строки; строки меню зовут те
-//!   же обработчики, что IPC.
+//! - **Меню ПКМ (B3, радиальное с G4)** — главный интерфейс: кольцо кнопок
+//!   вокруг питомца (покормить/вкусняшка/поиграть/уложить/настройки/убрать)
+//!   с подписью у наведённой и мини-шкалами сверху — [`driftling_core::radial`].
+//!   Кадр перепекается при смене наведения, фазы появления и шкал; кольцо
+//!   едет за питомцем; кнопки зовут те же обработчики, что IPC.
 //! - **Видимый уход (B5)**: еда — оверлей [`ActionLook::Eating`]; игра и
 //!   поглаживание (клик) — «радостное» окно (семейство happy в Idle);
 //!   «Уложить спать» — [`Pet::force_sleep`]; конец любого периода сна
@@ -71,8 +72,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
-use driftling_core::palette;
 use driftling_core::physics::{self, Platform};
+use driftling_core::radial;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
     apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
@@ -95,11 +96,8 @@ const IPC_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 /// гонять его каждый кадр незачем.
 const REFOLD_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Кегль строк меню ПКМ, px (язык дизайна настроек, text::menu_frame).
-const MENU_PX: f32 = 15.0;
-/// Акцент подсветки меню: цвет питомца осветляется — на тёмной карточке
-/// сам тёмный цвет тела был бы не виден.
-const MENU_ACCENT_LIGHTEN: f32 = 1.25;
+/// Кегль подписей кнопок радиального меню ПКМ, px.
+const MENU_PX: f32 = 14.0;
 /// Кегль текста речевого пузыря, px.
 const BUBBLE_PX: f32 = 14.0;
 /// Зазор между пузырём и макушкой питомца, логические px.
@@ -509,20 +507,27 @@ struct Bubble {
     until: f64,
 }
 
-/// Открытое меню ПКМ (B3): кадр + геометрия в логических экранных координатах.
+/// Открытое меню ПКМ (B3, радиальное с фазы G4): кольцо кнопок вокруг
+/// питомца. Кадр перепекается при смене наведённой кнопки, фазы появления
+/// и мини-шкал; положение следует за питомцем каждый тик.
 struct Menu {
-    /// Левый верхний угол меню на экране (уже прижат к краям).
+    /// Левый верхний угол кадра на экране (уже прижат к краям).
     origin: Vec2,
-    /// Локализованные строки (пекутся один раз при открытии).
-    rows: Vec<String>,
-    /// Текущий кадр (перепекается только при смене hovered).
+    layout: radial::RadialLayout,
+    /// Кнопки: иконка + локализованная подпись (пекутся один раз).
+    items: Vec<radial::RadialItem>,
     frame: Frame,
-    /// Хит-области строк в координатах кадра (из text::menu_frame).
-    rects: Vec<Rect>,
     hovered: Option<usize>,
-    /// Акцент подсветки строк: осветлённый цвет питомца на момент открытия.
+    /// Акцент: цвет питомца на момент открытия.
     accent: u32,
+    /// Момент открытия — от него считается фаза появления кольца.
+    opened_at: f64,
+    /// Под какие фазу/шкалы испечён кадр (чтобы не перепекать зря).
+    baked: (f32, [i32; 3]),
 }
+
+/// Длительность появления кольца, сек.
+const MENU_GROW_SECS: f64 = 0.18;
 
 impl Menu {
     /// Прямоугольник меню в логических экранных координатах.
@@ -535,13 +540,40 @@ impl Menu {
         )
     }
 
-    /// Перепечь кадр под новую подсвеченную строку (дёшево: маленькая
-    /// карточка; вызывается только при реальной смене hovered).
-    fn rebake(&mut self) {
-        let rows: Vec<&str> = self.rows.iter().map(String::as_str).collect();
-        let (frame, rects) = text::menu_frame(&rows, self.hovered, MENU_PX, self.accent);
-        self.frame = frame;
-        self.rects = rects;
+    /// Фаза появления 0..1 к моменту `now`.
+    fn grow(&self, now: f64) -> f32 {
+        ((now - self.opened_at) / MENU_GROW_SECS).clamp(0.0, 1.0) as f32
+    }
+
+    /// Перепечь кадр под текущие фазу/наведение/шкалы, если что-то из этого
+    /// изменилось. Возвращает true, если кадр действительно новый.
+    fn rebake(&mut self, now: f64, stats: [f32; 3]) -> bool {
+        let grow = self.grow(now);
+        let key = (grow, stats.map(|v| v.round() as i32));
+        if key == self.baked && !self.frame.argb.is_empty() {
+            return false;
+        }
+        self.baked = key;
+        self.frame = radial::radial_frame(
+            &self.layout,
+            &self.items,
+            self.hovered,
+            grow,
+            Some(stats),
+            MENU_PX,
+            self.accent,
+        );
+        true
+    }
+
+    /// Поставить кольцо центром на питомца, не вылезая за экран.
+    fn follow(&mut self, pet_center: Vec2, screen: &Rect) {
+        let side = self.layout.side as f32;
+        let want = Vec2::new(
+            pet_center.x - self.layout.center.x,
+            pet_center.y - self.layout.center.y,
+        );
+        self.origin = clamp_menu_origin(want, (side, side), screen);
     }
 }
 
@@ -566,7 +598,7 @@ const MENU_ACTIONS: [MenuAction; 6] = [
     MenuAction::Dismiss,
 ];
 
-/// Локализованные подписи строк меню, в порядке [`MENU_ACTIONS`].
+/// Локализованные подписи кнопок меню, в порядке [`MENU_ACTIONS`].
 fn menu_rows() -> Vec<String> {
     vec![
         fl!("menu-feed"),
@@ -578,9 +610,23 @@ fn menu_rows() -> Vec<String> {
     ]
 }
 
-/// Индекс строки меню под точкой `local` (координаты кадра меню).
-fn hover_index(rects: &[Rect], local: Vec2) -> Option<usize> {
-    rects.iter().position(|r| r.contains(local))
+/// Иконки кнопок меню, в порядке [`MENU_ACTIONS`].
+const MENU_ICONS: [radial::Icon; 6] = [
+    radial::Icon::Cookie,
+    radial::Icon::Candy,
+    radial::Icon::Ball,
+    radial::Icon::Moon,
+    radial::Icon::Gear,
+    radial::Icon::Cross,
+];
+
+/// Кнопки радиального меню: подпись + иконка.
+fn menu_items() -> Vec<radial::RadialItem> {
+    menu_rows()
+        .into_iter()
+        .zip(MENU_ICONS)
+        .map(|(label, icon)| radial::RadialItem { icon, label })
+        .collect()
 }
 
 /// Прижать левый верхний угол меню к экрану так, чтобы меню целиком
@@ -1178,44 +1224,59 @@ impl DaemonApp {
     /// Во время drag меню не открывается: пока оно открыто, события
     /// указателя не доходят до питомца, и Release потерялся бы — питомец
     /// завис бы в Dragged (родственник ТД-5).
-    fn open_menu(&mut self, p: Vec2) {
+    fn open_menu(&mut self, now: f64) {
         let (Some(pet), Some(world)) = (&self.pet, &self.world) else {
             return;
         };
         if pet.state == PetState::Dragged {
             return;
         }
-        let rows = menu_rows();
-        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
-        // Подсветка строк — осветлённый цвет питомца (контраст на карточке).
-        let accent = palette::lighten(self.derived.color, MENU_ACCENT_LIGHTEN);
-        let (frame, rects) = text::menu_frame(&refs, None, MENU_PX, accent);
-        let origin = clamp_menu_origin(p, (frame.w as f32, frame.h as f32), &world.screen);
-        self.menu = Some(Menu {
-            origin,
-            rows,
-            frame,
-            rects,
+        let layout = radial::radial_layout(MENU_ACTIONS.len(), self.sprites.size as f32);
+        let b = pet.bounds();
+        let center = Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
+        let mut menu = Menu {
+            origin: Vec2::default(),
+            layout,
+            items: menu_items(),
+            frame: Frame {
+                w: 0,
+                h: 0,
+                argb: Vec::new(),
+            },
             hovered: None,
-            accent,
-        });
+            // Подсветка — сам цвет питомца (иконки и кольцо — в его тоне).
+            accent: self.derived.color,
+            opened_at: now,
+            baked: (-1.0, [0; 3]),
+        };
+        menu.follow(center, &world.screen);
+        menu.rebake(now, self.menu_stats());
+        self.menu = Some(menu);
     }
 
-    /// Движение курсора при открытом меню: пересчитать подсветку строки;
-    /// кадр перепекается только при реальной смене hovered.
-    fn menu_hover(&mut self, p: Vec2) {
+    /// Сытость/энергия/настроение для мини-шкал меню.
+    fn menu_stats(&self) -> [f32; 3] {
+        let s = &self.derived.stats;
+        [s.satiety, s.energy, s.mood]
+    }
+
+    /// Движение курсора при открытом меню: пересчитать наведённую кнопку;
+    /// кадр перепекается только при реальной смене.
+    fn menu_hover(&mut self, p: Vec2, now: f64) {
+        let stats = self.menu_stats();
         let Some(menu) = &mut self.menu else {
             return;
         };
         let local = Vec2::new(p.x - menu.origin.x, p.y - menu.origin.y);
-        let hovered = hover_index(&menu.rects, local);
+        let hovered = radial::radial_hit(&menu.layout, local);
         if hovered != menu.hovered {
             menu.hovered = hovered;
-            menu.rebake();
+            menu.baked.0 = -1.0; // принудительная перепечка
+            menu.rebake(now, stats);
         }
     }
 
-    /// Нажатие при открытом меню: строка -> действие, любое другое место —
+    /// Нажатие при открытом меню: кнопка -> действие, любое другое место —
     /// просто закрыть. Меню закрывается в обоих случаях; питомцу это
     /// нажатие не отдаётся (закрывающий клик не должен начинать drag).
     fn menu_press(&mut self, p: Vec2, now: f64) {
@@ -1223,7 +1284,7 @@ impl DaemonApp {
             return;
         };
         let local = Vec2::new(p.x - menu.origin.x, p.y - menu.origin.y);
-        let Some(idx) = hover_index(&menu.rects, local) else {
+        let Some(idx) = radial::radial_hit(&menu.layout, local) else {
             return;
         };
         let action = MENU_ACTIONS[idx];
@@ -1242,6 +1303,18 @@ impl DaemonApp {
         if let Response::Error(e) = resp {
             log::warn!("меню: действие {action:?} не удалось: {e}");
         }
+    }
+
+    /// Открытое меню живёт вместе с питомцем: кольцо едет за ним, кадр
+    /// перепекается по фазе появления и по мини-шкалам.
+    fn menu_tick(&mut self, now: f64) {
+        let stats = self.menu_stats();
+        let (Some(menu), Some(pet), Some(world)) = (&mut self.menu, &self.pet, &self.world) else {
+            return;
+        };
+        let b = pet.bounds();
+        menu.follow(Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0), &world.screen);
+        menu.rebake(now, stats);
     }
 
     /// Призвать питомца (идемпотентно). Требует известной геометрии выхода.
@@ -1940,6 +2013,8 @@ impl App for DaemonApp {
 
         // Периоды сна: начало/конец (естественный или прерванный) — Slept.
         self.note_sleep(now);
+        // Радиальное меню едет за питомцем и дорастает (G4).
+        self.menu_tick(now);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -2087,7 +2162,7 @@ impl App for DaemonApp {
             }
             Event::PointerMotion(p) => {
                 if self.menu.is_some() {
-                    self.menu_hover(p);
+                    self.menu_hover(p, now);
                     return true;
                 }
                 self.pointer(PointerEvent::Motion(p), now)
@@ -2109,10 +2184,10 @@ impl App for DaemonApp {
                 true
             }
             // ПКМ по питомцу — открыть меню (B3); повторный ПКМ закрывает.
-            Event::PointerMenu(p) => {
+            Event::PointerMenu(_) => {
                 self.user_claim();
                 if self.menu.take().is_none() {
-                    self.open_menu(p);
+                    self.open_menu(now);
                 }
                 true
             }
@@ -2236,14 +2311,11 @@ mod tests {
         (app, tx, dir)
     }
 
-    /// Центр строки `idx` открытого меню в логических экранных координатах.
+    /// Центр кнопки `idx` открытого меню в логических экранных координатах.
     fn row_center(app: &DaemonApp, idx: usize) -> Vec2 {
         let menu = app.menu.as_ref().expect("меню открыто");
-        let r = menu.rects[idx];
-        Vec2::new(
-            menu.origin.x + r.x + r.w / 2.0,
-            menu.origin.y + r.y + r.h / 2.0,
-        )
+        let c = menu.layout.petals[idx];
+        Vec2::new(menu.origin.x + c.x, menu.origin.y + c.y)
     }
 
     /// Осадить питомца на землю: `secs` секунд симуляции тиками по 1/60.
@@ -2623,23 +2695,22 @@ mod tests {
         app.event(Event::PointerMenu(p), 0.0);
         assert_eq!(
             app.menu.as_ref().unwrap().accent,
-            palette::lighten(driftling_core::DEFAULT_PET_COLOR, MENU_ACCENT_LIGHTEN)
+            driftling_core::DEFAULT_PET_COLOR
         );
-        app.event(Event::PointerMotion(row_center(&app, 1)), 0.1);
+        // Наведение — после того как кольцо выросло (подсветка рисуется
+        // только у раскрытого меню).
+        app.event(Event::PointerMotion(row_center(&app, 1)), 0.3);
         let before = app.menu.as_ref().unwrap().frame.argb.clone();
-        app.event(Event::PointerMenu(p), 0.2); // закрыть
+        app.event(Event::PointerMenu(p), 0.35); // закрыть
 
         let reply = send(&tx, Request::Recolor(0xff_5f_bf_8f));
-        app.tick(0.3);
+        app.tick(0.4);
         assert_eq!(reply.recv().unwrap(), Response::Ok);
 
-        app.event(Event::PointerMenu(p), 0.4);
-        app.event(Event::PointerMotion(row_center(&app, 1)), 0.5);
+        app.event(Event::PointerMenu(p), 0.5);
+        app.event(Event::PointerMotion(row_center(&app, 1)), 0.8);
         let menu = app.menu.as_ref().unwrap();
-        assert_eq!(
-            menu.accent,
-            palette::lighten(0xff_5f_bf_8f, MENU_ACCENT_LIGHTEN)
-        );
+        assert_eq!(menu.accent, 0xff_5f_bf_8f);
         assert_ne!(menu.frame.argb, before, "подсветка в новом акценте");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2827,18 +2898,10 @@ mod tests {
         );
     }
 
-    /// Чистая математика меню: индекс строки под точкой и прижатие к экрану.
+    /// Чистая математика меню: прижатие к экрану (попадание по кнопкам
+    /// проверяется в core::radial).
     #[test]
     fn hover_and_clamp_math() {
-        let rects = [
-            Rect::new(4.0, 4.0, 100.0, 20.0),
-            Rect::new(4.0, 24.0, 100.0, 20.0),
-        ];
-        assert_eq!(hover_index(&rects, Vec2::new(10.0, 10.0)), Some(0));
-        assert_eq!(hover_index(&rects, Vec2::new(10.0, 30.0)), Some(1));
-        assert_eq!(hover_index(&rects, Vec2::new(-1.0, 10.0)), None);
-        assert_eq!(hover_index(&rects, Vec2::new(10.0, 60.0)), None);
-
         let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
         // Правый нижний угол: меню прижимается внутрь экрана.
         assert_eq!(

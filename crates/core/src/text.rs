@@ -55,7 +55,7 @@ fn line_height(px: f32) -> f32 {
 }
 
 /// Габариты текста: ширина по крайнему глифу, высота по числу строк.
-fn measure(text: &str, px: f32) -> (f32, f32) {
+pub(crate) fn measure(text: &str, px: f32) -> (f32, f32) {
     let w = layout_glyphs(text, px)
         .iter()
         .map(|g| g.x + g.width as f32)
@@ -67,7 +67,7 @@ fn measure(text: &str, px: f32) -> (f32, f32) {
 /// Смешать пиксель `color` с покрытием `cov` (0..=1) поверх кадра.
 /// Кадр хранится в premultiplied ARGB; источник премультиплицируется здесь.
 /// На непрозрачном фоне (карточки) результат остаётся непрозрачным.
-fn blend_px(frame: &mut Frame, x: i32, y: i32, color: u32, cov: f32) {
+pub(crate) fn blend_px(frame: &mut Frame, x: i32, y: i32, color: u32, cov: f32) {
     if x < 0 || y < 0 || x >= frame.w as i32 || y >= frame.h as i32 {
         return;
     }
@@ -89,7 +89,7 @@ fn blend_px(frame: &mut Frame, x: i32, y: i32, color: u32, cov: f32) {
 }
 
 /// Нарисовать глифы текста в кадр со смещением (`ox`, `oy`).
-fn draw_text(frame: &mut Frame, text: &str, px: f32, color: u32, ox: f32, oy: f32) {
+pub(crate) fn draw_text(frame: &mut Frame, text: &str, px: f32, color: u32, ox: f32, oy: f32) {
     for g in layout_glyphs(text, px) {
         if g.width == 0 || g.height == 0 {
             continue;
@@ -150,7 +150,7 @@ fn fill_rounded(frame: &mut Frame, area: Rect, r: f32, color: u32, k: f32) {
     }
 }
 
-fn transparent(w: u32, h: u32) -> Frame {
+pub(crate) fn transparent(w: u32, h: u32) -> Frame {
     Frame {
         w,
         h,

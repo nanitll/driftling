@@ -29,9 +29,11 @@ const SCALE: u32 = 4;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
-        [_, m, o] if m == "sheets" || m == "icons" || m == "surfaces" => (m.as_str(), Path::new(o)),
+        [_, m, o] if ["sheets", "icons", "surfaces", "radial"].contains(&m.as_str()) => {
+            (m.as_str(), Path::new(o))
+        }
         _ => {
-            eprintln!("использование: render_pack (sheets|icons|surfaces) <каталог>");
+            eprintln!("использование: render_pack (sheets|icons|surfaces|radial) <каталог>");
             std::process::exit(2);
         }
     };
@@ -46,6 +48,7 @@ fn main() {
     match mode {
         "sheets" => sheets(pack, out),
         "surfaces" => surfaces(pack, out),
+        "radial" => radial(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -86,6 +89,31 @@ impl Canvas {
         }
     }
 
+    /// Блит premultiplied-кадра с честным src-over (меню, пузыри).
+    fn blit_alpha(&mut self, f: &Frame, x0: u32, y0: u32) {
+        for y in 0..f.h {
+            for x in 0..f.w {
+                let p = f.argb[(y * f.w + x) as usize];
+                let a = (p >> 24) as f32 / 255.0;
+                if a <= 0.0 {
+                    continue;
+                }
+                let (dx, dy) = (x0 + x, y0 + y);
+                if dx >= self.w || dy >= self.h {
+                    continue;
+                }
+                let i = (dy * self.w + dx) as usize;
+                let d = self.px[i];
+                let ch = |sh: u32| -> u32 {
+                    let sc = ((p >> sh) & 0xff) as f32;
+                    let dc = ((d >> sh) & 0xff) as f32;
+                    ((sc + dc * (1.0 - a)).round() as u32).min(255)
+                };
+                self.px[i] = 0xff00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+            }
+        }
+    }
+
     fn blit(&mut self, f: &Frame, x0: u32, y0: u32) {
         for y in 0..f.h {
             for x in 0..f.w {
@@ -104,6 +132,48 @@ impl Canvas {
     fn save(&self, path: &Path) {
         write_png(path, self.w, self.h, &self.px);
     }
+}
+
+/// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
+/// наведённой кнопкой и мини-шкалами, плюс фаза появления.
+fn radial(pack: &Pack, out: &Path) {
+    use driftling_core::radial::{radial_frame, radial_layout, Icon, RadialItem};
+    const PET: u32 = 96;
+    let items: Vec<RadialItem> = [
+        (Icon::Cookie, "Покормить"),
+        (Icon::Candy, "Вкусняшка"),
+        (Icon::Ball, "Поиграть"),
+        (Icon::Moon, "Уложить спать"),
+        (Icon::Gear, "Настройки"),
+        (Icon::Cross, "Убрать с экрана"),
+    ]
+    .into_iter()
+    .map(|(icon, l)| RadialItem {
+        icon,
+        label: l.to_string(),
+    })
+    .collect();
+    let layout = radial_layout(items.len(), PET as f32);
+    let idle = pack.frames(Stage::Adult, "idle", PET, DEFAULT_PET_COLOR);
+    let accent = DEFAULT_PET_COLOR;
+    let stats = Some([72.0, 35.0, 88.0]);
+    for (name, bg, hovered, grow) in [
+        ("radial_light", LIGHT_BG, Some(0usize), 1.0f32),
+        ("radial_dark", DARK_BG, Some(3), 1.0),
+        ("radial_grow", DARK_BG, None, 0.45),
+    ] {
+        let mut c = Canvas::new(layout.side, layout.side, bg);
+        // Питомец в центре кольца (опорная точка — низ спрайта).
+        c.blit(
+            &idle[0],
+            (layout.center.x - PET as f32 / 2.0) as u32,
+            (layout.center.y - PET as f32 / 2.0) as u32,
+        );
+        let menu = radial_frame(&layout, &items, hovered, grow, stats, 13.0, accent);
+        c.blit_alpha(&menu, 0, 0);
+        c.save(&out.join(format!("{name}.png")));
+    }
+    println!("пруф радиального меню записан в {}", out.display());
 }
 
 /// Дев-пруф фазы G: «комната» с питомцем на всех поверхностях —

@@ -24,6 +24,7 @@ pub mod pack;
 pub mod palette;
 pub mod pet;
 pub mod physics;
+pub mod radial;
 pub mod sprite;
 pub mod stats;
 pub mod sync;
