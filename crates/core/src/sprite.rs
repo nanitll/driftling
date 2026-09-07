@@ -235,6 +235,9 @@ impl SpriteSet {
             PetState::Dragged => pick(&self.dragged, 4.0, t),
             PetState::Landing => pick(&self.landing, 6.0, t),
             PetState::Bonk => pick_or(&self.dizzy, &self.landing, 4.0, t),
+            // Катится кубарем: компактная поза падения, вращение
+            // добавляет рендер (Pet::orient).
+            PetState::Roll => pick(&self.falling, 8.0, t),
         }
     }
 

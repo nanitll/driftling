@@ -10,6 +10,7 @@ state-dragged = В руках
 state-landing = Приземлился
 state-climb = Лезет по стене
 state-bonk = Набил шишку
+state-roll = Катится кувырком
 state-unknown = Неизвестно
 
 # --- Аптайм (плюральные формы CLDR: one/few/many) ---

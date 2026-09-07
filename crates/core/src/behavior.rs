@@ -3,6 +3,8 @@
 //! мелкие занятия внутри Idle ([`IdleAction`]).
 //! Переходы — по таймерам с весами (все константы в BehaviorConfig, ТЗ §3.2).
 
+use crate::body::Body;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PetState {
     Idle,
@@ -16,6 +18,9 @@ pub enum PetState {
     Climb,
     /// Удар головой о потолок: короткое оглушение в воздухе, дальше падение.
     Bonk,
+    /// Катится по полу после броска: инерция гасится трением, тело
+    /// кувыркается (фаза G3).
+    Roll,
 }
 
 /// Мелкое занятие в состоянии Idle (фаза G): питомец не «стоит столбом»,
@@ -40,15 +45,10 @@ pub enum IdleAction {
 pub struct BehaviorConfig {
     /// Скорость ходьбы, px/s.
     pub walk_speed: f32,
-    /// Гравитация, px/s^2.
-    pub gravity: f32,
-    /// Предел скорости падения, px/s. Без него питомец разгоняется до
-    /// пары тысяч пикселей в секунду и «телепортируется» вниз: экран он
-    /// пролетает быстрее, чем глаз успевает его вести.
-    pub terminal_speed: f32,
-    /// Предел скорости броска, px/s: резкий флик мышью иначе выстреливает
-    /// питомцем через весь экран.
-    pub throw_speed_limit: f32,
+    /// Физика тела (фаза G3): масштаб мира, масса, сопротивление, отскок.
+    /// Гравитация, предельная скорость падения и предел броска НЕ задаются
+    /// числами — они выводятся отсюда (см. [`crate::body::Body`]).
+    pub body: Body,
     /// Диапазон длительности Idle до следующего решения, сек.
     pub idle_range: (f32, f32),
     /// Диапазон длительности Walk, сек.
@@ -61,8 +61,10 @@ pub struct BehaviorConfig {
     pub w_idle_to_walk: u32,
     /// Вес перехода Idle -> Sleep (из 100).
     pub w_idle_to_sleep: u32,
-    /// Скорость падения, с которой приземление считается «жёстким», px/s.
-    pub hard_landing_speed: f32,
+    /// Скорость падения, с которой приземление считается «жёстким», м/с.
+    /// В пиксели переводится масштабом тела — порог физический, а не
+    /// экранный: на большом мониторе он не должен меняться.
+    pub hard_landing_mps: f32,
 
     // ---- Фаза G: лазание, воздух, мелкая жизнь ----
     /// Доля скорости ходьбы при лазании по стене/потолку.
@@ -87,16 +89,14 @@ pub struct BehaviorConfig {
     /// перехватами). Средняя скорость не меняется.
     pub climb_pull_depth: f32,
     /// Скорость удара о потолок, выше которой питомец не цепляется, а
-    /// набивает шишку (Bonk), px/s.
-    pub ceiling_grab_speed: f32,
+    /// набивает шишку (Bonk), м/с.
+    pub ceiling_grab_mps: f32,
     /// Горизонтальная скорость влёта в стену, с которой питомец за неё
-    /// цепляется в падении, px/s.
-    pub wall_grab_speed: f32,
+    /// цепляется в падении, м/с.
+    pub wall_grab_mps: f32,
     /// Длительность Bonk, сек.
     pub bonk_time: f32,
-    /// Коэффициент сопротивления воздуха для горизонтальной скорости, 1/с:
-    /// бросок затухает, вместо того чтобы лететь равномерно до стены.
-    pub air_drag: f32,
+
     /// Диапазон паузы между мелкими занятиями в Idle, сек.
     pub fidget_range: (f32, f32),
 }
@@ -105,12 +105,7 @@ impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
             walk_speed: 38.0,
-            // Питомец маленький и лёгкий: земное ускорение в пикселях
-            // выглядит как выстрел. 900 px/s^2 с потолком скорости даёт
-            // падение через весь экран примерно за 1.7 с — его видно.
-            gravity: 900.0,
-            terminal_speed: 750.0,
-            throw_speed_limit: 1400.0,
+            body: Body::default(),
             // Фаза G: питомец должен быть спокойным соседом, а не бегать
             // без остановки — паузы длиннее прогулок.
             idle_range: (4.0, 12.0),
@@ -119,7 +114,7 @@ impl Default for BehaviorConfig {
             landing_time: 0.8,
             w_idle_to_walk: 32,
             w_idle_to_sleep: 14,
-            hard_landing_speed: 520.0,
+            hard_landing_mps: 2.6,
 
             climb_speed_scale: 0.65,
             // Баланс замерен прогоном часа жизни (см. `g_stats` в pet.rs):
@@ -135,10 +130,9 @@ impl Default for BehaviorConfig {
             climb_pull_depth: 0.55,
             // Бросок вверх — это приглашение повисеть: цепляется почти
             // всегда, шишка достаётся только совсем зверскому запуску.
-            ceiling_grab_speed: 1200.0,
-            wall_grab_speed: 90.0,
+            ceiling_grab_mps: 5.0,
+            wall_grab_mps: 0.3,
             bonk_time: 0.5,
-            air_drag: 0.9,
             fidget_range: (1.5, 5.0),
         }
     }
@@ -148,6 +142,26 @@ impl BehaviorConfig {
     /// Скорость движения по стене/потолку, px/s.
     pub fn climb_speed(&self) -> f32 {
         self.walk_speed * self.climb_speed_scale
+    }
+
+    /// Гравитация в пикселях (из физики тела).
+    pub fn gravity(&self) -> f32 {
+        self.body.gravity_px()
+    }
+
+    /// Скорость удара о пол, выше которой приземление «жёсткое», px/s.
+    pub fn hard_landing_speed(&self) -> f32 {
+        self.body.mps_to_px(self.hard_landing_mps)
+    }
+
+    /// Порог цепляния за потолок, px/s.
+    pub fn ceiling_grab_speed(&self) -> f32 {
+        self.body.mps_to_px(self.ceiling_grab_mps)
+    }
+
+    /// Порог цепляния за стену в полёте, px/s.
+    pub fn wall_grab_speed(&self) -> f32 {
+        self.body.mps_to_px(self.wall_grab_mps)
     }
 }
 
@@ -173,7 +187,7 @@ pub fn next_state_after(
         PetState::Sleep => (PetState::Idle, rng_range(rng, cfg.idle_range)),
         PetState::Landing => (PetState::Idle, rng_range(rng, cfg.idle_range)),
         PetState::Climb => (PetState::Idle, rng_range(rng, cfg.idle_range)),
-        // Falling, Dragged и Bonk завершаются событиями физики/указателя.
+        // Falling, Dragged, Bonk и Roll завершаются событиями физики.
         s => (s, f32::INFINITY),
     }
 }

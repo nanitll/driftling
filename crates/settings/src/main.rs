@@ -94,6 +94,7 @@ fn state_label(state: Option<&str>) -> String {
         Some("Landing") => fl!("state-landing"),
         Some("Climb") => fl!("state-climb"),
         Some("Bonk") => fl!("state-bonk"),
+        Some("Roll") => fl!("state-roll"),
         Some(_) => fl!("state-unknown"),
     }
 }
@@ -106,7 +107,7 @@ fn state_color(state: Option<&str>, accent_light: Color32) -> Color32 {
         Some("Walk") => accent_light,
         Some("Sleep") => SLEEP_BLUE,
         Some("Climb") => accent_light,
-        Some("Falling" | "Dragged" | "Landing" | "Bonk") => AMBER,
+        Some("Falling" | "Dragged" | "Landing" | "Bonk" | "Roll") => AMBER,
         Some(_) => MUTED,
     }
 }
@@ -2010,6 +2011,7 @@ mod tests {
         assert_eq!(state_label(Some("Sleep")), fl!("state-sleep"));
         assert_eq!(state_label(Some("Climb")), fl!("state-climb"));
         assert_eq!(state_label(Some("Bonk")), fl!("state-bonk"));
+        assert_eq!(state_label(Some("Roll")), fl!("state-roll"));
         assert_eq!(state_label(Some("Falling")), fl!("state-falling"));
         assert_eq!(state_label(Some("Dragged")), fl!("state-dragged"));
         assert_eq!(state_label(Some("Landing")), fl!("state-landing"));

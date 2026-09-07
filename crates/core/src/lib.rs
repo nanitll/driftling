@@ -15,6 +15,7 @@ pub const APP_ID: &str = "io.github.nanitll.driftling";
 
 pub mod attributes;
 pub mod behavior;
+pub mod body;
 pub mod config;
 pub mod geometry;
 pub mod growth;
@@ -30,7 +31,8 @@ pub mod text;
 
 pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, IdleAction, PetState};
-pub use config::{Config, SyncConfig, SyncMode};
+pub use body::Body;
+pub use config::{Config, PhysicsConfig, SyncConfig, SyncMode};
 pub use geometry::{Rect, Vec2};
 pub use growth::Stage;
 #[cfg(not(target_arch = "wasm32"))]

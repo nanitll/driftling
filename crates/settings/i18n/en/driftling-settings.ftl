@@ -11,6 +11,7 @@ state-dragged = Held
 state-landing = Landed
 state-climb = Climbing
 state-bonk = Bumped its head
+state-roll = Rolling
 state-unknown = Unknown
 
 # --- Uptime (CLDR plural rules) ---

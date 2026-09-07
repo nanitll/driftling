@@ -124,6 +124,10 @@ pub struct Pet {
     /// Текущая прогулка — «поход к стене» (фаза G): питомец идёт до края
     /// экрана не сворачивая и лезет наверх. Снимается на выходе из Walk.
     wall_trip: bool,
+    /// Угол кувырка, рад (фаза G3): тело в полёте и при качении вращается.
+    spin: f32,
+    /// Угловая скорость, рад/с.
+    spin_vel: f32,
 }
 
 /// Порог движения курсора, после которого нажатие становится захватом,
@@ -155,6 +159,8 @@ impl Pet {
             action_left: 1.0,
             sleep_on_land: false,
             wall_trip: false,
+            spin: 0.0,
+            spin_vel: 0.0,
         }
     }
 
@@ -229,10 +235,22 @@ impl Pet {
         self.surface.bounds(self.pos, self.size)
     }
 
-    /// Ориентация кадра для рендера: поворот под поверхность + зеркало по
-    /// направлению взгляда (кадры пака нарисованы мордой вправо, ногами вниз).
+    /// Ориентация кадра для рендера: поза под поверхность + кувырок тела
+    /// в полёте и при качении (фаза G3). Угол квантуется по четвертям —
+    /// пиксельный спрайт так и должен вращаться, без мыла.
     pub fn orient(&self) -> Orient {
-        self.surface.orient(self.facing)
+        let mut o = self.surface.orient(self.facing);
+        if matches!(self.state, PetState::Falling | PetState::Roll) {
+            let quarter = core::f32::consts::FRAC_PI_2;
+            let turns = (self.spin / quarter).rem_euclid(4.0) as u8;
+            o.quarter_turns = (o.quarter_turns + turns) % 4;
+        }
+        o
+    }
+
+    /// Угол кувырка, рад (для тестов и отладки).
+    pub fn spin(&self) -> f32 {
+        self.spin
     }
 
     /// Текущее мелкое занятие в Idle (фаза G) — для выбора кадра.
@@ -258,7 +276,8 @@ impl Pet {
             | PetState::Dragged
             | PetState::Walk
             | PetState::Climb
-            | PetState::Bonk => SimPace::Active,
+            | PetState::Bonk
+            | PetState::Roll => SimPace::Active,
             PetState::Idle | PetState::Landing => SimPace::Calm,
             PetState::Sleep => SimPace::Drowsy,
         }
@@ -279,6 +298,7 @@ impl Pet {
                 // Позицию ведёт указатель (см. pointer()); физика выключена.
             }
             PetState::Falling => self.tick_falling(world, dt),
+            PetState::Roll => self.tick_roll(world, dt),
             PetState::Walk => self.tick_walk(world, dt),
             PetState::Climb => self.tick_climb(world, dt),
             PetState::Bonk => {
@@ -306,13 +326,17 @@ impl Pet {
             // Опору ищем от ног ДО подшага: кромки выше исходной позиции
             // не считаются — на окно садимся только сверху.
             let feet_before = self.pos.y;
-            self.vel.y += self.cfg.gravity * step;
-            // Предел скорости падения: дальше питомец не разгоняется —
-            // иначе он не падает, а мгновенно исчезает вниз.
-            self.vel.y = self.vel.y.min(self.cfg.terminal_speed);
-            // Затухание горизонтальной скорости: брошенный питомец
-            // тормозит в полёте, а не летит по прямой до стены.
-            self.vel.x *= 1.0 - (self.cfg.air_drag * step).min(1.0);
+            // Квадратичное сопротивление воздуха по обеим осям: отсюда же
+            // берётся предельная скорость падения — её не задают, она
+            // получается сама, когда сопротивление сравнивается с весом.
+            let speed = self.vel.x.hypot(self.vel.y);
+            if speed > 0.0 {
+                let damp = 1.0 - (self.cfg.body.drag_k_px() * speed * step).min(1.0);
+                self.vel = self.vel * damp;
+            }
+            self.vel.y += self.cfg.gravity() * step;
+            self.spin += self.spin_vel * step;
+            self.spin_vel *= 1.0 - (self.cfg.body.spin_damping * step).min(1.0);
             self.pos = self.pos + self.vel * step;
 
             // Потолок (фаза G): за верхний край экрана питомец не улетает
@@ -449,7 +473,7 @@ impl Pet {
         // Прижать макушку к потолку.
         self.pos.y += world.screen.y - b.y;
         let speed = -self.vel.y;
-        if !self.grounded_only && speed <= self.cfg.ceiling_grab_speed {
+        if !self.grounded_only && speed <= self.cfg.ceiling_grab_speed() {
             // Зацепился: висит под потолком, мордой по ходу броска.
             self.switch_surface(Surface::Ceiling);
             if self.vel.x.abs() > 1.0 {
@@ -489,7 +513,7 @@ impl Pet {
             Surface::WallRight
         };
         self.clamp_horizontal(world);
-        if !self.grounded_only && self.vel.x.abs() >= self.cfg.wall_grab_speed {
+        if !self.grounded_only && self.vel.x.abs() >= self.cfg.wall_grab_speed() {
             self.switch_surface(wall);
             self.vel = Vec2::default();
             // Смотрим вверх: с зацепа приятнее лезть на потолок.
@@ -506,19 +530,48 @@ impl Pet {
         }
     }
 
-    /// Приземление на опору `support` (пол или кромка окна).
+    /// Удар о опору `support` (пол или кромка окна): отскок, качение или
+    /// приземление — по скорости удара (фаза G3, физика тела).
     fn land_on(&mut self, support: f32) {
         self.pos.y = support;
         let impact = self.vel.y;
-        self.vel = Vec2::default();
         self.surface = Surface::Floor;
+
+        // Отскок: доля скорости возвращается назад, пока удар достаточно
+        // силён. Команда «спать» отскоки отменяет — питомца кладут.
+        let bounce = impact * self.cfg.body.restitution;
+        let bounce_floor = self.cfg.body.mps_to_px(self.cfg.body.bounce_floor_mps);
+        if !self.sleep_on_land && bounce > bounce_floor {
+            self.vel.y = -bounce;
+            // Часть горизонтального хода съедает удар о пол.
+            self.vel.x *= 0.82;
+            self.spin_vel *= 0.8;
+            return; // остаёмся в Falling — это ещё полёт
+        }
+
+        self.vel.y = 0.0;
         if self.sleep_on_land {
             self.sleep_on_land = false;
+            self.vel = Vec2::default();
+            self.spin_vel = 0.0;
+            self.spin = 0.0;
             self.enter(PetState::Sleep);
             self.state_left = self.cfg.sleep_range.1;
             return;
         }
-        self.enter(if impact > self.cfg.hard_landing_speed {
+
+        // Инерция осталась — тело катится по полу, гася её трением.
+        let roll_stop = self.cfg.body.mps_to_px(self.cfg.body.roll_stop_mps);
+        if self.vel.x.abs() > roll_stop * 2.0 {
+            self.enter(PetState::Roll);
+            self.state_left = f32::INFINITY;
+            return;
+        }
+
+        self.vel = Vec2::default();
+        self.spin_vel = 0.0;
+        self.spin = 0.0;
+        self.enter(if impact > self.cfg.hard_landing_speed() {
             PetState::Landing
         } else {
             PetState::Idle
@@ -528,6 +581,45 @@ impl Pet {
         } else {
             1.0 + self.rng.f32()
         };
+    }
+
+    /// Качение по полу после броска (фаза G3): трение гасит ход, тело
+    /// кувыркается без проскальзывания, кромка под ногами продолжает
+    /// работать — с карниза докатившийся питомец падает.
+    fn tick_roll(&mut self, world: &World, dt: f32) {
+        self.vel.x *= 1.0 - (self.cfg.body.roll_friction * dt).min(1.0);
+        self.pos.x += self.vel.x * dt;
+        // Качение без проскальзывания: угловая скорость = v / R.
+        self.spin_vel = self.vel.x / (self.size / 2.0).max(1.0);
+        self.spin += self.spin_vel * dt;
+
+        // Стены экрана: катящееся тело отскакивает и теряет половину хода.
+        let b = self.bounds();
+        if (b.x <= world.screen.x && self.vel.x < 0.0)
+            || (b.right() >= world.screen.right() && self.vel.x > 0.0)
+        {
+            self.vel.x = -self.vel.x * 0.5;
+        }
+        self.clamp_horizontal(world);
+
+        // Опора под ногами: скатился с карниза — падает.
+        let feet = self.pos.y;
+        let support = support_below(world, self.pos.x, feet - STEP_SNAP);
+        if support - feet > STEP_SNAP {
+            self.enter(PetState::Falling);
+            self.state_left = f32::INFINITY;
+            return;
+        }
+        self.pos.y = support;
+
+        let roll_stop = self.cfg.body.mps_to_px(self.cfg.body.roll_stop_mps);
+        if self.vel.x.abs() <= roll_stop {
+            self.vel = Vec2::default();
+            self.spin_vel = 0.0;
+            self.spin = 0.0;
+            self.enter(PetState::Landing);
+            self.state_left = self.cfg.landing_time;
+        }
     }
 
     /// Попытка полезть на стену у края экрана (фаза G): бросок кубика по
@@ -736,14 +828,18 @@ impl Pet {
                     .unwrap_or(self.drag_history[2]);
                 let span = (t1 - t0).max(1e-3);
                 let mut v = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
-                // Резкий флик мышью давал по 3000 px/s — питомец улетал
-                // за кадр. Ограничиваем модуль, направление сохраняем.
+                // Скорость вылета ограничена импульсом руки, делённым на
+                // массу тела (фаза G3): тяжёлого питомца так далеко не
+                // зашвырнёшь, как лёгкого.
                 let speed = v.x.hypot(v.y);
-                let limit = self.cfg.throw_speed_limit;
+                let limit = self.cfg.body.throw_limit_px();
                 if speed > limit {
                     v = v * (limit / speed);
                 }
                 self.vel = v;
+                // Брошенное тело кувыркается: закрутка от горизонтальной
+                // составляющей броска, как у брошенного мяча.
+                self.spin_vel = self.vel.x / (self.size / 2.0).max(1.0) * 0.6;
                 self.enter(PetState::Falling);
                 true
             }
@@ -884,7 +980,7 @@ mod tests {
         let mut p = pet();
         // Тест про физику броска: цепляние за стену отключено, иначе
         // питомец залипнет на кромке экрана вместо земли.
-        p.cfg.wall_grab_speed = f32::INFINITY;
+        p.cfg.wall_grab_mps = f32::INFINITY;
         p.cfg.w_wall_climb = 0;
         p.cfg.w_wall_trip = 0;
         for _ in 0..600 {
@@ -1204,11 +1300,16 @@ mod tests {
         w.platforms.clear();
         p.world_changed(&w);
         assert_eq!(p.state, PetState::Falling, "сон прерван падением");
+        // Смотрим ровно момент приземления: дальше машина поведения живёт
+        // своей жизнью и может снова уложить питомца спать.
         for _ in 0..600 {
             p.tick(&w, 1.0 / 60.0);
+            if !matches!(p.state, PetState::Falling | PetState::Roll) {
+                break;
+            }
         }
         assert_eq!(p.pos.y, w.ground_y());
-        assert_ne!(p.state, PetState::Sleep, "после падения не спит");
+        assert_ne!(p.state, PetState::Sleep, "падение разбудило");
     }
 
     /// Окно чуть сдвинули по вертикали (≤ SUPPORT_TOL) — питомец едет
@@ -1339,7 +1440,7 @@ mod tests {
         // Скорость подобрана так, чтобы долететь до потолка (подъём
         // v^2/2g) и удариться мягче ceiling_grab_speed.
         p.pos = Vec2::new(900.0, 900.0);
-        p.vel = Vec2::new(30.0, -1500.0);
+        p.vel = Vec2::new(30.0, -2400.0);
         p.state = PetState::Falling;
         let mut min_top = f32::MAX;
         for _ in 0..300 {
@@ -1358,7 +1459,7 @@ mod tests {
         let w = world();
         let mut p = pet();
         p.pos = Vec2::new(900.0, 1000.0);
-        p.vel = Vec2::new(0.0, -2600.0);
+        p.vel = Vec2::new(0.0, -3400.0);
         p.state = PetState::Falling;
         let mut bonked = false;
         let mut min_top = f32::MAX;
@@ -1465,6 +1566,94 @@ mod tests {
         assert!(
             max_height < w.ground_y() - 200.0,
             "и забраться заметно выше пола: {max_height}"
+        );
+    }
+
+    /// Тело отскакивает от пола и катится: удар не гасит движение
+    /// мгновенно, как раньше (фаза G3, «больше физики тела»).
+    #[test]
+    fn body_bounces_then_rolls_to_a_stop() {
+        let w = world();
+        let mut p = pet();
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
+        p.cfg.wall_grab_mps = f32::INFINITY;
+        // Бросок вбок с высоты: должен быть отскок, потом качение.
+        p.pos = Vec2::new(600.0, 300.0);
+        p.vel = Vec2::new(500.0, 200.0);
+        p.state = PetState::Falling;
+        let ground = w.ground_y();
+        let (mut bounced, mut rolled) = (false, false);
+        let mut touched = false;
+        for _ in 0..1200 {
+            p.tick(&w, 1.0 / 120.0);
+            if p.pos.y >= ground - 0.5 {
+                touched = true;
+            }
+            // Отскок: уже касались земли, а потом снова заметно выше неё.
+            if touched && p.state == PetState::Falling && p.pos.y < ground - 20.0 {
+                bounced = true;
+            }
+            rolled |= p.state == PetState::Roll;
+        }
+        assert!(bounced, "тело не отскочило от пола");
+        assert!(rolled, "тело не покатилось после удара");
+        assert_eq!(p.pos.y, ground, "в итоге лежит на полу");
+        assert!(
+            matches!(
+                p.state,
+                PetState::Idle | PetState::Landing | PetState::Sleep
+            ),
+            "качение не закончилось: {:?}",
+            p.state
+        );
+    }
+
+    /// Качение — это качение без проскальзывания: тело кувыркается, а
+    /// когда останавливается, встаёт ровно (кадр без поворота).
+    #[test]
+    fn rolling_tumbles_and_settles_upright() {
+        let w = world();
+        let mut p = pet();
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
+        p.pos = Vec2::new(500.0, w.ground_y());
+        p.vel = Vec2::new(600.0, 0.0);
+        p.state = PetState::Roll;
+        p.state_left = f32::INFINITY;
+        let mut turns = std::collections::BTreeSet::new();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 120.0);
+            turns.insert(p.orient().quarter_turns);
+            if p.state != PetState::Roll {
+                break;
+            }
+        }
+        assert!(turns.len() >= 3, "кувырка не видно: {turns:?}");
+        assert_ne!(p.state, PetState::Roll, "качение должно закончиться");
+        assert_eq!(p.orient().quarter_turns, 0, "встал ровно");
+        assert!(p.pos.x > 500.0, "прокатился вперёд");
+    }
+
+    /// Свободное падение — настоящее: за первую секунду тело проходит
+    /// примерно g/2 метра (в пикселях — g_px/2), пока сопротивление ещё
+    /// мало.
+    #[test]
+    fn free_fall_matches_real_g() {
+        let w = World::new(Rect::new(0.0, 0.0, 1920.0, 100_000.0));
+        let mut p = pet();
+        p.pos = Vec2::new(900.0, 100.0);
+        p.vel = Vec2::default();
+        p.state = PetState::Falling;
+        let start = p.pos.y;
+        for _ in 0..120 {
+            p.tick(&w, 1.0 / 120.0);
+        }
+        let fallen = p.pos.y - start;
+        let want = p.cfg.gravity() / 2.0; // s = g t² / 2 при t = 1 с
+        assert!(
+            (fallen - want).abs() < want * 0.1,
+            "за секунду пролетел {fallen}, а по формуле {want}"
         );
     }
 
@@ -1602,13 +1791,16 @@ mod tests {
         let w = world();
         let mut dragged = pet();
         let mut ballistic = pet();
-        ballistic.cfg.air_drag = 0.0;
+        // «Баллистика» — тело без сопротивления: обнуляем коэффициент.
+        ballistic.cfg.body.drag_coeff = 0.0;
         for p in [&mut dragged, &mut ballistic] {
-            p.pos = Vec2::new(400.0, 200.0);
-            p.vel = Vec2::new(300.0, 0.0);
+            p.pos = Vec2::new(300.0, 100.0);
+            // Сопротивление квадратично: на прогулочных скоростях его почти
+            // нет (так и в жизни), заметно оно на скорости броска.
+            p.vel = Vec2::new(2500.0, 0.0);
             p.state = PetState::Falling;
         }
-        for _ in 0..40 {
+        for _ in 0..20 {
             dragged.tick(&w, 1.0 / 60.0);
             ballistic.tick(&w, 1.0 / 60.0);
         }
@@ -1628,7 +1820,7 @@ mod tests {
         let mut p = pet();
         p.pos = Vec2::new(900.0, 100.0);
         p.state = PetState::Falling;
-        let limit = p.cfg.terminal_speed;
+        let limit = p.cfg.body.terminal_px();
         let mut peak = 0.0f32;
         for _ in 0..600 {
             p.tick(&w, 1.0 / 60.0);
@@ -1656,7 +1848,7 @@ mod tests {
         assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(1500.0, 400.0)), 0.02));
         let speed = p.vel.x.hypot(p.vel.y);
         assert!(
-            speed <= p.cfg.throw_speed_limit + 1.0,
+            speed <= p.cfg.body.throw_limit_px() + 1.0,
             "бросок {speed} px/s не ограничен"
         );
         assert!(

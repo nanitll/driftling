@@ -102,10 +102,16 @@ impl PetAttributes {
     /// BehaviorConfig с поправкой на стадию роста (фаза G): малыш и
     /// коротконогий ребёнок двигаются медленнее взрослого — та же
     /// лестница, что у размера спрайта ([`crate::sprite::stage_scale`]).
-    pub fn behavior_config_for(&self, stage: Stage) -> BehaviorConfig {
+    ///
+    /// `height_m` — рост взрослого питомца «в жизни» (настройка
+    /// `[physics]`): по нему и по размеру ВЗРОСЛОГО спрайта задаётся
+    /// масштаб мира, из которого физика тела берёт настоящие 9.81 м/с².
+    pub fn behavior_config_for(&self, stage: Stage, height_m: f32) -> BehaviorConfig {
         let k = crate::sprite::stage_scale(stage);
         let mut cfg = self.behavior_config();
         cfg.walk_speed *= k;
+        cfg.body.height_m = height_m;
+        cfg.body.px_per_m = cfg.body.scale_for(self.clamped().size as f32);
         cfg
     }
 }
@@ -403,10 +409,29 @@ mod tests {
     #[test]
     fn behavior_config_scales_with_stage() {
         let a = PetAttributes::default();
-        let baby = a.behavior_config_for(Stage::Baby).walk_speed;
-        let adult = a.behavior_config_for(Stage::Adult).walk_speed;
+        let baby = a.behavior_config_for(Stage::Baby, 0.3).walk_speed;
+        let adult = a.behavior_config_for(Stage::Adult, 0.3).walk_speed;
         assert!(baby < adult, "{baby} должен быть меньше {adult}");
         assert_eq!(adult, a.behavior_config().walk_speed);
+    }
+
+    /// Масштаб мира берётся из роста «в жизни» и размера взрослого
+    /// спрайта: гравитация в пикселях — это настоящие 9.81 м/с².
+    #[test]
+    fn world_scale_comes_from_real_height() {
+        let a = PetAttributes {
+            size: 96,
+            ..PetAttributes::default()
+        };
+        let cfg = a.behavior_config_for(Stage::Adult, 0.30);
+        assert!((cfg.body.px_per_m - 320.0).abs() < 0.5);
+        assert!((cfg.gravity() - crate::body::G * 320.0).abs() < 1.0);
+        // Меньше «в жизни» — мельче мир, падения резче.
+        let small = a.behavior_config_for(Stage::Adult, 0.15);
+        assert!(small.gravity() > cfg.gravity() * 1.9);
+        // Стадия на масштаб мира не влияет: комната одна для всех.
+        let baby = a.behavior_config_for(Stage::Baby, 0.30);
+        assert_eq!(baby.body.px_per_m, cfg.body.px_per_m);
     }
 
     #[test]

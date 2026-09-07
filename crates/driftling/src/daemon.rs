@@ -77,8 +77,8 @@ use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier,
 use driftling_core::{
     apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
     Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient, Pet,
-    PetAttributes, PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, Surface, SyncConfig,
-    SyncMode, Vec2, World,
+    PetAttributes, PetRecord, PetState, PhysicsConfig, PointerEvent, Rect, SimPace, Stage, Surface,
+    SyncConfig, SyncMode, Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
@@ -254,11 +254,14 @@ pub fn run() -> Result<()> {
     }
     // Синк (фаза E): секция [sync] config.toml; битый конфиг не роняет
     // демона — просто работаем без синка (и говорим об этом).
-    let sync_cfg = match Config::load() {
-        Ok(cfg) => cfg.sync,
+    let (sync_cfg, physics_cfg) = match Config::load() {
+        Ok(cfg) => (cfg.sync, cfg.physics),
         Err(e) => {
             log::warn!("config.toml не прочитан ({e}) — синк выключен");
-            driftling_core::SyncConfig::default()
+            (
+                driftling_core::SyncConfig::default(),
+                PhysicsConfig::default(),
+            )
         }
     };
     // Восприятие мира (фаза D): KWin-провайдер на KDE, null-провайдер
@@ -272,6 +275,7 @@ pub fn run() -> Result<()> {
         Some(sense),
         sync_cfg,
     );
+    app.physics = physics_cfg;
     // Разовая нормализация характеристик из эпохи ручного config.toml
     // (фаза G): 400 px/s и непоседливость 100 — это не характер, а баг.
     app.tame_attributes();
@@ -765,6 +769,10 @@ struct DaemonApp {
     journal_dir: PathBuf,
     /// Конфиг синка (фаза E); перечитывается `ctl reload`.
     sync_cfg: SyncConfig,
+    /// Физика мира (фаза G3): рост питомца «в жизни» задаёт масштаб, из
+    /// которого выводятся настоящие 9.81 м/с² и вес. Перечитывается
+    /// `ctl reload`.
+    physics: PhysicsConfig,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -877,6 +885,7 @@ impl DaemonApp {
             last_claim: None,
             folder_poll_at: None,
             folder_seen,
+            physics: PhysicsConfig::default(),
             folder_poll: FOLDER_POLL,
             folder_merged_at: None,
             sig_exit: Arc::new(AtomicBool::new(false)),
@@ -1137,7 +1146,10 @@ impl DaemonApp {
         self.sprite_color = color;
         let attrs = self.derived.attributes;
         if let Some(pet) = &mut self.pet {
-            pet.apply_config(attrs.behavior_config_for(stage), self.sprites.size as f32);
+            pet.apply_config(
+                attrs.behavior_config_for(stage, self.physics.height_m()),
+                self.sprites.size as f32,
+            );
             pet.set_grounded_only(stage == Stage::Egg);
         }
         if hatched && self.pet.is_some() {
@@ -1233,7 +1245,7 @@ impl DaemonApp {
                 self.sprites.size as f32,
                 self.derived
                     .attributes
-                    .behavior_config_for(self.derived.stage),
+                    .behavior_config_for(self.derived.stage, self.physics.height_m()),
                 // Сид из битов монотонного времени: дёшево и достаточно.
                 now.to_bits(),
             );
@@ -1282,7 +1294,7 @@ impl DaemonApp {
                 size,
                 self.derived
                     .attributes
-                    .behavior_config_for(self.derived.stage),
+                    .behavior_config_for(self.derived.stage, self.physics.height_m()),
                 now.to_bits(),
             );
             pet.state = PetState::Walk;
@@ -1604,7 +1616,10 @@ impl DaemonApp {
         let a = attrs.clamped();
         if let Some(pet) = &mut self.pet {
             let keep_size = pet.size;
-            pet.apply_config(a.behavior_config_for(self.derived.stage), keep_size);
+            pet.apply_config(
+                a.behavior_config_for(self.derived.stage, self.physics.height_m()),
+                keep_size,
+            );
         }
         log::info!("set_attributes: применены {a:?}");
         self.care(EventKind::AttributesSet { attributes: a })
@@ -1618,10 +1633,24 @@ impl DaemonApp {
         match Config::load() {
             Ok(cfg) => {
                 log::info!("reload: настройки приложения перечитаны");
+                self.physics = cfg.physics;
+                self.apply_pet_config();
                 self.apply_sync_config(cfg.sync);
                 Response::Ok
             }
             Err(e) => Response::Error(fl!("daemon-config-unreadable", error = e)),
+        }
+    }
+
+    /// Применить физику из конфига к живому питомцу (после reload).
+    fn apply_pet_config(&mut self) {
+        let cfg = self
+            .derived
+            .attributes
+            .behavior_config_for(self.derived.stage, self.physics.height_m());
+        let size = self.sprites.size as f32;
+        if let Some(pet) = &mut self.pet {
+            pet.apply_config(cfg, size);
         }
     }
 
