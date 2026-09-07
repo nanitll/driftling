@@ -307,6 +307,9 @@ impl Pet {
             // не считаются — на окно садимся только сверху.
             let feet_before = self.pos.y;
             self.vel.y += self.cfg.gravity * step;
+            // Предел скорости падения: дальше питомец не разгоняется —
+            // иначе он не падает, а мгновенно исчезает вниз.
+            self.vel.y = self.vel.y.min(self.cfg.terminal_speed);
             // Затухание горизонтальной скорости: брошенный питомец
             // тормозит в полёте, а не летит по прямой до стены.
             self.vel.x *= 1.0 - (self.cfg.air_drag * step).min(1.0);
@@ -382,7 +385,13 @@ impl Pet {
             self.enter(PetState::Walk);
             return;
         }
-        let step = self.surface.tangent() * (self.cfg.climb_speed() * self.facing.sign() * dt);
+        // Лазание идёт рывками: питомец перехватывается лапами, а не
+        // едет по стене с постоянной скоростью. Средняя скорость от
+        // пульсации не меняется — синус за период даёт ноль.
+        let phase = self.state_time * self.cfg.climb_pull_hz * core::f32::consts::TAU;
+        let pulse = 1.0 + self.cfg.climb_pull_depth * phase.sin();
+        let speed = self.cfg.climb_speed() * pulse.max(0.0);
+        let step = self.surface.tangent() * (speed * self.facing.sign() * dt);
         self.pos = self.pos + step;
         match self.surface {
             Surface::WallLeft | Surface::WallRight => {
@@ -726,7 +735,15 @@ impl Pet {
                     .find(|(t, _)| t1 - t <= 0.12)
                     .unwrap_or(self.drag_history[2]);
                 let span = (t1 - t0).max(1e-3);
-                self.vel = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
+                let mut v = Vec2::new((p1.x - p0.x) / span, (p1.y - p0.y) / span);
+                // Резкий флик мышью давал по 3000 px/s — питомец улетал
+                // за кадр. Ограничиваем модуль, направление сохраняем.
+                let speed = v.x.hypot(v.y);
+                let limit = self.cfg.throw_speed_limit;
+                if speed > limit {
+                    v = v * (limit / speed);
+                }
+                self.vel = v;
                 self.enter(PetState::Falling);
                 true
             }
@@ -963,14 +980,20 @@ mod tests {
         // Два одинаковых питомца: один тикает крупно, другой мелко.
         let mut coarse = pet();
         let mut fine = pet();
-        coarse.tick(&w, 1.5);
-        for _ in 0..30 {
+        for _ in 0..2 {
+            coarse.tick(&w, 1.5);
+        }
+        for _ in 0..60 {
             fine.tick(&w, 0.05);
         }
-        // За 1.5 с при g=1800 оба обязаны долететь до земли без пролёта.
+        // За 3 с падения оба обязаны долететь до земли без пролёта.
         assert_eq!(coarse.pos.y, w.ground_y());
         assert_eq!(fine.pos.y, w.ground_y());
-        assert_eq!(coarse.state, fine.state);
+        // Состояния после приземления сравнивать нельзя: у крупного шага
+        // приземление случается позже, и дальше машина поведения у них
+        // расходится сама по себе. Важно, что оба уже НЕ падают.
+        assert_ne!(coarse.state, PetState::Falling);
+        assert_ne!(fine.state, PetState::Falling);
         assert!(
             (coarse.pos.x - fine.pos.x).abs() < 1.0,
             "траектории разошлись: {} vs {}",
@@ -1316,7 +1339,7 @@ mod tests {
         // Скорость подобрана так, чтобы долететь до потолка (подъём
         // v^2/2g) и удариться мягче ceiling_grab_speed.
         p.pos = Vec2::new(900.0, 900.0);
-        p.vel = Vec2::new(30.0, -1800.0);
+        p.vel = Vec2::new(30.0, -1500.0);
         p.state = PetState::Falling;
         let mut min_top = f32::MAX;
         for _ in 0..300 {
@@ -1445,8 +1468,42 @@ mod tests {
         );
     }
 
+    /// Лазание идёт рывками (перехват лапами), но средняя скорость за
+    /// секунду совпадает с расчётной: пульсация не ускоряет и не тормозит.
+    #[test]
+    fn climb_pulses_but_keeps_average_speed() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(0.0, 900.0);
+        p.surface = Surface::WallLeft;
+        p.facing = Direction::Left; // вверх
+        p.state = PetState::Climb;
+        p.state_time = 0.0;
+        p.state_left = f32::INFINITY;
+        let start = p.pos.y;
+        let (mut min_step, mut max_step) = (f32::MAX, 0.0f32);
+        let mut prev = p.pos.y;
+        for _ in 0..120 {
+            p.tick(&w, 1.0 / 60.0);
+            let step = (prev - p.pos.y).abs();
+            min_step = min_step.min(step);
+            max_step = max_step.max(step);
+            prev = p.pos.y;
+        }
+        let avg = (start - p.pos.y) / 2.0; // px/s за две секунды
+        let want = p.cfg.climb_speed();
+        assert!(
+            (avg - want).abs() < want * 0.15,
+            "средняя скорость {avg} против расчётной {want}"
+        );
+        assert!(
+            max_step > min_step * 1.5,
+            "рывков нет: шаги {min_step}..{max_step}"
+        );
+    }
+
     /// Ориентация кадра: на полу — обычная, на потолке — вверх ногами
-    /// («на лапках»), на стенах — поворот на четверть (лезет боком).
+    /// («на лапках»), на стенах — профиль лицом к своей стене.
     #[test]
     fn orient_follows_surface() {
         let mut p = pet();
@@ -1456,12 +1513,16 @@ mod tests {
         assert!(p.orient().flip_x);
         p.surface = Surface::Ceiling;
         assert!(p.orient().flip_y, "под потолком ногами вверх");
-        // На стенах питомец лезет боком: кадр поворачивается на четверть,
-        // ноги упираются в стену (влево на левой, вправо на правой).
-        p.surface = Surface::WallLeft;
-        assert_eq!(p.orient().quarter_turns, 1);
-        p.surface = Surface::WallRight;
-        assert_eq!(p.orient().quarter_turns, 3);
+        // На стенах питомец нарисован в профиль и смотрит НА свою стену;
+        // направление движения (вверх/вниз) на зеркало не влияет, иначе он
+        // перекидывался бы лицом от стены при каждом развороте.
+        for facing in [Direction::Left, Direction::Right] {
+            p.facing = facing;
+            p.surface = Surface::WallLeft;
+            assert_eq!(p.orient(), Orient::mirrored(true), "лицом к левой стене");
+            p.surface = Surface::WallRight;
+            assert_eq!(p.orient(), Orient::IDENTITY, "лицом к правой стене");
+        }
     }
 
     /// «Уложить спать» на стене: питомец отцепляется и засыпает,
@@ -1556,6 +1617,51 @@ mod tests {
             "драг обязан тормозить: {} vs {}",
             dragged.pos.x,
             ballistic.pos.x
+        );
+    }
+
+    /// Падение не разгоняется бесконечно: есть предел скорости, иначе
+    /// питомец «телепортируется» вниз (жалоба «ебнутое ускорение»).
+    #[test]
+    fn falling_never_exceeds_terminal_speed() {
+        let w = world();
+        let mut p = pet();
+        p.pos = Vec2::new(900.0, 100.0);
+        p.state = PetState::Falling;
+        let limit = p.cfg.terminal_speed;
+        let mut peak = 0.0f32;
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+            peak = peak.max(p.vel.y);
+        }
+        assert!(peak <= limit + 1.0, "разогнался до {peak}, предел {limit}");
+        // И всё-таки долетел до земли — предел не превращается в зависание.
+        assert_eq!(p.pos.y, w.ground_y());
+    }
+
+    /// Резкий флик мышью не выстреливает питомцем через весь экран:
+    /// модуль скорости броска ограничен, направление сохраняется.
+    #[test]
+    fn throw_speed_is_capped() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        // Рывок вправо-вверх: 300 px за 10 мс = 30 000 px/s «в руках».
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(1200.0, 800.0)), 0.01));
+        assert!(p.pointer(&w, PointerEvent::Motion(Vec2::new(1500.0, 400.0)), 0.02));
+        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(1500.0, 400.0)), 0.02));
+        let speed = p.vel.x.hypot(p.vel.y);
+        assert!(
+            speed <= p.cfg.throw_speed_limit + 1.0,
+            "бросок {speed} px/s не ограничен"
+        );
+        assert!(
+            p.vel.x > 0.0 && p.vel.y < 0.0,
+            "направление броска сохранено"
         );
     }
 

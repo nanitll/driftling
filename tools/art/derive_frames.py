@@ -202,6 +202,99 @@ def stretch_up(grid: Grid) -> Grid:
     return out
 
 
+def cells_of(grid: Grid, ch: str) -> list[tuple[int, int]]:
+    return [(y, x) for y, row in enumerate(grid) for x, c in enumerate(row) if c == ch]
+
+
+def move_cells(grid: Grid, cells: list[tuple[int, int]], dx: int, dy: int = 0) -> None:
+    """Перенести пиксели внутри силуэта: исходные затираются телом, новые
+    рисуются только там, где под ними уже есть тело (за контур не вылезаем)."""
+    taken = [(y, x, grid[y][x]) for y, x in cells]
+    for y, x, _ in taken:
+        grid[y][x] = BODY
+    for y, x, ch in taken:
+        ny, nx = y + dy, x + dx
+        if 0 <= ny < len(grid) and 0 <= nx < len(grid[0]) and grid[ny][nx] in (BODY, "D"):
+            grid[ny][nx] = ch
+
+
+def profile_view(grid: Grid) -> Grid:
+    """Профиль (вид сбоку), мордой вправо.
+
+    Питомец нарисован анфас, но на стене он должен быть виден именно сбоку —
+    поэтому дальний глаз и дальняя щека убираются, ближние съезжают к морде,
+    брюшко уходит вперёд, а дальняя лапка прячется за ближней и темнеет.
+    """
+    out = [row[:] for row in grid]
+    width = len(out[0])
+    center = width // 2
+
+    # Глаза: дальний убираем, ближний остаётся у морды.
+    clusters = eye_clusters(out)
+    eye_cells = {c for cluster in clusters for c in cluster}
+    if clusters:
+        near = max(clusters, key=lambda c: sum(x for _, x in c) / len(c))
+        for cells in clusters:
+            if cells is near:
+                continue
+            for y, x in cells:
+                out[y][x] = BODY
+        # Ближний глаз и так стоит у морды — двигать его некуда,
+        # дальше только контур.
+
+    # Щёки: остаётся только ближняя.
+    for y, x in cells_of(out, "C"):
+        if x < center:
+            out[y][x] = BODY
+    # Рот уезжает к морде. Контур глаза тоже нарисован символом «E» —
+    # его трогать нельзя, иначе морда рассыпается.
+    mouth = [(y, x) for y, x in cells_of(out, EYE) if (y, x) not in eye_cells]
+    move_cells(out, mouth, +4)
+    # Брюшко видно спереди — сдвигаем вперёд.
+    move_cells(out, cells_of(out, "W"), +3)
+    # Антенна чуть заваливается назад.
+    an = anatomy(out)
+    out = shift_rows(out, list(range(0, an.body_top)), -1)
+
+    # Дальняя лапка прячется за ближнюю и уходит в тень.
+    an = anatomy(out)
+    groups = foot_columns(out, an.legs)
+    if len(groups) >= 2:
+        far_x0, far_x1 = groups[0]
+        far = [
+            (y, x)
+            for y in an.legs
+            for x in range(far_x0, far_x1 + 1)
+            if out[y][x] != EMPTY
+        ]
+        shade = [(y, x, "D" if out[y][x] == BODY else out[y][x]) for y, x in far]
+        for y, x in far:
+            out[y][x] = EMPTY
+        for y, x, ch in shade:
+            nx = x + 3
+            if 0 <= nx < width and out[y][nx] == EMPTY:
+                out[y][nx] = ch
+    return out
+
+
+def climb_profile(grid: Grid, near_up: int, far_up: int) -> Grid:
+    """Поза лазания в профиль: питомец висит вертикально, мордой к стене,
+    лапки цепляются за неё спереди. Стена — слева от кадра после зеркала,
+    поэтому лапки рисуем со стороны морды.
+
+    `near_up`/`far_up` — на сколько рядов подтянута передняя и задняя лапка.
+    """
+    # Лапки, на которых он ходит по полу, поджаты: на стене все четыре
+    # держатся за неё, а не болтаются вниз.
+    out = drop_legs(profile_view(grid), keep=0)
+    an = anatomy(out)
+    height = max(4, an.body_bottom - an.body_top)
+    # Лапки цепляются спереди: верхняя — у плеча, нижняя — у бедра.
+    draw_paw(out, an.body_top + height // 4 - near_up, on_left=False)
+    draw_paw(out, an.body_bottom - height // 3 - far_up, on_left=False)
+    return out
+
+
 def back_view(grid: Grid) -> Grid:
     """Вид со спины: питомец прижался к поверхности, лица и брюшка не видно.
 
@@ -363,16 +456,15 @@ def derive(stage: str) -> dict[str, Grid]:
     # Топчется и водит антенной.
     out["wiggle_0"] = shift_rows(idle, antenna, +1)
     out["wiggle_1"] = shift_rows(src["idle_1"], antenna, -1)
-    # Висит на стене без движения: все четыре лапки держат.
-    out["cling_0"] = climb_pose(idle, paw_up=0, feet=[0, 0])
-    out["cling_1"] = climb_pose(src["idle_1"], paw_up=0, feet=[0, 0])
-    # Лезет по стене: шаг берём из готового цикла ходьбы, добавляя
-    # цепляющиеся передние лапки. Задние двигаются только вверх — вниз
-    # им некуда, там край кадра.
-    out["climb_0"] = climb_pose(src["walk_0"], paw_up=-1, feet=[0, -1])
-    out["climb_1"] = climb_pose(src["walk_1"], paw_up=0, feet=[0, 0])
-    out["climb_2"] = climb_pose(src["walk_2"], paw_up=+1, feet=[-1, 0])
-    out["climb_3"] = climb_pose(src["walk_3"], paw_up=0, feet=[0, 0])
+    # Висит на стене без движения: обе лапки держат вровень.
+    out["cling_0"] = climb_profile(idle, near_up=0, far_up=0)
+    out["cling_1"] = climb_profile(src["idle_1"], near_up=0, far_up=0)
+    # Лезет: лапки перехватывают по очереди — передняя тянется, задняя
+    # подтягивается следом.
+    out["climb_0"] = climb_profile(idle, near_up=2, far_up=0)
+    out["climb_1"] = climb_profile(src["idle_1"], near_up=1, far_up=1)
+    out["climb_2"] = climb_profile(idle, near_up=0, far_up=2)
+    out["climb_3"] = climb_profile(src["idle_1"], near_up=1, far_up=1)
     # Звёздочки после удара о потолок.
     dizzy = close_eyes(src["landing_0"])
     out["dizzy_0"] = add_stars(dizzy, [(2, -7), (5, 4)])

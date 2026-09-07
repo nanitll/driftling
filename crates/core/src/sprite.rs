@@ -174,24 +174,31 @@ pub struct SpriteSet {
     pub climb: Vec<Frame>,
     /// Звёздочки после удара о потолок.
     pub dizzy: Vec<Frame>,
-    /// Прозрачные поля поз хвата (climb/cling): на них сдвигается рисунок,
-    /// чтобы лапки касались стены или потолка. Заполняется сборкой набора.
+    /// Прозрачные поля поз хвата (climb/cling) — ими питомец прижимается
+    /// к стене: спереди (морда и лапки) это правое поле кадра.
     pub grip_inset: Inset,
+    /// Прозрачные поля ходьбы — ими он прижимается к потолку (низ кадра,
+    /// там ноги). Заполняются сборкой набора.
+    pub feet_inset: Inset,
 }
 
 impl SpriteSet {
-    /// Пересчитать поля хвата по кадрам лазания (или отката к ходьбе).
-    /// К поверхности всегда обращены НОГИ, то есть низ кадра, — значит
-    /// прижимать питомца нужно на нижнее поле (`Inset::bottom`).
+    /// Пересчитать поля прижатия: к стене — по кадрам лазания (профиль,
+    /// перёд кадра), к потолку — по кадрам ходьбы (ноги внизу кадра).
     pub fn with_grip_inset(mut self) -> Self {
-        let frames = if !self.climb.is_empty() {
+        let grip = if !self.climb.is_empty() {
             &self.climb
         } else if !self.cling.is_empty() {
             &self.cling
         } else {
             &self.walk
         };
-        self.grip_inset = frames_inset(frames);
+        self.grip_inset = frames_inset(grip);
+        self.feet_inset = frames_inset(if self.walk.is_empty() {
+            &self.idle
+        } else {
+            &self.walk
+        });
         self
     }
 }
@@ -577,6 +584,7 @@ pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet
             ),
         ],
         grip_inset: Inset::default(),
+        feet_inset: Inset::default(),
     }
     .with_grip_inset()
 }

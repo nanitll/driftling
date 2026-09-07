@@ -588,6 +588,7 @@ impl Pack {
                 climb: Vec::new(),
                 dizzy: Vec::new(),
                 grip_inset: Default::default(),
+                feet_inset: Default::default(),
             }
             .with_grip_inset();
         }
@@ -613,6 +614,7 @@ impl Pack {
             climb: opt(&st.anims, "climb"),
             dizzy: opt(&st.anims, "dizzy"),
             grip_inset: Default::default(),
+            feet_inset: Default::default(),
         }
         .with_grip_inset()
     }
@@ -715,6 +717,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "baby/landing_0",
         include_str!("../../../assets/pack-default/baby/landing_0.txt"),
+    ),
+    (
+        "baby/profile_0",
+        include_str!("../../../assets/pack-default/baby/profile_0.txt"),
+    ),
+    (
+        "baby/profile_1",
+        include_str!("../../../assets/pack-default/baby/profile_1.txt"),
     ),
     (
         "baby/sad_0",
@@ -845,6 +855,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/child/landing_0.txt"),
     ),
     (
+        "child/profile_0",
+        include_str!("../../../assets/pack-default/child/profile_0.txt"),
+    ),
+    (
+        "child/profile_1",
+        include_str!("../../../assets/pack-default/child/profile_1.txt"),
+    ),
+    (
         "child/sad_0",
         include_str!("../../../assets/pack-default/child/sad_0.txt"),
     ),
@@ -973,6 +991,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/teen/landing_0.txt"),
     ),
     (
+        "teen/profile_0",
+        include_str!("../../../assets/pack-default/teen/profile_0.txt"),
+    ),
+    (
+        "teen/profile_1",
+        include_str!("../../../assets/pack-default/teen/profile_1.txt"),
+    ),
+    (
         "teen/sad_0",
         include_str!("../../../assets/pack-default/teen/sad_0.txt"),
     ),
@@ -1099,6 +1125,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "adult/landing_0",
         include_str!("../../../assets/pack-default/adult/landing_0.txt"),
+    ),
+    (
+        "adult/profile_0",
+        include_str!("../../../assets/pack-default/adult/profile_0.txt"),
+    ),
+    (
+        "adult/profile_1",
+        include_str!("../../../assets/pack-default/adult/profile_1.txt"),
     ),
     (
         "adult/sad_0",

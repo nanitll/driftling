@@ -615,15 +615,18 @@ fn intersect(a: Rect, b: Rect) -> Rect {
 
 /// Сдвиг рисунка к поверхности на прозрачное поле кадра (фаза G2):
 /// лапки должны касаться стены и потолка, а не висеть в пикселе от них.
-/// К поверхности всегда обращён НИЗ кадра (на стене он повёрнут, под
-/// потолком отражён), поэтому берётся нижнее поле.
-fn grip_shift(bounds: Rect, surface: Surface, inset: sprite::Inset) -> Rect {
-    let pad = inset.bottom as f32;
+///
+/// К стене питомец повёрнут ПЕРЕДОМ (профильные кадры лазания нарисованы
+/// мордой вправо, к левой стене зеркалятся) — берём переднее поле кадра.
+/// К потолку он обращён ногами — там нижнее поле кадров ходьбы.
+fn grip_shift(bounds: Rect, surface: Surface, sprites: &SpriteSet) -> Rect {
+    let front = sprites.grip_inset.right as f32;
+    let feet = sprites.feet_inset.bottom as f32;
     let (dx, dy) = match surface {
         Surface::Floor => (0.0, 0.0),
-        Surface::WallLeft => (-pad, 0.0),
-        Surface::WallRight => (pad, 0.0),
-        Surface::Ceiling => (0.0, -pad),
+        Surface::WallLeft => (-front, 0.0),
+        Surface::WallRight => (front, 0.0),
+        Surface::Ceiling => (0.0, -feet),
     };
     Rect::new(bounds.x + dx, bounds.y + dy, bounds.w, bounds.h)
 }
@@ -1907,7 +1910,7 @@ impl App for DaemonApp {
                 // На стене и под потолком рисунок прижимается к поверхности:
                 // пустое поле кадра иначе оставило бы питомца висеть в
                 // паре пикселей от неё. Хит-область едет вместе с рисунком.
-                let bounds = grip_shift(pet.bounds(), pet.surface, self.sprites.grip_inset);
+                let bounds = grip_shift(pet.bounds(), pet.surface, &self.sprites);
                 // Полный вид (B2/B5): настроение из статов; «радостное»
                 // окно после игры/поглаживания перекрывает настроение.
                 let mood = if self.happy_until.is_some() {
@@ -2279,22 +2282,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Фаза G2: на стене и под потолком рисунок прижимается к поверхности
-    /// на нижнее поле кадра (к поверхности всегда обращены ноги), а на полу
-    /// не сдвигается.
+    /// Фаза G2: к стене питомец прижимается ПЕРЕДОМ (переднее поле
+    /// профильного кадра), к потолку — ногами (нижнее поле ходьбы),
+    /// а на полу рисунок не сдвигается.
     #[test]
     fn grip_shift_hugs_the_surface() {
-        let inset = sprite::Inset {
+        let mut sprites = sprite::placeholder(64);
+        sprites.grip_inset = sprite::Inset {
             left: 3,
             right: 4,
             top: 2,
             bottom: 5,
         };
+        sprites.feet_inset = sprite::Inset {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 6,
+        };
         let b = Rect::new(100.0, 200.0, 64.0, 64.0);
-        assert_eq!(grip_shift(b, Surface::Floor, inset), b);
-        assert_eq!(grip_shift(b, Surface::WallLeft, inset).x, 95.0);
-        assert_eq!(grip_shift(b, Surface::WallRight, inset).x, 105.0);
-        assert_eq!(grip_shift(b, Surface::Ceiling, inset).y, 195.0);
+        assert_eq!(grip_shift(b, Surface::Floor, &sprites), b);
+        assert_eq!(grip_shift(b, Surface::WallLeft, &sprites).x, 96.0);
+        assert_eq!(grip_shift(b, Surface::WallRight, &sprites).x, 104.0);
+        assert_eq!(grip_shift(b, Surface::Ceiling, &sprites).y, 194.0);
     }
 
     #[test]
