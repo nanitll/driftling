@@ -218,6 +218,9 @@ fn build_snapshot(root: &Node) -> WorldSnapshot {
     WorldSnapshot {
         platforms,
         workspace_bottom,
+        // sway отдаёт прямоугольник текущего воркспейса; разбивки рабочих
+        // областей по выходам тут нет — демон обойдётся workspace_bottom.
+        screen_areas: Vec::new(),
         fullscreen_active,
     }
 }

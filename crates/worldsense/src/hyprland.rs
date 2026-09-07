@@ -173,6 +173,9 @@ fn build_snapshot(clients_json: &str, monitors_json: &str) -> Option<WorldSnapsh
     Some(WorldSnapshot {
         platforms,
         workspace_bottom,
+        // Hyprland отдаёт резерв баров одним числом на монитор — разбивки
+        // по выходам нет, демон возьмёт workspace_bottom.
+        screen_areas: Vec::new(),
         fullscreen_active,
     })
 }

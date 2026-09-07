@@ -202,6 +202,126 @@ def stretch_up(grid: Grid) -> Grid:
     return out
 
 
+def back_view(grid: Grid) -> Grid:
+    """Вид со спины: питомец прижался к поверхности, лица и брюшка не видно.
+
+    Именно так он выглядит, когда лезет по стене или висит под потолком, —
+    поворачивать кадр боком (как на первой итерации фазы G) неправдоподобно.
+    """
+    out = [row[:] for row in grid]
+    for y, row in enumerate(out):
+        for x, ch in enumerate(row):
+            # Глаза, блики, щёки, рот и светлое брюшко — всё это спереди.
+            if ch in (EYE, SHINE, "C", "W"):
+                out[y][x] = BODY
+    return out
+
+
+def side_margin(grid: Grid, y: int) -> tuple[int, int]:
+    """Крайние занятые пиксели ряда (слева, справа); (-1, -1) — ряд пуст."""
+    xs = [x for x, c in enumerate(grid[y]) if c != EMPTY]
+    return (xs[0], xs[-1]) if xs else (-1, -1)
+
+
+def paw_row(grid: Grid, lo: int, hi: int) -> int:
+    """Ряд в полосе [lo, hi], где силуэт уже всего: там лапка не сольётся с телом."""
+    best, best_w = lo, 10**6
+    for y in range(max(0, lo), min(hi + 1, len(grid))):
+        left, right = side_margin(grid, y)
+        if left < 0:
+            continue
+        if right - left < best_w:
+            best, best_w = y, right - left
+    return best
+
+
+def outline_around(grid: Grid, cells: list[tuple[int, int]]) -> None:
+    """Обвести контуром только что нарисованные пиксели тела."""
+    height, width = len(grid), len(grid[0])
+    for y, x in cells:
+        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+            if 0 <= ny < height and 0 <= nx < width and grid[ny][nx] == EMPTY:
+                grid[ny][nx] = "O"
+
+
+def draw_paw(grid: Grid, y: int, on_left: bool) -> None:
+    """Лапка сбоку от корпуса: 2x2 «варежка» вплотную к силуэту, со своим
+    контуром. Ряд за рядом лапка повторяет изгиб тела и не отлипает."""
+    width = len(grid[0])
+    painted: list[tuple[int, int]] = []
+    for dy in (0, 1):
+        row = y + dy
+        if not 0 <= row < len(grid):
+            continue
+        left, right = side_margin(grid, row)
+        if left < 0:
+            continue
+        for dx in (1, 2):
+            x = (left - dx) if on_left else (right + dx)
+            if 0 <= x < width and grid[row][x] == EMPTY:
+                grid[row][x] = BODY
+                painted.append((row, x))
+    outline_around(grid, painted)
+
+
+def foot_columns(grid: Grid, legs: list[int]) -> list[tuple[int, int]]:
+    """Колонки левой и правой лапки (по просвету между ними)."""
+    cols = sorted({x for y in legs for x, c in enumerate(grid[y]) if c != EMPTY})
+    if not cols:
+        return []
+    groups, start, prev = [], cols[0], cols[0]
+    for x in cols[1:]:
+        if x - prev > 1:
+            groups.append((start, prev))
+            start = x
+        prev = x
+    groups.append((start, prev))
+    return groups
+
+
+def shift_feet(grid: Grid, offsets: list[int]) -> Grid:
+    """Поднять/опустить лапки: шаг лазания. `offsets` — по лапке слева направо."""
+    an = anatomy(grid)
+    if not an.legs:
+        return [row[:] for row in grid]
+    groups = foot_columns(grid, an.legs)
+    out = [row[:] for row in grid]
+    for i, (x0, x1) in enumerate(groups):
+        dy = offsets[i] if i < len(offsets) else 0
+        if dy == 0:
+            continue
+        cells = [
+            (y, x, grid[y][x])
+            for y in an.legs
+            for x in range(x0, x1 + 1)
+            if grid[y][x] != EMPTY
+        ]
+        for y, x, _ in cells:
+            out[y][x] = EMPTY
+        for y, x, ch in cells:
+            ny = y + dy
+            if 0 <= ny < len(out):
+                out[ny][x] = ch
+    return out
+
+
+def climb_pose(grid: Grid, paw_up: int, feet: list[int]) -> Grid:
+    """Кадр лазания: спина к нам, четыре лапки держатся за поверхность,
+    шаг по диагонали (передняя лапка тянется вверх, задняя с другой стороны
+    подтягивается).
+
+    `paw_up`: -1 — тянется левая передняя, +1 — правая, 0 — обе вровень.
+    """
+    out = back_view(grid)
+    an = anatomy(out)
+    height = max(2, an.body_bottom - an.body_top)
+    # Лапки крепим в верхней трети корпуса, где силуэт уже.
+    upper = paw_row(out, an.body_top + 1, an.body_top + height // 3)
+    draw_paw(out, upper + (0 if paw_up < 0 else 2), on_left=True)
+    draw_paw(out, upper + (0 if paw_up > 0 else 2), on_left=False)
+    return shift_feet(out, feet)
+
+
 def add_stars(grid: Grid, centers: list[tuple[int, int]]) -> Grid:
     """Звёздочки-крестики над головой (кадры оглушения).
 
@@ -241,12 +361,15 @@ def derive(stage: str) -> dict[str, Grid]:
     # Топчется и водит антенной.
     out["wiggle_0"] = shift_rows(idle, antenna, +1)
     out["wiggle_1"] = shift_rows(src["idle_1"], antenna, -1)
-    # Держится за поверхность: лапки укорочены в хват.
-    out["cling_0"] = drop_legs(idle, keep=1)
-    out["cling_1"] = shift_rows(drop_legs(idle, keep=1), antenna, +1)
-    # Ползёт: тот же шаг, но лапки в хвате.
-    for i in range(4):
-        out[f"climb_{i}"] = drop_legs(src[f"walk_{i}"], keep=1)
+    # Держится за поверхность: спина к нам, все лапки на месте.
+    out["cling_0"] = climb_pose(idle, paw_up=0, feet=[0, 0])
+    out["cling_1"] = shift_rows(climb_pose(idle, paw_up=0, feet=[0, 0]), antenna, +1)
+    # Ползёт: диагональный шаг — левая передняя с правой задней и наоборот.
+    # Лапки двигаются только вверх: вниз им некуда — там край кадра.
+    out["climb_0"] = climb_pose(idle, paw_up=-1, feet=[0, -1])
+    out["climb_1"] = climb_pose(idle, paw_up=0, feet=[0, 0])
+    out["climb_2"] = climb_pose(idle, paw_up=+1, feet=[-1, 0])
+    out["climb_3"] = climb_pose(idle, paw_up=0, feet=[0, 0])
     # Звёздочки после удара о потолок.
     dizzy = close_eyes(src["landing_0"])
     out["dizzy_0"] = add_stars(dizzy, [(2, -7), (5, 4)])

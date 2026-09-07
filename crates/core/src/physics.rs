@@ -25,9 +25,8 @@ pub struct Platform {
 /// и ориентация кадра.
 ///
 /// Направление движения вдоль поверхности задаётся [`Surface::tangent`] при
-/// `facing = Right`; знак `facing` его переворачивает. Тангенсы выбраны так,
-/// чтобы «нос» повёрнутого кадра всегда смотрел вперёд по движению:
-/// на левой стене `Right` — это вниз, на правой — вверх (см. [`Surface::orient`]).
+/// `facing = Right`; знак `facing` его переворачивает. На стенах движение
+/// вертикальное: на левой `Right` — вниз, на правой — вверх.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Surface {
     /// Земля или верхняя кромка окна: ноги вниз (модель фаз M0–D).
@@ -43,8 +42,11 @@ pub enum Surface {
 
 /// Ориентация кадра при отрисовке: локальные отражения спрайта, затем
 /// поворот на `quarter_turns` четвертей по часовой стрелке.
-/// Кадры пака нарисованы мордой вправо и ногами вниз — всё остальное
-/// получается этой трансформацией, отдельного арта под стены не нужно.
+///
+/// Питомец пользуется только отражениями: на стене он не лежит боком, а
+/// держится за неё спиной к нам (для этого в паке есть свои кадры `climb`
+/// и `cling`), под потолком висит вверх ногами. Повороты оставлены в
+/// контракте рендера для паков и будущих поз — блит их умеет.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Orient {
     /// Отразить по горизонтали в системе координат кадра (смотрит влево).
@@ -142,34 +144,24 @@ impl Surface {
         matches!(self, Surface::Floor | Surface::Ceiling)
     }
 
-    /// Ориентация кадра: ноги всегда упираются в поверхность.
+    /// Ориентация кадра под поверхность.
+    ///
+    /// На полу — привычное зеркало по направлению взгляда. На стене питомец
+    /// стоит вертикально и держится за неё спиной к зрителю (кадры `climb`/
+    /// `cling`): поворачивать его боком неправдоподобно, а зеркалить нечего —
+    /// поза симметрична, и мельтешение при смене направления только мешало бы.
+    /// Под потолком тот же кадр отражается по вертикали — питомец висит,
+    /// зацепившись лапками, антенной вниз.
     pub fn orient(self, facing: Direction) -> Orient {
         let flip_x = facing == Direction::Left;
         match self {
-            Surface::Floor => Orient {
-                flip_x,
-                flip_y: false,
-                quarter_turns: 0,
-            },
-            // Потолок — вертикальное отражение: ноги вверх, направление взгляда
-            // по горизонтали сохраняется.
+            Surface::Floor => Orient::mirrored(flip_x),
             Surface::Ceiling => Orient {
                 flip_x,
                 flip_y: true,
                 quarter_turns: 0,
             },
-            // Поворот на 90° по часовой: низ кадра уходит влево — ноги в стену.
-            Surface::WallLeft => Orient {
-                flip_x,
-                flip_y: false,
-                quarter_turns: 1,
-            },
-            // Против часовой (три четверти по часовой): низ кадра уходит вправо.
-            Surface::WallRight => Orient {
-                flip_x,
-                flip_y: false,
-                quarter_turns: 3,
-            },
+            Surface::WallLeft | Surface::WallRight => Orient::IDENTITY,
         }
     }
 
@@ -187,6 +179,82 @@ impl Surface {
 /// Порог «ступеньки» при ходьбе, px: перепад опоры в пределах порога
 /// перешагивается (снап вверх/вниз), больший обрыв вниз — падение.
 pub const STEP_SNAP: f32 = 12.0;
+
+/// Минимальная ширина карниза, на который питомца вообще пускают, px.
+/// Кусочки уже этого — щели между окнами, а не место для жизни.
+pub const MIN_LEDGE: f32 = 24.0;
+
+/// Видимые участки верхних кромок окон (фаза G2).
+///
+/// На вход — окна В ПОРЯДКЕ СТЕКИНГА СВЕРХУ ВНИЗ (первое самое верхнее),
+/// как их отдаёт worldsense. Кромка окна, накрытая другим окном, местом для
+/// стояния не является: иначе питомец «стоит в воздухе» посреди чужого окна —
+/// именно это и выглядит как сломанный поиск опоры.
+///
+/// Каждая кромка режется на видимые отрезки, и каждый отрезок становится
+/// отдельной платформой (id сохраняется — платформы одного окна связаны).
+/// Отрезки уже `min_width` выбрасываются, кромки за пределами экрана —
+/// обрезаются по нему.
+///
+/// `head_room` — высота питомца: над кромкой должно остаться место, где его
+/// видно. Кромка максимизированного окна лежит на самом верху экрана, и
+/// питомец, «стоящий» на ней, оказался бы телом за верхним краем — то есть
+/// невидимым. Такие кромки не платформы (наверху есть потолок — на нём
+/// питомец висит и его видно).
+pub fn visible_ledges(
+    stack_top_first: &[Platform],
+    screen: Rect,
+    min_width: f32,
+    head_room: f32,
+) -> Vec<Platform> {
+    let mut out = Vec::new();
+    for (i, p) in stack_top_first.iter().enumerate() {
+        let top = p.rect.y;
+        // Кромка выше/ниже экрана или без места для питомца над ней.
+        if top - head_room < screen.y || top > screen.bottom() {
+            continue;
+        }
+        let mut spans = vec![(p.rect.x.max(screen.x), p.rect.right().min(screen.right()))];
+        for above in &stack_top_first[..i] {
+            let r = above.rect;
+            // Окно накрывает кромку, только если пересекает её по вертикали:
+            // верх окна не ниже кромки, низ — строго ниже неё.
+            if r.y <= top && r.bottom() > top {
+                spans = subtract_span(&spans, r.x, r.right());
+                if spans.is_empty() {
+                    break;
+                }
+            }
+        }
+        for (x0, x1) in spans {
+            if x1 - x0 >= min_width {
+                out.push(Platform {
+                    rect: Rect::new(x0, top, x1 - x0, p.rect.h),
+                    id: p.id,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Вычесть отрезок `[lo, hi)` из набора непересекающихся отрезков.
+fn subtract_span(spans: &[(f32, f32)], lo: f32, hi: f32) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    for &(a, b) in spans {
+        if hi <= a || lo >= b {
+            out.push((a, b)); // не пересекаются
+            continue;
+        }
+        if lo > a {
+            out.push((a, lo));
+        }
+        if hi < b {
+            out.push((hi, b));
+        }
+    }
+    out
+}
 
 /// Допуск «опора всё ещё под ногами», px: при изменении мира опора,
 /// уехавшая по вертикали не дальше допуска, догоняется снапом,
@@ -266,6 +334,118 @@ mod tests {
         assert_eq!(support_below(&w, 100.0, 0.0), 500.0);
         assert_eq!(support_below(&w, 300.0, 0.0), 500.0);
         assert_eq!(support_below(&w, 300.1, 0.0), w.ground_y());
+    }
+
+    // ---- Видимые кромки (фаза G2) ---------------------------------------
+
+    fn screen() -> Rect {
+        Rect::new(0.0, 0.0, 1920.0, 1080.0)
+    }
+
+    /// Окно с явной высотой: для перекрытий важно, докуда окно достаёт вниз.
+    fn win(x: f32, y: f32, w: f32, h: f32, id: u64) -> Platform {
+        Platform {
+            rect: Rect::new(x, y, w, h),
+            id,
+        }
+    }
+
+    /// Окно, целиком накрытое окном сверху, платформ не даёт: именно так
+    /// питомец и оказывался «стоящим в воздухе» посреди чужого окна.
+    #[test]
+    fn covered_window_gives_no_ledge() {
+        let stack = vec![
+            win(0.0, 100.0, 1920.0, 900.0, 1),  // сверху, почти во весь экран
+            win(300.0, 500.0, 600.0, 400.0, 2), // под ним
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        assert_eq!(vis.len(), 1, "видна только кромка верхнего окна: {vis:?}");
+        assert_eq!(vis[0].id, 1);
+    }
+
+    /// Частичное перекрытие: кромка режется на видимые куски.
+    #[test]
+    fn partly_covered_ledge_splits_into_visible_spans() {
+        let stack = vec![
+            win(500.0, 100.0, 300.0, 900.0, 1), // накрывает середину кромки
+            win(300.0, 500.0, 900.0, 400.0, 2),
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        let lower: Vec<_> = vis.iter().filter(|p| p.id == 2).collect();
+        assert_eq!(lower.len(), 2, "две видимые части: {vis:?}");
+        assert_eq!((lower[0].rect.x, lower[0].rect.right()), (300.0, 500.0));
+        assert_eq!((lower[1].rect.x, lower[1].rect.right()), (800.0, 1200.0));
+    }
+
+    /// Окно сверху, но НИЖЕ кромки (его верх ниже) — не мешает: кромка видна.
+    #[test]
+    fn window_below_the_ledge_does_not_cover_it() {
+        let stack = vec![
+            win(0.0, 700.0, 1920.0, 300.0, 1), // выше по стекингу, ниже по экрану
+            win(300.0, 500.0, 600.0, 400.0, 2),
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        assert!(vis.iter().any(|p| p.id == 2), "кромка не накрыта: {vis:?}");
+    }
+
+    /// Узкие щели между окнами платформами не становятся.
+    #[test]
+    fn narrow_gaps_are_dropped() {
+        let stack = vec![
+            win(0.0, 100.0, 500.0, 900.0, 1),
+            win(510.0, 100.0, 500.0, 900.0, 2), // щель 10 px между ними
+            win(0.0, 500.0, 1920.0, 400.0, 3),
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        let bottom: Vec<_> = vis.iter().filter(|p| p.id == 3).collect();
+        assert!(
+            bottom.iter().all(|p| p.rect.w >= MIN_LEDGE),
+            "щели отброшены: {bottom:?}"
+        );
+        assert!(
+            !bottom.iter().any(|p| (p.rect.x - 500.0).abs() < 1.0),
+            "щели 500..510 быть не должно: {bottom:?}"
+        );
+    }
+
+    /// Кромки за пределами экрана обрезаются, а совсем чужие — выбрасываются.
+    #[test]
+    fn ledges_are_clipped_to_the_screen() {
+        let stack = vec![
+            win(-400.0, 300.0, 900.0, 400.0, 1), // торчит слева за экран
+            win(0.0, -50.0, 800.0, 400.0, 2),    // кромка над экраном
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        assert_eq!(vis.len(), 1);
+        assert_eq!((vis[0].rect.x, vis[0].rect.right()), (0.0, 500.0));
+    }
+
+    /// Видимые кромки годятся как есть для support_below: питомец на
+    /// накрытом окне опоры не находит и падает на землю.
+    #[test]
+    fn support_uses_visible_ledges_only() {
+        let stack = vec![
+            win(0.0, 100.0, 1920.0, 900.0, 1),
+            win(300.0, 500.0, 600.0, 400.0, 2),
+        ];
+        let mut w = World::new(screen());
+        w.platforms = visible_ledges(&stack, screen(), MIN_LEDGE, 0.0);
+        // Точка под верхним окном, но над «накрытой» кромкой второго.
+        assert_eq!(support_below(&w, 600.0, 300.0), w.ground_y());
+    }
+
+    /// Кромка максимизированного окна (y = верх экрана) платформой не
+    /// становится: стоя на ней, питомец был бы телом за краем экрана.
+    #[test]
+    fn ledge_without_head_room_is_dropped() {
+        let stack = vec![
+            win(0.0, 0.0, 1920.0, 1080.0, 1), // максимизированное
+            win(200.0, 300.0, 600.0, 400.0, 2),
+        ];
+        let vis = visible_ledges(&stack, screen(), MIN_LEDGE, 64.0);
+        assert!(vis.is_empty(), "стоять негде: {vis:?}");
+        // Без требования места кромка бы нашлась — значит отсекает именно оно.
+        assert_eq!(visible_ledges(&stack, screen(), MIN_LEDGE, 0.0).len(), 1);
     }
 
     /// Верх панели (exclusive-зона, D5) — пол: без платформ опора = override.

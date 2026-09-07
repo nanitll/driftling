@@ -8,7 +8,7 @@
 use driftling_core::Rect;
 use serde::Deserialize;
 
-use crate::{WindowPlatform, WorldSnapshot};
+use crate::{ScreenArea, WindowPlatform, WorldSnapshot};
 
 /// Кромка короче этого — не платформа (стоять негде): отсекает служебные
 /// окна-точки вроде xwaylandvideobridge (1×1 px). Общий порог всех провайдеров.
@@ -44,12 +44,28 @@ pub(crate) struct RawWorkArea {
     pub h: f32,
 }
 
+/// Рабочая область одного выхода: `s*` — геометрия экрана, остальное —
+/// свободная от панелей область (обе в глобальных координатах).
+#[derive(Debug, Deserialize)]
+pub(crate) struct RawScreenArea {
+    pub sx: f32,
+    pub sy: f32,
+    pub sw: f32,
+    pub sh: f32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawSnapshot {
     #[serde(default)]
     pub windows: Vec<RawWindow>,
     #[serde(default, rename = "workArea")]
     pub work_area: Option<RawWorkArea>,
+    #[serde(default, rename = "workAreas")]
+    pub work_areas: Vec<RawScreenArea>,
     #[serde(default, rename = "anyFullscreen")]
     pub any_fullscreen: bool,
 }
@@ -77,8 +93,18 @@ pub(crate) fn filter(raw: &RawSnapshot) -> WorldSnapshot {
         .collect();
     // Скрипт шлёт снизу вверх, наружу отдаём сверху вниз.
     platforms.reverse();
+    let screen_areas = raw
+        .work_areas
+        .iter()
+        .filter(|a| a.sw > 0.0 && a.sh > 0.0 && a.w > 0.0 && a.h > 0.0)
+        .map(|a| ScreenArea {
+            screen: Rect::new(a.sx, a.sy, a.sw, a.sh),
+            area: Rect::new(a.x, a.y, a.w, a.h),
+        })
+        .collect();
     WorldSnapshot {
         platforms,
+        screen_areas,
         workspace_bottom: raw.work_area.as_ref().map(|wa| wa.y + wa.h),
         // Флагу скрипта доверяем, но на всякий случай дублируем по окнам.
         fullscreen_active: raw.any_fullscreen
@@ -145,6 +171,46 @@ mod tests {
             (top.rect.x, top.rect.y, top.rect.w, top.rect.h),
             (348.0, 112.0, 1270.0, 855.0)
         );
+    }
+
+    /// Рабочие области по выходам: разбираются вместе с геометрией экранов,
+    /// и демон выбирает свою по пересечению (двухмониторный случай).
+    #[test]
+    fn rabochie_oblasti_po_vyhodam() {
+        let json = r#"{
+            "windows": [],
+            "workArea": {"x": 0, "y": 0, "w": 1920, "h": 1040},
+            "workAreas": [
+                {"sx": 0, "sy": 0, "sw": 1920, "sh": 1080,
+                 "x": 0, "y": 0, "w": 1920, "h": 1040},
+                {"sx": 1920, "sy": 0, "sw": 1920, "sh": 1080,
+                 "x": 1920, "y": 0, "w": 1860, "h": 1080}
+            ]
+        }"#;
+        let snap = parse_and_filter(json).unwrap();
+        assert_eq!(snap.screen_areas.len(), 2);
+        // Свой выход — второй монитор: область без боковой панели.
+        let mine = snap
+            .area_for_output(Rect::new(1920.0, 0.0, 1920.0, 1080.0))
+            .expect("область своего выхода");
+        assert_eq!((mine.x, mine.w, mine.h), (1920.0, 1860.0, 1080.0));
+        // Первый монитор — своя область с нижней панелью.
+        let other = snap
+            .area_for_output(Rect::new(0.0, 0.0, 1920.0, 1080.0))
+            .unwrap();
+        assert_eq!(other.h, 1040.0);
+        // Выход, которого в снапшоте нет, области не получает.
+        assert!(snap
+            .area_for_output(Rect::new(9000.0, 0.0, 800.0, 600.0))
+            .is_none());
+    }
+
+    /// Старый скрипт без workAreas: список пуст, общий workArea жив.
+    #[test]
+    fn bez_workareas_ostayotsya_obshchiy() {
+        let snap = parse_and_filter(SAMPLE).unwrap();
+        assert!(snap.screen_areas.is_empty());
+        assert_eq!(snap.workspace_bottom, Some(1080.0));
     }
 
     #[test]

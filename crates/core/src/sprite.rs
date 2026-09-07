@@ -88,6 +88,58 @@ pub fn stage_scale(stage: Stage) -> f32 {
     }
 }
 
+/// Прозрачные поля кадра, px: сколько пустоты от края спрайта до рисунка.
+/// Нужны, чтобы на стене и потолке питомец прижимался к поверхности
+/// вплотную, а не висел в воздухе на ширину пустого поля кадра.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Inset {
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub bottom: u32,
+}
+
+/// Минимальные (по всем кадрам семейства) прозрачные поля.
+/// Пустое семейство или полностью прозрачные кадры — нули.
+pub fn frames_inset(frames: &[Frame]) -> Inset {
+    let mut acc: Option<Inset> = None;
+    for f in frames {
+        let mut min_x = f.w;
+        let mut max_x = 0u32;
+        let mut min_y = f.h;
+        let mut max_y = 0u32;
+        for y in 0..f.h {
+            for x in 0..f.w {
+                if f.argb[(y * f.w + x) as usize] >> 24 != 0 {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if min_x > max_x {
+            continue; // кадр пуст
+        }
+        let cur = Inset {
+            left: min_x,
+            right: f.w - 1 - max_x,
+            top: min_y,
+            bottom: f.h - 1 - max_y,
+        };
+        acc = Some(match acc {
+            None => cur,
+            Some(a) => Inset {
+                left: a.left.min(cur.left),
+                right: a.right.min(cur.right),
+                top: a.top.min(cur.top),
+                bottom: a.bottom.min(cur.bottom),
+            },
+        });
+    }
+    acc.unwrap_or_default()
+}
+
 /// Набор кадров под каждое состояние. Все семейства сгенерированы под один
 /// размер `size`; масштаб стадии применяется при генерации набора.
 #[derive(Debug, Clone)]
@@ -122,6 +174,24 @@ pub struct SpriteSet {
     pub climb: Vec<Frame>,
     /// Звёздочки после удара о потолок.
     pub dizzy: Vec<Frame>,
+    /// Прозрачные поля поз хвата (climb/cling): на них сдвигается рисунок,
+    /// чтобы лапки касались стены или потолка. Заполняется сборкой набора.
+    pub grip_inset: Inset,
+}
+
+impl SpriteSet {
+    /// Пересчитать поля хвата по кадрам лазания (или отката к ходьбе).
+    pub fn with_grip_inset(mut self) -> Self {
+        let frames = if !self.climb.is_empty() {
+            &self.climb
+        } else if !self.cling.is_empty() {
+            &self.cling
+        } else {
+            &self.walk
+        };
+        self.grip_inset = frames_inset(frames);
+        self
+    }
 }
 
 impl SpriteSet {
@@ -499,7 +569,9 @@ pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet
                 c,
             ),
         ],
+        grip_inset: Inset::default(),
     }
+    .with_grip_inset()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

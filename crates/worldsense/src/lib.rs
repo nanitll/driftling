@@ -35,6 +35,18 @@ pub struct WindowPlatform {
     pub id: u64,
 }
 
+/// Рабочая область одного выхода: геометрия самого выхода и свободная от
+/// панелей область внутри него — обе в глобальных координатах композитора.
+///
+/// Питомец живёт на своём выходе, а рабочие области у мониторов разные
+/// (панель может быть только на одном). Поэтому область приходит вместе с
+/// геометрией экрана — демон выбирает свою по совпадению с выходом.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScreenArea {
+    pub screen: Rect,
+    pub area: Rect,
+}
+
 /// Снимок «рельефа» рабочего стола.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WorldSnapshot {
@@ -42,9 +54,34 @@ pub struct WorldSnapshot {
     /// порядок — сверху вниз по стекингу (первое — самое верхнее).
     pub platforms: Vec<WindowPlatform>,
     /// Верх нижней панели = пол. `None` — данных нет, пол = низ экрана.
+    /// Общий (грубый) вариант для провайдеров без разбивки по экранам.
     pub workspace_bottom: Option<f32>,
+    /// Рабочие области по выходам (KWin). Пусто — данных нет.
+    pub screen_areas: Vec<ScreenArea>,
     /// Есть полноэкранное окно: питомцу пора прятаться (вежливость, D5).
     pub fullscreen_active: bool,
+}
+
+impl WorldSnapshot {
+    /// Рабочая область выхода, чья геометрия совпала с `output`
+    /// (в глобальных координатах). Точного совпадения не требуем: выбираем
+    /// область с наибольшим пересечением — масштабирование и округление
+    /// логических координат не должны ломать выбор.
+    pub fn area_for_output(&self, output: Rect) -> Option<Rect> {
+        self.screen_areas
+            .iter()
+            .map(|sa| (overlap(sa.screen, output), sa.area))
+            .filter(|(o, _)| *o > 0.0)
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, area)| area)
+    }
+}
+
+/// Площадь пересечения прямоугольников.
+fn overlap(a: Rect, b: Rect) -> f32 {
+    let w = (a.right().min(b.right()) - a.x.max(b.x)).max(0.0);
+    let h = (a.bottom().min(b.bottom()) - a.y.max(b.y)).max(0.0);
+    w * h
 }
 
 /// Источник снапшотов мира. Реализации не блокируют надолго и не паникуют.

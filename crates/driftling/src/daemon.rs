@@ -72,13 +72,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use driftling_core::palette;
-use driftling_core::physics::Platform;
+use driftling_core::physics::{self, Platform};
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
     apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
     Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient, Pet,
-    PetAttributes, PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, SyncConfig, SyncMode,
-    Vec2, World,
+    PetAttributes, PetRecord, PetState, PointerEvent, Rect, SimPace, Stage, Surface, SyncConfig,
+    SyncMode, Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
@@ -604,6 +604,28 @@ fn hello_bubble(from: f64, secs: f64) -> Bubble {
     }
 }
 
+/// Пересечение прямоугольников (пустое — нулевой размер).
+fn intersect(a: Rect, b: Rect) -> Rect {
+    let x = a.x.max(b.x);
+    let y = a.y.max(b.y);
+    let w = (a.right().min(b.right()) - x).max(0.0);
+    let h = (a.bottom().min(b.bottom()) - y).max(0.0);
+    Rect::new(x, y, w, h)
+}
+
+/// Сдвиг рисунка к поверхности на прозрачное поле кадра (фаза G2):
+/// на стене лапки должны касаться кромки экрана, под потолком — потолка.
+/// Под потолком кадр перевёрнут, поэтому к поверхности обращён НИЗ исходного.
+fn grip_shift(bounds: Rect, surface: Surface, inset: sprite::Inset) -> Rect {
+    let (dx, dy) = match surface {
+        Surface::Floor => (0.0, 0.0),
+        Surface::WallLeft => (-(inset.left as f32), 0.0),
+        Surface::WallRight => (inset.right as f32, 0.0),
+        Surface::Ceiling => (0.0, -(inset.bottom as f32)),
+    };
+    Rect::new(bounds.x + dx, bounds.y + dy, bounds.w, bounds.h)
+}
+
 /// Набор кадров стадии из встроенного арт-пака (фаза C), колоризованный
 /// цветом питомца. Целевой размер — базовый размер (attributes.size),
 /// отмасштабированный [`sprite::stage_scale`]: та же лестница роста, что
@@ -708,6 +730,11 @@ struct DaemonApp {
     /// Глобальная логическая позиция выхода питомца (из OutputGeometry):
     /// снапшоты worldsense приходят в глобальных координатах композитора.
     screen_origin: Vec2,
+    /// Полный прямоугольник выхода в локальных координатах (из
+    /// OutputGeometry). `World::screen` может быть уже — это рабочая
+    /// область без панелей (фаза G2), а сюда возвращаемся, когда данных
+    /// о ней нет.
+    output_rect: Rect,
     /// Последний опрос sense.latest() — троттлинг при спокойном питомце.
     last_sense_poll: Option<Instant>,
     /// Интервал спокойного опроса; в тестах ужимается до нуля.
@@ -827,6 +854,7 @@ impl DaemonApp {
             world: None,
             sense,
             screen_origin: Vec2::default(),
+            output_rect: Rect::default(),
             last_sense_poll: None,
             sense_poll_idle: SENSE_POLL_IDLE,
             fullscreen_hidden: false,
@@ -1694,11 +1722,23 @@ impl DaemonApp {
         };
 
         // Снапшота нет (не-KDE, KWin умер) — штатная деградация: рельеф
-        // пустеет, пол возвращается к низу экрана.
-        let (platforms, ground_override, fullscreen) = match snap {
+        // пустеет, пол возвращается к низу экрана, мир = весь выход.
+        let (screen, platforms, ground_override, fullscreen) = match snap {
             Some(s) => {
                 let o = self.screen_origin;
-                let platforms: Vec<Platform> = s
+                let out_global = Rect::new(o.x, o.y, self.output_rect.w, self.output_rect.h);
+                // Мир питомца — рабочая область СВОЕГО выхода (G2): по
+                // панелям он не ходит, а на двух мониторах у выходов эти
+                // области разные. Нет данных — весь выход, как раньше.
+                let screen = s
+                    .area_for_output(out_global)
+                    .map(|a| Rect::new(a.x - o.x, a.y - o.y, a.w, a.h))
+                    .map(|a| intersect(a, self.output_rect))
+                    .filter(|a| a.w > 0.0 && a.h > 0.0)
+                    .unwrap_or(self.output_rect);
+                // Стекинг сверху вниз (как отдаёт worldsense) — обязателен
+                // для отсечения накрытых кромок ниже.
+                let stack: Vec<Platform> = s
                     .platforms
                     .iter()
                     .map(|p| Platform {
@@ -1706,22 +1746,39 @@ impl DaemonApp {
                         id: p.id,
                     })
                     .collect();
-                // Верх нижней панели -> пол; совпал с низом экрана или ушёл
-                // за экран (панель чужого выхода, D6) — оставляем низ экрана.
-                let ground = s
-                    .workspace_bottom
-                    .map(|y| y - o.y)
-                    .filter(|y| *y > world.screen.y && *y < world.screen.bottom());
-                (platforms, ground, s.fullscreen_active)
+                // Стоять можно только на ВИДИМЫХ участках кромок (G2):
+                // кромка под чужим окном — это «питомец в воздухе».
+                // Карниз уже трети питомца — не место для жизни.
+                let size = self.sprites.size as f32;
+                let min_ledge = physics::MIN_LEDGE.max(size / 3.0);
+                let platforms = physics::visible_ledges(&stack, screen, min_ledge, size);
+                // Верх нижней панели -> пол. При известной рабочей области
+                // пол — её низ, отдельный override не нужен.
+                let ground = if s.screen_areas.is_empty() {
+                    s.workspace_bottom
+                        .map(|y| y - o.y)
+                        .filter(|y| *y > screen.y && *y < screen.bottom())
+                } else {
+                    None
+                };
+                (screen, platforms, ground, s.fullscreen_active)
             }
-            None => (Vec::new(), None, false),
+            None => (self.output_rect, Vec::new(), None, false),
         };
 
-        if world.platforms != platforms || world.ground_y_override != ground_override {
+        if world.platforms != platforms
+            || world.ground_y_override != ground_override
+            || world.screen != screen
+        {
             world.platforms = platforms;
             world.ground_y_override = ground_override;
+            world.screen = screen;
             log::debug!(
-                "мир: платформ {}, пол {:.0}{}",
+                "мир: {:.0}x{:.0} @ ({:.0},{:.0}), карнизов {}, пол {:.0}{}",
+                world.screen.w,
+                world.screen.h,
+                world.screen.x,
+                world.screen.y,
                 world.platforms.len(),
                 world.ground_y(),
                 if world.ground_y_override.is_some() {
@@ -1730,6 +1787,19 @@ impl DaemonApp {
                     " (низ экрана)"
                 }
             );
+            // Разбор «почему питомец стоит вот тут»: перечисляем видимые
+            // карнизы. Дешёвая диагностика — включается RUST_LOG=trace.
+            if log::log_enabled!(log::Level::Trace) {
+                for p in &world.platforms {
+                    log::trace!(
+                        "  карниз y={:.0} x={:.0}..{:.0} (окно {:x})",
+                        p.rect.y,
+                        p.rect.x,
+                        p.rect.right(),
+                        p.id
+                    );
+                }
+            }
             if let Some(pet) = &mut self.pet {
                 let before = pet.state;
                 pet.world_changed(world);
@@ -1832,7 +1902,10 @@ impl App for DaemonApp {
                 input_rects: Vec::new(),
             },
             (Some(pet), Some(world)) => {
-                let bounds = pet.bounds();
+                // На стене и под потолком рисунок прижимается к поверхности:
+                // пустое поле кадра иначе оставило бы питомца висеть в
+                // паре пикселей от неё. Хит-область едет вместе с рисунком.
+                let bounds = grip_shift(pet.bounds(), pet.surface, self.sprites.grip_inset);
                 // Полный вид (B2/B5): настроение из статов; «радостное»
                 // окно после игры/поглаживания перекрывает настроение.
                 let mood = if self.happy_until.is_some() {
@@ -1925,6 +1998,7 @@ impl App for DaemonApp {
                 let first = self.world.is_none();
                 self.screen_origin = origin;
                 let screen = Rect::new(0.0, 0.0, width, height);
+                self.output_rect = screen;
                 match &mut self.world {
                     // Экран поменялся — рельеф (платформы/пол) переживает:
                     // ближайший poll_worldsense пересчитает его сам.
@@ -2201,6 +2275,24 @@ mod tests {
             "нормализация не повторяется"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Фаза G2: на стене и под потолком рисунок прижимается к поверхности
+    /// на прозрачное поле кадра, а на полу не сдвигается.
+    #[test]
+    fn grip_shift_hugs_the_surface() {
+        let inset = sprite::Inset {
+            left: 3,
+            right: 4,
+            top: 2,
+            bottom: 5,
+        };
+        let b = Rect::new(100.0, 200.0, 64.0, 64.0);
+        assert_eq!(grip_shift(b, Surface::Floor, inset), b);
+        assert_eq!(grip_shift(b, Surface::WallLeft, inset).x, 97.0);
+        assert_eq!(grip_shift(b, Surface::WallRight, inset).x, 104.0);
+        // Под потолком кадр перевёрнут: к нему обращён низ исходного кадра.
+        assert_eq!(grip_shift(b, Surface::Ceiling, inset).y, 195.0);
     }
 
     #[test]
@@ -3130,6 +3222,7 @@ mod tests {
                 })
                 .collect(),
             workspace_bottom: bottom,
+            screen_areas: Vec::new(),
             fullscreen_active: fullscreen,
         }
     }
@@ -3165,6 +3258,55 @@ mod tests {
         assert_eq!(world.ground_y_override, Some(1040.0), "верх панели — пол");
         let pet = app.pet.as_ref().unwrap();
         assert_eq!(pet.pos.y, 700.0, "питомец стоит на кромке окна");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Фаза G2, два монитора: мир питомца — рабочая область ЕГО выхода,
+    /// а не активного экрана. По чужим панелям он не ходит.
+    #[test]
+    fn world_is_the_work_area_of_own_output() {
+        let (mut app, sense, _tx, dir) = sense_app("sense-area");
+        // Питомец на правом мониторе (глобально 1920..3840).
+        assert!(app.event(
+            Event::OutputGeometry {
+                width: 1920.0,
+                height: 1080.0,
+                origin: Vec2::new(1920.0, 0.0),
+            },
+            0.0,
+        ));
+        let mut snap = world_snap(&[], None, false);
+        snap.screen_areas = vec![
+            // Левый монитор: нижняя панель 40 px.
+            driftling_worldsense::ScreenArea {
+                screen: Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                area: Rect::new(0.0, 0.0, 1920.0, 1040.0),
+            },
+            // Правый (наш): вертикальная панель 60 px справа.
+            driftling_worldsense::ScreenArea {
+                screen: Rect::new(1920.0, 0.0, 1920.0, 1080.0),
+                area: Rect::new(1920.0, 0.0, 1860.0, 1080.0),
+            },
+        ];
+        sense.set(Some(snap));
+
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let world = app.world.as_ref().unwrap();
+        assert_eq!(
+            (world.screen.x, world.screen.w, world.screen.h),
+            (0.0, 1860.0, 1080.0),
+            "взята область своего выхода, а не активного"
+        );
+        assert_eq!(world.ground_y_override, None, "пол — низ своей области");
+        // Питомец не заходит на панель: правый край мира — 1860.
+        let pet = app.pet.as_mut().unwrap();
+        pet.pos.x = 1859.0;
+        pet.state = PetState::Walk;
+        pet.facing = Direction::Right;
+        settle(&mut app, &mut now, 2.0);
+        let b = app.pet.as_ref().unwrap().bounds();
+        assert!(b.right() <= 1860.0, "зашёл на панель: {b:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -57,6 +57,11 @@
 //! движок берёт откат (`climb` -> `walk`, `cling`/`blink`/`sit`/... ->
 //! `idle`, `dizzy` -> `landing`), так что паки формата 1 без них валидны.
 //!
+//! `climb` и `cling` рисуются ИНАЧЕ остальных: это вид СО СПИНЫ — питомец
+//! прижался к поверхности и держится лапками. Их же кадры показываются под
+//! потолком, отражёнными по вертикали. Поворачивать обычную походку боком
+//! нельзя: со стороны это читается как «лежит в воздухе».
+//!
 //! Кадры рисуются мордой ВПРАВО и ногами ВНИЗ; зеркало по взгляду и
 //! поворот под поверхность (стена, потолок) делает рендер
 //! (`driftling_core::Orient`) — отдельного арта под лазание не нужно.
@@ -582,7 +587,9 @@ impl Pack {
                 cling: Vec::new(),
                 climb: Vec::new(),
                 dizzy: Vec::new(),
-            };
+                grip_inset: Default::default(),
+            }
+            .with_grip_inset();
         }
         SpriteSet {
             size: st.native * k,
@@ -605,7 +612,9 @@ impl Pack {
             cling: opt(&st.anims, "cling"),
             climb: opt(&st.anims, "climb"),
             dizzy: opt(&st.anims, "dizzy"),
+            grip_inset: Default::default(),
         }
+        .with_grip_inset()
     }
 }
 

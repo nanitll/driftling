@@ -117,6 +117,8 @@ fn surfaces(pack: &Pack, out: &Path) {
     let climb = frames("climb");
     let cling = frames("cling");
     let idle = frames("idle");
+    // Поза для стен и потолка — «спиной к поверхности»: те же кадры, что
+    // увидит оверлей (ориентацию берём у Surface, как делает питомец).
 
     for (name, bg) in [("surfaces_light", LIGHT_BG), ("surfaces_dark", DARK_BG)] {
         let mut c = Canvas::new(ROOM_W, ROOM_H, bg);

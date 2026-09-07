@@ -325,6 +325,9 @@ impl Live {
         Ok(parse::filter(&RawSnapshot {
             windows,
             work_area,
+            // EWMH-свойство _NET_WORKAREA — общее на рабочий стол,
+            // без разбивки по выходам.
+            work_areas: Vec::new(),
             any_fullscreen,
         }))
     }

@@ -1446,7 +1446,7 @@ mod tests {
     }
 
     /// Ориентация кадра: на полу — обычная, на потолке — вверх ногами,
-    /// на стенах — поворот на четверть.
+    /// на стенах — без поворотов (поза нарисована отдельно).
     #[test]
     fn orient_follows_surface() {
         let mut p = pet();
@@ -1456,10 +1456,15 @@ mod tests {
         assert!(p.orient().flip_x);
         p.surface = Surface::Ceiling;
         assert!(p.orient().flip_y, "под потолком ногами вверх");
-        p.surface = Surface::WallLeft;
-        assert_eq!(p.orient().quarter_turns, 1);
-        p.surface = Surface::WallRight;
-        assert_eq!(p.orient().quarter_turns, 3);
+        // На стенах кадр не крутим и не зеркалим: поза «спиной к стене»
+        // симметрична, а поворот боком выглядел бы нелепо.
+        for wall in [Surface::WallLeft, Surface::WallRight] {
+            p.surface = wall;
+            for facing in [Direction::Left, Direction::Right] {
+                p.facing = facing;
+                assert_eq!(p.orient(), Orient::IDENTITY, "{wall:?}/{facing:?}");
+            }
+        }
     }
 
     /// «Уложить спать» на стене: питомец отцепляется и засыпает,

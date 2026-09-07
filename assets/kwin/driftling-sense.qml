@@ -170,6 +170,34 @@ Item {
         } catch (e) {
             // Нет workArea — приёмник возьмёт низ экрана.
         }
+        // Рабочая область КАЖДОГО экрана вместе с его геометрией: демон
+        // живёт на своём выходе и обязан взять область именно его, а не
+        // активного (на двух мониторах это разные вещи — питомец иначе
+        // ходит по чужим панелям и висит над чужим полом).
+        try {
+            var areas = [];
+            var screens = Workspace.screens;
+            for (var s = 0; s < screens.length; ++s) {
+                var out = screens[s];
+                var g = out.geometry;
+                var a = Workspace.clientArea(0, out, Workspace.currentDesktop);
+                areas.push({
+                    sx: g.x,
+                    sy: g.y,
+                    sw: g.width,
+                    sh: g.height,
+                    x: a.x,
+                    y: a.y,
+                    w: a.width,
+                    h: a.height
+                });
+            }
+            if (areas.length > 0) {
+                snap.workAreas = areas;
+            }
+        } catch (e) {
+            // Старый KWin без Workspace.screens — остаётся workArea выше.
+        }
         push.arguments = [JSON.stringify(snap)];
         push.call();
     }
