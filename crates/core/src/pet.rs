@@ -4,7 +4,7 @@ use crate::behavior::{
     next_idle_action, next_state_after, next_state_off_floor, BehaviorConfig, IdleAction, PetState,
 };
 use crate::geometry::{Rect, Vec2};
-use crate::physics::{support_below, Orient, Platform, Surface, STEP_SNAP, SUPPORT_TOL};
+use crate::physics::{support_below, Deform, Orient, Platform, Surface, STEP_SNAP, SUPPORT_TOL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -142,6 +142,16 @@ pub struct Pet {
     last_motion: Option<(f32, Vec2)>,
     /// Пора тошнить: снимается демоном через [`Pet::take_vomit`].
     vomit_pending: bool,
+    /// Форма тела (фаза G6): 1.0 — покой, <1 — сплющен, >1 — вытянут.
+    squash: f32,
+    /// Скорость изменения формы (пружина).
+    squash_vel: f32,
+    /// Завал верхушки, px: инерция головы и хохолка.
+    lean: f32,
+    lean_vel: f32,
+    /// Прошлые позиция и скорость по горизонтали — для ускорения тела.
+    prev_x: f32,
+    prev_vx: f32,
     /// Угол кувырка, рад (фаза G3): тело в полёте и при качении вращается.
     spin: f32,
     /// Угловая скорость, рад/с.
@@ -184,6 +194,12 @@ impl Pet {
             shake_sign: 0.0,
             last_motion: None,
             vomit_pending: false,
+            squash: 1.0,
+            squash_vel: 0.0,
+            lean: 0.0,
+            lean_vel: 0.0,
+            prev_x: pos.x,
+            prev_vx: 0.0,
             spin: 0.0,
             spin_vel: 0.0,
         }
@@ -277,6 +293,7 @@ impl Pet {
         let h = self.cfg.body.mps_to_px(0.0) + self.cfg.body.px_per_m * 0.35;
         self.vel = Vec2::new(self.vel.x * 0.3, -(2.0 * self.cfg.gravity() * h).sqrt());
         self.bounced = true; // приземление с прыжка — без подскока
+        self.squash_vel += 3.0; // отталкивание вытягивает тело
         self.enter(PetState::Falling);
         self.state_left = f32::INFINITY;
         true
@@ -365,6 +382,34 @@ impl Pet {
         self.spin
     }
 
+    /// Мягкая деформация тела для рендера (фаза G6): сплющивание о пол,
+    /// вытягивание в полёте, дыхание в покое и завал хохолка по инерции.
+    /// Площадь сохраняется лишь частично — полное сохранение выглядит
+    /// резиновым.
+    pub fn deform(&self) -> Deform {
+        let sy = self.squash;
+        let sx = 1.0 + (1.0 - sy) * 0.75;
+        let (anchor_x, anchor_y) = self.surface.deform_anchor();
+        Deform {
+            scale_x: sx,
+            scale_y: sy,
+            // Кадр зеркалится по взгляду — завал должен остаться в
+            // экранных координатах, поэтому знак следует за зеркалом.
+            lean: if self.facing == Direction::Left {
+                -self.lean
+            } else {
+                self.lean
+            },
+            anchor_x,
+            anchor_y,
+        }
+    }
+
+    /// Текущая форма тела (1.0 — покой) — для тестов и отладки.
+    pub fn squash(&self) -> f32 {
+        self.squash
+    }
+
     /// Текущее мелкое занятие в Idle (фаза G) — для выбора кадра.
     pub fn idle_action(&self) -> IdleAction {
         self.idle_action
@@ -405,6 +450,7 @@ impl Pet {
         self.state_time += dt;
         self.advance_fidget(dt);
         self.settle_stomach(dt);
+        self.tick_body(dt);
 
         match self.state {
             PetState::Dragged => {
@@ -457,6 +503,65 @@ impl Pet {
             return;
         }
         self.nausea = (self.nausea - 0.12 * dt).max(0.0);
+    }
+
+    /// Мягкое тело (фаза G6): пружина формы тянется к «покойной» форме
+    /// (в полёте вытянутой, в покое дышащей, при ходьбе покачивающейся), а
+    /// верхушка заваливается по ускорению тела — хохолок отстаёт от рывков.
+    fn tick_body(&mut self, dt: f32) {
+        if dt <= 0.0 {
+            return;
+        }
+        // Пружина формы.
+        let rest = self.rest_shape();
+        let cfg = &self.cfg;
+        self.squash_vel +=
+            ((rest - self.squash) * cfg.squash_spring - self.squash_vel * cfg.squash_damping) * dt;
+        self.squash = (self.squash + self.squash_vel * dt).clamp(0.6, 1.5);
+
+        // Ускорение тела по горизонтали — из фактического перемещения:
+        // так одинаково ловятся и шаг, и бросок, и рывок мышью.
+        let vx = (self.pos.x - self.prev_x) / dt;
+        let ax = ((vx - self.prev_vx) / dt).clamp(-60_000.0, 60_000.0);
+        self.prev_x = self.pos.x;
+        self.prev_vx = vx;
+        let limit = self.size * 0.22;
+        let mut target = (-ax / self.cfg.gravity() * self.size * 0.09).clamp(-limit, limit);
+        if self.state == PetState::Walk {
+            // На ходу питомец слегка наклоняется вперёд.
+            target += self.facing.sign() * self.size * 0.03;
+        }
+        self.lean_vel +=
+            ((target - self.lean) * cfg.lean_spring - self.lean_vel * cfg.lean_damping) * dt;
+        self.lean = (self.lean + self.lean_vel * dt).clamp(-limit * 1.5, limit * 1.5);
+    }
+
+    /// Форма, к которой тянется пружина в текущем состоянии.
+    fn rest_shape(&self) -> f32 {
+        match self.state {
+            // В полёте тело вытягивается тем сильнее, чем быстрее летит.
+            PetState::Falling | PetState::Bonk => {
+                // Мера — не предельная скорость (28 м/с, до неё дело не
+                // доходит), а скорость жёсткого приземления: падение через
+                // полэкрана уже вытягивает тело заметно.
+                let ref_speed = self.cfg.hard_landing_speed() * 2.0;
+                let k = (self.vel.y.abs() / ref_speed).clamp(0.0, 1.0);
+                1.0 + self.cfg.stretch_in_air * k
+            }
+            // В руке слегка обвисает.
+            PetState::Dragged => 1.0 + self.cfg.stretch_in_air * 0.25,
+            // Шаг: лёгкое покачивание в такт (походка 6 кадров/с = 3 шага).
+            PetState::Walk => 1.0 - 0.02 * (self.state_time * 3.0 * core::f32::consts::TAU).sin(),
+            PetState::Climb => {
+                1.0 - 0.015
+                    * (self.state_time * self.cfg.climb_pull_hz * core::f32::consts::TAU).sin()
+            }
+            // Покой и сон: дыхание, во сне медленнее и глубже.
+            PetState::Sleep => 1.0 + self.cfg.breath_depth * 1.4 * (self.state_time * 1.4).sin(),
+            PetState::Idle => 1.0 + self.cfg.breath_depth * (self.state_time * 2.4).sin(),
+            PetState::Landing => 0.93,
+            PetState::Roll => 1.0,
+        }
     }
 
     /// Падение: гравитация + сопротивление воздуха, потолок и стены экрана,
@@ -684,6 +789,9 @@ impl Pet {
         self.pos.y = support;
         let impact = self.vel.y;
         self.surface = Surface::Floor;
+        // Удар сминает тело тем сильнее, чем быстрее прилетело (фаза G6).
+        let hit = (impact / (self.cfg.hard_landing_speed() * 1.5)).clamp(0.0, 1.0);
+        self.squash_vel -= hit * self.cfg.squash_impact * 12.0;
 
         // Подскок: мягкое тело сминается о пол и один раз невысоко
         // отпружинивает — только после сильного удара, и не повторно
@@ -1804,6 +1912,115 @@ mod tests {
             p.state_left, p.cfg.sleep_range.1,
             "меньше единицы не бывает"
         );
+    }
+
+    // ---- Фаза G6: мягкое тело --------------------------------------------
+
+    /// Удар о пол сминает тело, пружина возвращает форму с колебанием, а
+    /// не мгновенно: это и есть «желе», которое видно глазом.
+    #[test]
+    fn hard_landing_squashes_then_springs_back() {
+        let w = world();
+        let mut p = pet();
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
+        p.pos = Vec2::new(900.0, 200.0);
+        p.vel = Vec2::new(0.0, 1800.0);
+        p.state = PetState::Falling;
+        // В полёте тело вытянуто (пружина доходит за несколько кадров).
+        for _ in 0..14 {
+            p.tick(&w, 1.0 / 120.0);
+        }
+        assert!(p.squash() > 1.02, "в падении вытянут: {}", p.squash());
+        assert!(p.deform().scale_x < 1.0, "по горизонтали уже");
+
+        let mut min_squash = 1.0f32;
+        for _ in 0..40 {
+            p.tick(&w, 1.0 / 120.0);
+            min_squash = min_squash.min(p.squash());
+        }
+        assert!(min_squash < 0.9, "удар должен смять тело: {min_squash}");
+        // Через полсекунды форма возвращается к покою.
+        for _ in 0..90 {
+            p.tick(&w, 1.0 / 120.0);
+        }
+        assert!(
+            (p.squash() - 1.0).abs() < 0.05,
+            "пружина не вернула форму: {}",
+            p.squash()
+        );
+    }
+
+    /// В покое тело дышит: форма всё время слегка гуляет вокруг единицы.
+    #[test]
+    fn idle_body_breathes() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        p.state = PetState::Idle;
+        p.state_time = 0.0;
+        p.state_left = 1000.0;
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for _ in 0..300 {
+            p.tick(&w, 1.0 / 60.0);
+            lo = lo.min(p.squash());
+            hi = hi.max(p.squash());
+        }
+        assert!(hi - lo > 0.004, "дыхания не видно: {lo}..{hi}");
+        assert!(hi - lo < 0.12, "дыхание не должно быть тряской: {lo}..{hi}");
+    }
+
+    /// Резкий рывок в руке заваливает верхушку (инерция хохолка), и завал
+    /// возвращается к нулю, когда движение прекращается.
+    #[test]
+    fn sharp_motion_leans_the_body() {
+        let w = world();
+        let mut p = pet();
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 60.0);
+        }
+        let grab = Vec2::new(p.pos.x, p.pos.y - 10.0);
+        assert!(p.pointer(&w, PointerEvent::Press(grab), 0.0));
+        assert!(p.pointer(
+            &w,
+            PointerEvent::Motion(Vec2::new(grab.x + 4.0, grab.y)),
+            0.02
+        ));
+        // Резко дёрнули вправо.
+        let mut t = 0.02;
+        for i in 1..=6 {
+            t += 1.0 / 120.0;
+            p.pointer(
+                &w,
+                PointerEvent::Motion(Vec2::new(grab.x + 4.0 + 40.0 * i as f32, grab.y)),
+                t,
+            );
+            p.tick(&w, 1.0 / 120.0);
+        }
+        let leaned = p.deform().lean.abs();
+        assert!(leaned > 0.5, "верхушка не завалилась: {leaned}");
+        // Отпустили и дали успокоиться на полу.
+        assert!(p.pointer(
+            &w,
+            PointerEvent::Release(Vec2::new(grab.x + 244.0, grab.y)),
+            t
+        ));
+        for _ in 0..600 {
+            p.tick(&w, 1.0 / 120.0);
+        }
+        assert!(p.deform().lean.abs() < leaned * 0.5, "завал не унялся");
+    }
+
+    /// Якорь деформации привязан к поверхности: на полу тело растёт вверх
+    /// от ног, под потолком — вниз от рук.
+    #[test]
+    fn deform_anchor_matches_surface() {
+        let mut p = pet();
+        assert_eq!(p.deform().anchor_y, 1.0);
+        p.surface = Surface::Ceiling;
+        assert_eq!(p.deform().anchor_y, 0.0);
     }
 
     // ---- Фаза G5: укачивание --------------------------------------------

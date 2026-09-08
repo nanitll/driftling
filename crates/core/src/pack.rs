@@ -406,8 +406,9 @@ pub const BODY_ANIMS: [&str; 10] = [
 /// Необязательные семейства фазы G: если пак их не содержит, движок
 /// откатывается к базовым (climb -> walk, cling/blink/sit/... -> idle,
 /// dizzy -> landing). Внешние паки формата 1 остаются валидными.
-pub const EXTRA_ANIMS: [&str; 10] = [
+pub const EXTRA_ANIMS: [&str; 12] = [
     "blink", "sit", "stretch", "wiggle", "cling", "climb", "dizzy", "hang", "swing", "vomit",
+    "wave", "dangle",
 ];
 /// Обязательные семейства стадии яйца.
 pub const EGG_ANIMS: [&str; 2] = ["egg", "hatch"];
@@ -590,6 +591,8 @@ impl Pack {
                 hang: Vec::new(),
                 swing: Vec::new(),
                 vomit: Vec::new(),
+                wave: Vec::new(),
+                dangle: Vec::new(),
                 grip_inset: Default::default(),
                 feet_inset: Default::default(),
             }
@@ -619,6 +622,8 @@ impl Pack {
             hang: opt(&st.anims, "hang"),
             swing: opt(&st.anims, "swing"),
             vomit: opt(&st.anims, "vomit"),
+            wave: opt(&st.anims, "wave"),
+            dangle: opt(&st.anims, "dangle"),
             grip_inset: Default::default(),
             feet_inset: Default::default(),
         }
@@ -679,6 +684,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "baby/cling_1",
         include_str!("../../../assets/pack-default/baby/cling_1.txt"),
+    ),
+    (
+        "baby/dangle_0",
+        include_str!("../../../assets/pack-default/baby/dangle_0.txt"),
+    ),
+    (
+        "baby/dangle_1",
+        include_str!("../../../assets/pack-default/baby/dangle_1.txt"),
     ),
     (
         "baby/dizzy_0",
@@ -813,6 +826,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/baby/walk_3.txt"),
     ),
     (
+        "baby/wave_0",
+        include_str!("../../../assets/pack-default/baby/wave_0.txt"),
+    ),
+    (
+        "baby/wave_1",
+        include_str!("../../../assets/pack-default/baby/wave_1.txt"),
+    ),
+    (
         "baby/wiggle_0",
         include_str!("../../../assets/pack-default/baby/wiggle_0.txt"),
     ),
@@ -847,6 +868,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "child/cling_1",
         include_str!("../../../assets/pack-default/child/cling_1.txt"),
+    ),
+    (
+        "child/dangle_0",
+        include_str!("../../../assets/pack-default/child/dangle_0.txt"),
+    ),
+    (
+        "child/dangle_1",
+        include_str!("../../../assets/pack-default/child/dangle_1.txt"),
     ),
     (
         "child/dizzy_0",
@@ -981,6 +1010,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/child/walk_3.txt"),
     ),
     (
+        "child/wave_0",
+        include_str!("../../../assets/pack-default/child/wave_0.txt"),
+    ),
+    (
+        "child/wave_1",
+        include_str!("../../../assets/pack-default/child/wave_1.txt"),
+    ),
+    (
         "child/wiggle_0",
         include_str!("../../../assets/pack-default/child/wiggle_0.txt"),
     ),
@@ -1015,6 +1052,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "teen/cling_1",
         include_str!("../../../assets/pack-default/teen/cling_1.txt"),
+    ),
+    (
+        "teen/dangle_0",
+        include_str!("../../../assets/pack-default/teen/dangle_0.txt"),
+    ),
+    (
+        "teen/dangle_1",
+        include_str!("../../../assets/pack-default/teen/dangle_1.txt"),
     ),
     (
         "teen/dizzy_0",
@@ -1149,6 +1194,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
         include_str!("../../../assets/pack-default/teen/walk_3.txt"),
     ),
     (
+        "teen/wave_0",
+        include_str!("../../../assets/pack-default/teen/wave_0.txt"),
+    ),
+    (
+        "teen/wave_1",
+        include_str!("../../../assets/pack-default/teen/wave_1.txt"),
+    ),
+    (
         "teen/wiggle_0",
         include_str!("../../../assets/pack-default/teen/wiggle_0.txt"),
     ),
@@ -1183,6 +1236,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "adult/cling_1",
         include_str!("../../../assets/pack-default/adult/cling_1.txt"),
+    ),
+    (
+        "adult/dangle_0",
+        include_str!("../../../assets/pack-default/adult/dangle_0.txt"),
+    ),
+    (
+        "adult/dangle_1",
+        include_str!("../../../assets/pack-default/adult/dangle_1.txt"),
     ),
     (
         "adult/dizzy_0",
@@ -1315,6 +1376,14 @@ static FRAME_SOURCES: &[(&str, &str)] = &[
     (
         "adult/walk_3",
         include_str!("../../../assets/pack-default/adult/walk_3.txt"),
+    ),
+    (
+        "adult/wave_0",
+        include_str!("../../../assets/pack-default/adult/wave_0.txt"),
+    ),
+    (
+        "adult/wave_1",
+        include_str!("../../../assets/pack-default/adult/wave_1.txt"),
     ),
     (
         "adult/wiggle_0",

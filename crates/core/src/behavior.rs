@@ -99,6 +99,21 @@ pub struct BehaviorConfig {
 
     /// Диапазон паузы между мелкими занятиями в Idle, сек.
     pub fidget_range: (f32, f32),
+
+    // ---- Фаза G6: мягкое тело ----
+    /// Жёсткость пружины формы (squash & stretch), 1/с².
+    pub squash_spring: f32,
+    /// Затухание пружины формы, 1/с.
+    pub squash_damping: f32,
+    /// Насколько сильно удар о пол сминает тело (доля от предельной скорости).
+    pub squash_impact: f32,
+    /// Насколько тело вытягивается в свободном падении (на предельной скорости).
+    pub stretch_in_air: f32,
+    /// Глубина «дыхания» в покое.
+    pub breath_depth: f32,
+    /// Жёсткость и затухание завала верхушки (инерция хохолка), 1/с², 1/с.
+    pub lean_spring: f32,
+    pub lean_damping: f32,
 }
 
 impl Default for BehaviorConfig {
@@ -134,6 +149,14 @@ impl Default for BehaviorConfig {
             wall_grab_mps: 0.3,
             bonk_time: 0.5,
             fidget_range: (1.5, 5.0),
+
+            squash_spring: 190.0,
+            squash_damping: 13.0,
+            squash_impact: 0.55,
+            stretch_in_air: 0.22,
+            breath_depth: 0.018,
+            lean_spring: 120.0,
+            lean_damping: 12.0,
         }
     }
 }

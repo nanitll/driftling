@@ -345,3 +345,35 @@ frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
 [stages.adult.anims.vomit]
 fps = 3.0
 frames = ["vomit_0", "vomit_1"]
+
+[stages.baby.anims.wave]
+fps = 3.0
+frames = ["wave_0", "wave_1"]
+
+[stages.baby.anims.dangle]
+fps = 1.2
+frames = ["dangle_0", "dangle_1"]
+
+[stages.child.anims.wave]
+fps = 3.0
+frames = ["wave_0", "wave_1"]
+
+[stages.child.anims.dangle]
+fps = 1.2
+frames = ["dangle_0", "dangle_1"]
+
+[stages.teen.anims.wave]
+fps = 3.0
+frames = ["wave_0", "wave_1"]
+
+[stages.teen.anims.dangle]
+fps = 1.2
+frames = ["dangle_0", "dangle_1"]
+
+[stages.adult.anims.wave]
+fps = 3.0
+frames = ["wave_0", "wave_1"]
+
+[stages.adult.anims.dangle]
+fps = 1.2
+frames = ["dangle_0", "dangle_1"]

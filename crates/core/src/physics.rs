@@ -117,7 +117,97 @@ impl Orient {
     }
 }
 
+/// Мягкая деформация тела при отрисовке (фаза G6): неравномерный масштаб
+/// (squash & stretch) и «завал» верхушки — им отыгрывается инерция
+/// хохолка-антенны и головы.
+///
+/// Деформация — чисто визуальный слой поверх ориентации: физика опор и
+/// хит-области считают питомца прямоугольником `Pet::bounds`, а тело при
+/// этом может сплющиваться о пол и вытягиваться в полёте.
+///
+/// `anchor` — точка кадра (в долях 0..1), которая при деформации остаётся
+/// на месте: у стоящего это середина низа (ноги на полу), у висящего под
+/// потолком — середина верха.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Deform {
+    pub scale_x: f32,
+    pub scale_y: f32,
+    /// Сдвиг САМОГО верха кадра, px; книзу гаснет как куб высоты.
+    pub lean: f32,
+    pub anchor_x: f32,
+    pub anchor_y: f32,
+}
+
+impl Default for Deform {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl Deform {
+    /// Без деформации; якорь — середина низа (ноги на месте).
+    pub const NONE: Deform = Deform {
+        scale_x: 1.0,
+        scale_y: 1.0,
+        lean: 0.0,
+        anchor_x: 0.5,
+        anchor_y: 1.0,
+    };
+
+    /// Деформации нет — блит идёт быстрым путём.
+    pub fn is_identity(&self) -> bool {
+        (self.scale_x - 1.0).abs() < 1e-3
+            && (self.scale_y - 1.0).abs() < 1e-3
+            && self.lean.abs() < 1e-3
+    }
+
+    /// Размер кадра `w`x`h` после деформации (не меньше пикселя).
+    pub fn output_size(&self, w: u32, h: u32) -> (u32, u32) {
+        (
+            ((w as f32 * self.scale_x).round() as u32).max(1),
+            ((h as f32 * self.scale_y).round() as u32).max(1),
+        )
+    }
+
+    /// Смещение левого верха, чтобы якорная точка осталась на месте.
+    pub fn offset(&self, w: u32, h: u32) -> (f32, f32) {
+        let (ow, oh) = self.output_size(w, h);
+        (
+            self.anchor_x * (w as f32 - ow as f32),
+            self.anchor_y * (h as f32 - oh as f32),
+        )
+    }
+
+    /// Обратное отображение точки вывода `(dx, dy)` (в пикселях
+    /// деформированного кадра размера `out`) в координаты недеформированного
+    /// кадра `(w, h)`. Завал гаснет как куб высоты: низ стоит, верх ведёт.
+    pub fn source_point(
+        &self,
+        (w, h): (u32, u32),
+        (ow, oh): (u32, u32),
+        dx: u32,
+        dy: u32,
+    ) -> (f32, f32) {
+        let fy = (dy as f32 + 0.5) / oh.max(1) as f32;
+        let t = (1.0 - fy).clamp(0.0, 1.0);
+        let lean_px = self.lean * t * t * t;
+        let x = (dx as f32 + 0.5 - lean_px) / ow.max(1) as f32 * w as f32;
+        let y = fy * h as f32;
+        (x, y)
+    }
+}
+
 impl Surface {
+    /// Якорь деформации: точка тела, прижатая к поверхности.
+    pub fn deform_anchor(self) -> (f32, f32) {
+        match self {
+            // Ноги на полу; на стене профиль стоит вертикально — тоже низ.
+            Surface::Floor | Surface::WallLeft | Surface::WallRight => (0.5, 1.0),
+            // Под потолком держат руки — на месте остаётся верх.
+            Surface::Ceiling => (0.5, 0.0),
+        }
+    }
+
     /// Единичный вектор движения вдоль поверхности при `facing = Right`.
     pub fn tangent(self) -> Vec2 {
         match self {
@@ -449,6 +539,42 @@ mod tests {
         assert!(vis.is_empty(), "стоять негде: {vis:?}");
         // Без требования места кромка бы нашлась — значит отсекает именно оно.
         assert_eq!(visible_ledges(&stack, screen(), MIN_LEDGE, 0.0).len(), 1);
+    }
+
+    /// Деформация: объём примерно сохраняется, якорь стоит на месте,
+    /// обратное отображение возвращает точку внутрь кадра.
+    #[test]
+    fn deform_keeps_the_anchor_and_maps_back() {
+        let d = Deform {
+            scale_x: 1.25,
+            scale_y: 0.8,
+            lean: 6.0,
+            ..Deform::NONE
+        };
+        assert!(!d.is_identity());
+        assert!(Deform::NONE.is_identity());
+        let (ow, oh) = d.output_size(64, 64);
+        assert_eq!((ow, oh), (80, 51));
+        // Якорь — середина низа: по горизонтали кадр растёт в обе стороны,
+        // по вертикали низ остаётся на месте.
+        let (dx, dy) = d.offset(64, 64);
+        assert!((dx + 8.0).abs() < 0.01, "сдвиг по x: {dx}");
+        assert!((dy - 13.0).abs() < 0.01, "низ на месте: {dy}");
+        // Низ кадра не завален, верх — уведён на lean.
+        let (x_bottom, _) = d.source_point((64, 64), (ow, oh), 40, oh - 1);
+        let (x_top, y_top) = d.source_point((64, 64), (ow, oh), 40, 0);
+        assert!((x_bottom - 32.4).abs() < 1.0, "низ по центру: {x_bottom}");
+        assert!(x_top < x_bottom - 3.0, "верх уведён: {x_top}");
+        assert!(y_top < 1.0);
+    }
+
+    /// Якорь деформации зависит от поверхности: под потолком тело растёт
+    /// вниз от рук, а не вверх от ног.
+    #[test]
+    fn deform_anchor_follows_surface() {
+        assert_eq!(Surface::Floor.deform_anchor(), (0.5, 1.0));
+        assert_eq!(Surface::WallLeft.deform_anchor(), (0.5, 1.0));
+        assert_eq!(Surface::Ceiling.deform_anchor(), (0.5, 0.0));
     }
 
     /// Верх панели (exclusive-зона, D5) — пол: без платформ опора = override.

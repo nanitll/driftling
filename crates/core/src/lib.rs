@@ -17,6 +17,7 @@ pub mod attributes;
 pub mod behavior;
 pub mod body;
 pub mod config;
+pub mod effects;
 pub mod geometry;
 pub mod growth;
 pub mod journal;
@@ -43,6 +44,6 @@ pub use journal::{
 };
 pub use palette::{DEFAULT_PET_COLOR, PET_PRESETS};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
-pub use physics::{Orient, Surface};
+pub use physics::{Deform, Orient, Surface};
 pub use stats::PetStats;
 pub use sync::{apply_remote, cursors_of, events_after, Cursors};

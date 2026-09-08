@@ -3,7 +3,7 @@
 //! это и wl_shm ARGB8888, и 32-битный ZPixmap на LSB-first X-серверах.
 
 use driftling_core::sprite::Frame;
-use driftling_core::{Orient, Rect};
+use driftling_core::{Deform, Orient, Rect};
 
 use crate::Scene;
 
@@ -12,14 +12,14 @@ use crate::Scene;
 pub(crate) fn scene_bounds(scene: &Scene<'_>) -> Option<(i32, i32, u32, u32)> {
     let mut acc: Option<(i32, i32, i32, i32)> = None;
     for s in &scene.sprites {
-        if s.frame.w == 0 || s.frame.h == 0 {
+        if s.invisible() {
             continue;
         }
-        let (sw, sh) = s.size();
-        let x0 = s.origin.x.round() as i32;
-        let y0 = s.origin.y.round() as i32;
-        let x1 = x0 + sw as i32;
-        let y1 = y0 + sh as i32;
+        let r = s.screen_rect();
+        let x0 = r.x.round() as i32;
+        let y0 = r.y.round() as i32;
+        let x1 = x0 + r.w as i32;
+        let y1 = y0 + r.h as i32;
         acc = Some(match acc {
             None => (x0, y0, x1, y1),
             Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
@@ -49,6 +49,10 @@ struct SpriteKey {
     /// Положение спрайта внутри буфера (относительно объединённых границ).
     rel: (i32, i32),
     orient: Orient,
+    /// Деформация и прозрачность огрубляются до сотых: дрожание последнего
+    /// знака не должно заставлять перерисовывать кадр каждый тик.
+    deform: (i32, i32, i32),
+    alpha: i32,
 }
 
 pub(crate) fn content_key(scene: &Scene<'_>, origin: (i32, i32), scale: u32) -> ContentKey {
@@ -57,16 +61,22 @@ pub(crate) fn content_key(scene: &Scene<'_>, origin: (i32, i32), scale: u32) -> 
         sprites: scene
             .sprites
             .iter()
-            .filter(|s| s.frame.w > 0 && s.frame.h > 0)
+            .filter(|s| !s.invisible())
             .map(|s| SpriteKey {
                 argb: s.frame.argb.as_ptr() as usize,
                 w: s.frame.w,
                 h: s.frame.h,
-                rel: (
-                    s.origin.x.round() as i32 - origin.0,
-                    s.origin.y.round() as i32 - origin.1,
-                ),
+                rel: {
+                    let r = s.screen_rect();
+                    (r.x.round() as i32 - origin.0, r.y.round() as i32 - origin.1)
+                },
                 orient: s.orient,
+                deform: (
+                    (s.deform.scale_x * 100.0).round() as i32,
+                    (s.deform.scale_y * 100.0).round() as i32,
+                    (s.deform.lean * 10.0).round() as i32,
+                ),
+                alpha: (s.alpha * 100.0).round() as i32,
             })
             .collect(),
     }
@@ -99,11 +109,14 @@ pub(crate) fn compose(
 ) {
     canvas.fill(0); // 0x00000000 — полностью прозрачно
     for s in &scene.sprites {
-        let rel = (
-            s.origin.x.round() as i32 - origin.0,
-            s.origin.y.round() as i32 - origin.1,
+        if s.invisible() {
+            continue;
+        }
+        let r = s.screen_rect();
+        let rel = (r.x.round() as i32 - origin.0, r.y.round() as i32 - origin.1);
+        blit(
+            canvas, size, s.frame, rel, s.orient, s.deform, s.alpha, scale,
         );
-        blit(canvas, size, s.frame, rel, s.orient, scale);
     }
 }
 
@@ -118,18 +131,23 @@ fn source_index(frame: &Frame, orient: Orient, dx: u32, dy: u32) -> usize {
 /// Блит спрайта на холст: nearest-neighbour масштаб, ориентация кадра
 /// (зеркала + поворот на четверти), пропуск пикселей с альфой 0, клип по
 /// краям. `origin` — логические координаты левого верхнего угла спрайта.
+#[allow(clippy::too_many_arguments)]
 fn blit(
     canvas: &mut [u8],
     (cw, ch): (u32, u32),
     frame: &Frame,
     (ox, oy): (i32, i32),
     orient: Orient,
+    deform: Deform,
+    alpha: f32,
     scale: u32,
 ) {
-    if frame.w == 0 || frame.h == 0 {
+    if frame.w == 0 || frame.h == 0 || alpha <= 0.004 {
         return;
     }
-    let (out_w, out_h) = orient.output_size(frame.w, frame.h);
+    let (ow, oh) = orient.output_size(frame.w, frame.h);
+    let (out_w, out_h) = deform.output_size(ow, oh);
+    let plain = deform.is_identity();
     let base_x = ox * scale as i32;
     let base_y = oy * scale as i32;
     for dy in 0..out_h * scale {
@@ -142,15 +160,44 @@ fn blit(
             if cx < 0 || cx >= cw as i32 {
                 continue;
             }
-            let px = frame.argb[source_index(frame, orient, dx / scale, dy / scale)];
+            // Без деформации выборка прямая — быстрый путь обычного кадра.
+            let (sx, sy) = if plain {
+                (dx / scale, dy / scale)
+            } else {
+                let (fx, fy) =
+                    deform.source_point((ow, oh), (out_w, out_h), dx / scale, dy / scale);
+                if fx < 0.0 || fy < 0.0 {
+                    continue;
+                }
+                let (sx, sy) = (fx as u32, fy as u32);
+                if sx >= ow || sy >= oh {
+                    continue;
+                }
+                (sx, sy)
+            };
+            let px = frame.argb[source_index(frame, orient, sx, sy)];
             if px >> 24 == 0 {
                 continue; // прозрачный пиксель спрайта
+            }
+            let px = fade(px, alpha);
+            if px >> 24 == 0 {
+                continue;
             }
             let off = ((cy as u32 * cw + cx as u32) * 4) as usize;
             // ARGB8888 little-endian: байты B, G, R, A.
             canvas[off..off + 4].copy_from_slice(&px.to_le_bytes());
         }
     }
+}
+
+/// Умножить premultiplied-пиксель на прозрачность: и альфа, и каналы.
+fn fade(px: u32, alpha: f32) -> u32 {
+    if alpha >= 0.996 {
+        return px;
+    }
+    let k = alpha.clamp(0.0, 1.0);
+    let ch = |sh: u32| ((((px >> sh) & 0xff) as f32 * k).round() as u32).min(255);
+    (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 #[cfg(test)]
@@ -181,6 +228,8 @@ mod tests {
                 frame,
                 origin,
                 orient: Orient::mirrored(mirror),
+                deform: Deform::NONE,
+                alpha: 1.0,
             }],
             input_rects: vec![Rect::new(
                 origin.x,
@@ -197,7 +246,16 @@ mod tests {
     fn blit_scale1_pixel_perfect() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 4 * 4 * 4];
-        blit(&mut canvas, (4, 4), &f, (1, 1), Orient::IDENTITY, 1);
+        blit(
+            &mut canvas,
+            (4, 4),
+            &f,
+            (1, 1),
+            Orient::IDENTITY,
+            Deform::NONE,
+            1.0,
+            1,
+        );
         assert_eq!(pixel(&canvas, 4, 1, 1), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 4, 2, 1), 0xff_00_22_00);
         assert_eq!(pixel(&canvas, 4, 1, 2), 0xff_00_00_33);
@@ -212,7 +270,16 @@ mod tests {
     fn blit_mirror_swaps_columns() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 2 * 2 * 4];
-        blit(&mut canvas, (2, 2), &f, (0, 0), Orient::mirrored(true), 1);
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            Orient::mirrored(true),
+            Deform::NONE,
+            1.0,
+            1,
+        );
         assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_22_00); // B слева
         assert_eq!(pixel(&canvas, 2, 1, 0), 0xff_11_00_00); // A справа
         assert_eq!(pixel(&canvas, 2, 0, 1), 0); // прозрачный (зеркало C)
@@ -230,7 +297,7 @@ mod tests {
             quarter_turns: 1,
         };
         let mut canvas = vec![0u8; 2 * 2 * 4];
-        blit(&mut canvas, (2, 2), &f, (0, 0), cw, 1);
+        blit(&mut canvas, (2, 2), &f, (0, 0), cw, Deform::NONE, 1.0, 1);
         // Поворот по часовой: A уходит вправо-вверх, C — влево-вверх.
         assert_eq!(pixel(&canvas, 2, 1, 0), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_00_33);
@@ -241,7 +308,7 @@ mod tests {
             ..cw
         };
         let mut canvas = vec![0u8; 2 * 2 * 4];
-        blit(&mut canvas, (2, 2), &f, (0, 0), ccw, 1);
+        blit(&mut canvas, (2, 2), &f, (0, 0), ccw, Deform::NONE, 1.0, 1);
         assert_eq!(pixel(&canvas, 2, 0, 1), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_22_00);
     }
@@ -256,16 +323,94 @@ mod tests {
             quarter_turns: 0,
         };
         let mut canvas = vec![0u8; 2 * 2 * 4];
-        blit(&mut canvas, (2, 2), &f, (0, 0), orient, 1);
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            orient,
+            Deform::NONE,
+            1.0,
+            1,
+        );
         assert_eq!(pixel(&canvas, 2, 0, 0), 0xff_00_00_33, "нижний ряд наверху");
         assert_eq!(pixel(&canvas, 2, 0, 1), 0xff_11_00_00);
+    }
+
+    /// Фаза G6: сплющивание тянет кадр по X и жмёт по Y, низ остаётся на
+    /// месте (якорь), рисунок продолжает попадать в холст.
+    #[test]
+    fn blit_deform_squashes_around_the_anchor() {
+        let f = frame_2x2();
+        let squash = Deform {
+            scale_x: 2.0,
+            scale_y: 1.0,
+            ..Deform::NONE
+        };
+        let mut canvas = vec![0u8; 4 * 2 * 4];
+        blit(
+            &mut canvas,
+            (4, 2),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            squash,
+            1.0,
+            1,
+        );
+        // Левый пиксель растянут на две колонки.
+        assert_eq!(pixel(&canvas, 4, 0, 0), 0xff_11_00_00);
+        assert_eq!(pixel(&canvas, 4, 1, 0), 0xff_11_00_00);
+        assert_eq!(pixel(&canvas, 4, 2, 0), 0xff_00_22_00);
+    }
+
+    /// Прозрачность гасит premultiplied-пиксель целиком: и каналы, и альфу.
+    #[test]
+    fn blit_alpha_fades_the_sprite() {
+        let f = frame_2x2();
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            Deform::NONE,
+            0.5,
+            1,
+        );
+        let px = pixel(&canvas, 2, 0, 0);
+        assert_eq!(px >> 24, 0x80, "альфа вдвое: {px:08x}");
+        assert_eq!((px >> 16) & 0xff, 0x09, "канал тоже вдвое: {px:08x}");
+        // Полностью прозрачный спрайт не рисуется вовсе.
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            Deform::NONE,
+            0.0,
+            1,
+        );
+        assert_eq!(pixel(&canvas, 2, 0, 0), 0);
     }
 
     #[test]
     fn blit_scale2_nearest_neighbour() {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 4 * 4 * 4];
-        blit(&mut canvas, (4, 4), &f, (0, 0), Orient::IDENTITY, 2);
+        blit(
+            &mut canvas,
+            (4, 4),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            Deform::NONE,
+            1.0,
+            2,
+        );
         // Каждый исходный пиксель — блок 2x2.
         for (x, y) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
             assert_eq!(pixel(&canvas, 4, x, y), 0xff_11_00_00);
@@ -283,10 +428,28 @@ mod tests {
         let f = frame_2x2();
         let mut canvas = vec![0u8; 2 * 2 * 4];
         // Наполовину за левым верхним углом: не паникует, видимая часть верна.
-        blit(&mut canvas, (2, 2), &f, (-1, -1), Orient::IDENTITY, 1);
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (-1, -1),
+            Orient::IDENTITY,
+            Deform::NONE,
+            1.0,
+            1,
+        );
         assert_eq!(pixel(&canvas, 2, 0, 0), 0); // прозрачный угол спрайта
                                                 // За правым нижним краем — тоже без паники.
-        blit(&mut canvas, (2, 2), &f, (1, 1), Orient::IDENTITY, 1);
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (1, 1),
+            Orient::IDENTITY,
+            Deform::NONE,
+            1.0,
+            1,
+        );
         assert_eq!(pixel(&canvas, 2, 1, 1), 0xff_11_00_00);
     }
 
@@ -323,11 +486,15 @@ mod tests {
                     frame: &f,
                     origin: Vec2::new(0.0, 0.0),
                     orient: Orient::IDENTITY,
+                    deform: Deform::NONE,
+                    alpha: 1.0,
                 },
                 SpriteInstance {
                     frame: &f,
                     origin: Vec2::new(10.0, 4.0),
                     orient: Orient::IDENTITY,
+                    deform: Deform::NONE,
+                    alpha: 1.0,
                 },
             ],
             input_rects: vec![],

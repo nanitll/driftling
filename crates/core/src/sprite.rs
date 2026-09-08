@@ -37,6 +37,8 @@ pub enum ActionLook {
     Vomiting,
     /// Чихает (фаза G5): короткое сжатие — кадр приземления.
     Sneezing,
+    /// Машет лапкой (фаза G6): приветствие и прощание.
+    Waving,
 }
 
 /// Полное описание внешнего вида питомца в кадре: состояние поведения,
@@ -51,6 +53,9 @@ pub struct Look {
     pub overlay: Option<ActionLook>,
     pub surface: Surface,
     pub idle_action: IdleAction,
+    /// Питомец стоит на кромке окна, а не на земле (фаза G6): сидя он
+    /// свешивает лапки с карниза.
+    pub on_ledge: bool,
 }
 
 impl Look {
@@ -63,6 +68,7 @@ impl Look {
             overlay: None,
             surface: Surface::Floor,
             idle_action: IdleAction::Stand,
+            on_ledge: false,
         }
     }
 }
@@ -184,6 +190,10 @@ pub struct SpriteSet {
     pub swing: Vec<Frame>,
     /// Тошнит после укачивания.
     pub vomit: Vec<Frame>,
+    /// Машет лапкой: здоровается и прощается.
+    pub wave: Vec<Frame>,
+    /// Сидит на карнизе, свесив лапки.
+    pub dangle: Vec<Frame>,
     /// Прозрачные поля поз хвата (climb/cling) — ими питомец прижимается
     /// к стене: спереди (морда и лапки) это правое поле кадра.
     pub grip_inset: Inset,
@@ -228,6 +238,7 @@ impl SpriteSet {
                 ActionLook::Hatching => pick(&self.hatching, 2.0, t),
                 ActionLook::Vomiting => pick_or(&self.vomit, &self.sick, 3.0, t),
                 ActionLook::Sneezing => pick(&self.landing, 6.0, t),
+                ActionLook::Waving => pick_or(&self.wave, &self.happy, 3.0, t),
             };
         }
         if look.stage == Stage::Egg {
@@ -270,6 +281,8 @@ impl SpriteSet {
         }
         match look.idle_action {
             IdleAction::Blink => pick_or(&self.blink, &self.idle, 1.0, t),
+            // На карнизе сидят, свесив лапки за край.
+            IdleAction::Sit if look.on_ledge => pick_or(&self.dangle, &self.sit, 1.2, t),
             IdleAction::Sit => pick_or(&self.sit, &self.idle, 1.5, t),
             IdleAction::Stretch => pick_or(&self.stretch, &self.idle, 2.5, t),
             IdleAction::Wiggle => pick_or(&self.wiggle, &self.idle, 4.0, t),
@@ -608,6 +621,8 @@ pub fn placeholder_colored(base_size: u32, stage: Stage, argb: u32) -> SpriteSet
         hang: Vec::new(),
         swing: Vec::new(),
         vomit: Vec::new(),
+        wave: Vec::new(),
+        dangle: Vec::new(),
         grip_inset: Inset::default(),
         feet_inset: Inset::default(),
     }

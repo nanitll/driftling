@@ -459,6 +459,47 @@ def hang_pose(grid: Grid, left_hand: int, right_hand: int, sway: int) -> Grid:
     return body
 
 
+def wave_pose(grid: Grid, hand_row_offset: int) -> Grid:
+    """Приветственный взмах: ближняя лапка поднята к макушке и машет."""
+    out = [row[:] for row in grid]
+    an = anatomy(out)
+    top = next(y for y, row in enumerate(out) if row_filled(row) > 0)
+    arm_up(out, on_left=False, hand_row=max(0, top + hand_row_offset))
+    # Слегка приподнятая на цыпочки поза читается как «тянется помахать».
+    if an.legs:
+        out = shift_feet(out, [0, -1])
+    return out
+
+
+def dangle_pose(grid: Grid, swing: int) -> Grid:
+    """Сидит на карнизе, свесив лапки: корпус опущен, лапки — вперёд-вниз
+    и качаются (`swing` — сдвиг лапок по горизонтали)."""
+    an = anatomy(grid)
+    if not an.legs:
+        return [row[:] for row in grid]
+    height, width = len(grid), len(grid[0])
+    out = [blank_row(width) for _ in range(height)]
+    # Корпус садится на ряд ниже.
+    for y in range(0, an.body_bottom + 1):
+        ny = y + 1
+        if ny < height:
+            out[ny] = grid[y][:]
+    # Лапки — вперёд (вправо, к краю карниза) и качаются.
+    groups = foot_columns(grid, an.legs)
+    shift = 3 + swing
+    for y in an.legs:
+        for x in range(width):
+            ch = grid[y][x]
+            if ch == EMPTY:
+                continue
+            near = groups and x >= groups[-1][0]
+            dx = shift if near else shift - 2
+            nx = x + dx
+            if 0 <= nx < width and out[y][nx] == EMPTY:
+                out[y][nx] = ch if near else ("D" if ch == BODY else ch)
+    return out
+
+
 def vomit_pose(grid: Grid, splash: bool) -> Grid:
     """Тошнит: глаза зажмурены, рот распахнут; на втором кадре — струйка."""
     out = close_eyes(grid)
@@ -536,6 +577,12 @@ def derive(stage: str) -> dict[str, Grid]:
     out["swing_1"] = hang_pose(src["idle_1"], left_hand=0, right_hand=0, sway=0)
     out["swing_2"] = hang_pose(idle, left_hand=3, right_hand=0, sway=1)
     out["swing_3"] = hang_pose(src["idle_1"], left_hand=0, right_hand=0, sway=0)
+    # Машет лапкой: здоровается и прощается.
+    out["wave_0"] = wave_pose(idle, hand_row_offset=0)
+    out["wave_1"] = wave_pose(src["idle_1"], hand_row_offset=2)
+    # Сидит на карнизе, свесив лапки.
+    out["dangle_0"] = dangle_pose(idle, swing=0)
+    out["dangle_1"] = dangle_pose(src["idle_1"], swing=1)
     # Укачало: тошнит (зелёный оттенок добавляет демон перекраской).
     out["vomit_0"] = vomit_pose(idle, splash=False)
     out["vomit_1"] = vomit_pose(idle, splash=True)
@@ -586,6 +633,14 @@ frames = ["swing_0", "swing_1", "swing_2", "swing_3"]
 [stages.{stage}.anims.vomit]
 fps = 3.0
 frames = ["vomit_0", "vomit_1"]
+
+[stages.{stage}.anims.wave]
+fps = 3.0
+frames = ["wave_0", "wave_1"]
+
+[stages.{stage}.anims.dangle]
+fps = 1.2
+frames = ["dangle_0", "dangle_1"]
 """
 
 
@@ -594,7 +649,12 @@ def sync_manifest() -> None:
     path = PACK / "pack.toml"
     text = path.read_text()
     for stage in STAGES:
+        if f"[stages.{stage}.anims.wave]" in text:
+            continue
         if f"[stages.{stage}.anims.hang]" in text:
+            extra = MANIFEST_BLOCK.format(stage=stage)
+            extra = extra[extra.index(f"[stages.{stage}.anims.wave]"):]
+            text = text.rstrip("\n") + "\n\n" + extra
             continue
         if f"[stages.{stage}.anims.blink]" in text:
             # Блок фазы G уже есть — дописываем только новые семейства.

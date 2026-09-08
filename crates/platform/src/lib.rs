@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use driftling_core::sprite::Frame;
-use driftling_core::{Orient, Rect, Vec2};
+use driftling_core::{Deform, Orient, Rect, Vec2};
 
 mod render;
 mod supervise;
@@ -52,17 +52,42 @@ pub struct Scene<'a> {
 
 pub struct SpriteInstance<'a> {
     pub frame: &'a Frame,
-    /// Левый верхний угол спрайта (уже с учётом поворота: для четвертей
-    /// 90°/270° ширина и высота кадра меняются местами).
+    /// Левый верхний угол НЕдеформированного спрайта (с учётом поворота:
+    /// для четвертей 90°/270° ширина и высота кадра меняются местами).
+    /// Деформация двигает рисунок относительно него так, чтобы якорная
+    /// точка осталась на месте — см. [`SpriteInstance::screen_rect`].
     pub origin: Vec2,
     /// Ориентация кадра: зеркала + поворот под поверхность (фаза G).
     pub orient: Orient,
+    /// Мягкая деформация тела (фаза G6): squash & stretch + завал верхушки.
+    pub deform: Deform,
+    /// Общая прозрачность 0..1 (тень, пыль, затухания). 1.0 — как есть.
+    pub alpha: f32,
 }
 
 impl SpriteInstance<'_> {
-    /// Размер кадра на экране с учётом поворота.
+    /// Размер кадра на экране с учётом поворота (без деформации).
     pub fn size(&self) -> (u32, u32) {
         self.orient.output_size(self.frame.w, self.frame.h)
+    }
+
+    /// Размер после деформации.
+    pub fn deformed_size(&self) -> (u32, u32) {
+        let (w, h) = self.size();
+        self.deform.output_size(w, h)
+    }
+
+    /// Прямоугольник на экране с учётом поворота и деформации.
+    pub fn screen_rect(&self) -> Rect {
+        let (w, h) = self.size();
+        let (ow, oh) = self.deform.output_size(w, h);
+        let (dx, dy) = self.deform.offset(w, h);
+        Rect::new(self.origin.x + dx, self.origin.y + dy, ow as f32, oh as f32)
+    }
+
+    /// Спрайт полностью прозрачен — рисовать нечего.
+    pub fn invisible(&self) -> bool {
+        self.alpha <= 0.004 || self.frame.w == 0 || self.frame.h == 0
     }
 }
 

@@ -625,39 +625,6 @@ fn stats_pill(frame: &mut Frame, layout: &RadialLayout, at: Vec2, stats: [f32; 3
     }
 }
 
-/// Лужица (фаза G5): плоская зеленоватая клякса шириной `w`, которую
-/// питомец оставляет на полу, когда его укачало. Premultiplied ARGB.
-pub fn puddle_frame(w: u32, color: u32) -> Frame {
-    let w = w.max(8);
-    let h = (w / 3).max(4);
-    let mut frame = transparent(w, h);
-    let (fw, fh) = (w as f32, h as f32);
-    // Три перекрывающихся диска разного размера — неровный край.
-    for (cx, cy, r) in [
-        (fw * 0.5, fh * 0.55, fh * 0.45),
-        (fw * 0.3, fh * 0.6, fh * 0.38),
-        (fw * 0.72, fh * 0.58, fh * 0.4),
-    ] {
-        disc(&mut frame, Vec2::new(cx, cy), r, color, 0.9);
-    }
-    line(
-        &mut frame,
-        Vec2::new(fw * 0.22, fh * 0.6),
-        Vec2::new(fw * 0.78, fh * 0.6),
-        fh * 0.7,
-        color,
-    );
-    // Блик.
-    disc(
-        &mut frame,
-        Vec2::new(fw * 0.42, fh * 0.42),
-        fh * 0.12,
-        0xff_ff_ff_ff,
-        0.35,
-    );
-    frame
-}
-
 /// Кадр меню. `grow` — фаза появления 0..1 (1 — полностью раскрыто),
 /// `hovered` — кнопка под курсором, `stats` — [сытость, энергия,
 /// настроение] для мини-шкал (None — не рисовать), `px` — кегль подписи,
@@ -874,14 +841,6 @@ mod tests {
             0xff_b0_a2_94,
         );
         assert!(ink(&with_stats) > ink(&full));
-    }
-
-    /// Лужица рисуется и не вылезает за кадр.
-    #[test]
-    fn puddle_is_drawn() {
-        let f = puddle_frame(40, 0xff_7d_c4_7d);
-        assert!(ink(&f) > 40);
-        assert!(f.h < f.w);
     }
 
     /// Кадр premultiplied: канал не превышает альфу (иначе компоситор

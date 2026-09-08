@@ -77,10 +77,10 @@ use driftling_core::physics::{self, Platform};
 use driftling_core::radial;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
 use driftling_core::{
-    apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, DerivedPet,
-    Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient, Pet,
-    PetAttributes, PetRecord, PetState, PhysicsConfig, PointerEvent, Rect, SimPace, Stage, Surface,
-    SyncConfig, SyncMode, Vec2, World,
+    apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, Deform,
+    DerivedPet, Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient,
+    Pet, PetAttributes, PetRecord, PetState, PhysicsConfig, PointerEvent, Rect, SimPace, Stage,
+    Surface, SyncConfig, SyncMode, Vec2, World,
 };
 use driftling_ipc::{Request, Response, Server};
 use driftling_platform::{App, Event, Pace, Scene, SpriteInstance};
@@ -122,6 +122,16 @@ const SULK_SECS: f64 = 15.0;
 const PUDDLE_SECS: f64 = 25.0;
 const VOMIT_SECS: f64 = 1.6;
 const HICCUP_SECS: f64 = 30.0;
+/// Сколько питомец машет на прощание, прежде чем убежать, сек.
+const BYE_WAVE_SECS: f64 = 0.9;
+/// Живое тело (фаза G6): тень и пыль.
+/// Выше этой высоты над опорой тень уже не рисуется, px.
+const SHADOW_FADE_PX: f32 = 420.0;
+/// Прозрачность тени, когда питомец стоит на опоре.
+const SHADOW_ALPHA: f32 = 0.85;
+/// Сколько живёт облачко пыли, сек.
+const PUFF_LIFE: f64 = 0.5;
+
 /// Зелень укачанного: доля подмеса в цвет тела.
 const QUEASY_GREEN: u32 = 0xff_6f_c2_74;
 const QUEASY_MIX: f32 = 0.55;
@@ -514,6 +524,16 @@ struct Overlay {
     until: f64,
 }
 
+/// Облачко пыли (фаза G6): живёт доли секунды, разлетается и тает.
+struct Puff {
+    origin: Vec2,
+    vel: Vec2,
+    born: f64,
+    life: f64,
+    /// Стартовый размер как доля кадра пыли.
+    scale: f32,
+}
+
 /// Лужица на полу после тошноты (фаза G5).
 struct Puddle {
     frame: Frame,
@@ -894,6 +914,20 @@ struct DaemonApp {
     birthday_greeted: Option<i64>,
     /// Следующая проверка «не чихнуть ли».
     sneeze_check_at: f64,
+
+    // ---- Живое тело (фаза G6) ----
+    /// Кадр тени под питомцем (печётся под размер спрайта).
+    shadow: Frame,
+    /// Кадр облачка пыли.
+    puff: Frame,
+    /// Под какой размер спрайта испечены тень и пыль.
+    fx_size: u32,
+    /// Живые облачка пыли от приземлений и разворотов.
+    puffs: Vec<Puff>,
+    /// Прошлое состояние питомца — ловим момент приземления для пыли.
+    prev_state: Option<PetState>,
+    /// Прощание (фаза G6): сперва машет лапкой, в этот момент — убегает.
+    bye_run_at: Option<(f64, f32)>,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1024,6 +1058,20 @@ impl DaemonApp {
             dismiss_after_run: false,
             birthday_greeted: None,
             sneeze_check_at: 30.0,
+            shadow: Frame {
+                w: 0,
+                h: 0,
+                argb: Vec::new(),
+            },
+            puff: Frame {
+                w: 0,
+                h: 0,
+                argb: Vec::new(),
+            },
+            fx_size: 0,
+            puffs: Vec::new(),
+            prev_state: None,
+            bye_run_at: None,
         }
     }
 
@@ -1227,6 +1275,8 @@ impl DaemonApp {
 
     /// Снять все кратковременные визуальные состояния (dismiss).
     fn clear_effects(&mut self) {
+        self.bye_run_at = None;
+        self.puffs.clear();
         self.menu = None;
         self.overlay = None;
         self.bubble = None;
@@ -1348,6 +1398,71 @@ impl DaemonApp {
         };
         menu.rebake(now, self.menu_stats());
         self.menu = Some(menu);
+    }
+
+    /// Тень и пыль печём под текущий размер спрайта — один раз на набор.
+    fn sync_effects(&mut self) {
+        let size = self.sprites.size;
+        if size == self.fx_size && !self.shadow.argb.is_empty() {
+            return;
+        }
+        self.fx_size = size;
+        self.shadow = driftling_core::effects::shadow_frame((size as f32 * 0.78) as u32);
+        self.puff = driftling_core::effects::puff_frame(
+            (size as f32 * 0.34) as u32,
+            palette::lighten(self.sprite_color, 1.35),
+        );
+    }
+
+    /// Пыль из-под ног: `n` облачков в точке `at` с разлётом в стороны.
+    fn spawn_puffs(&mut self, at: Vec2, n: usize, power: f32, now: f64) {
+        if self.puff.argb.is_empty() {
+            return;
+        }
+        let base = self.sprites.size as f32;
+        for i in 0..n {
+            let side = if i % 2 == 0 { -1.0 } else { 1.0 };
+            let k = 0.6 + 0.4 * noise(now * 7.0 + i as f64) as f32;
+            self.puffs.push(Puff {
+                origin: Vec2::new(
+                    at.x + side * base * 0.12 * k - self.puff.w as f32 / 2.0,
+                    at.y - self.puff.h as f32 * 0.8,
+                ),
+                vel: Vec2::new(
+                    side * base * (0.9 + 0.7 * k) * power,
+                    -base * 0.35 * k * power,
+                ),
+                born: now,
+                life: PUFF_LIFE * (0.75 + 0.5 * k) as f64,
+                scale: 0.55 + 0.35 * k,
+            });
+        }
+    }
+
+    /// Живое тело (фаза G6): пыль от приземлений и разворотов, полёт и
+    /// затухание уже висящих облачков.
+    fn body_fx_tick(&mut self, now: f64, dt: f32) {
+        self.sync_effects();
+        // Приземление и удар о потолок поднимают пыль.
+        let state = self.pet.as_ref().map(|p| p.state);
+        if let (Some(prev), Some(cur), Some(pet)) = (self.prev_state, state, self.pet.as_ref()) {
+            let b = pet.bounds();
+            if prev == PetState::Falling && cur == PetState::Landing {
+                self.spawn_puffs(Vec2::new(b.x + b.w / 2.0, b.bottom()), 4, 1.0, now);
+            } else if prev == PetState::Falling && cur == PetState::Roll {
+                self.spawn_puffs(Vec2::new(b.x + b.w / 2.0, b.bottom()), 3, 1.2, now);
+            } else if prev == PetState::Bonk && cur == PetState::Falling {
+                self.spawn_puffs(Vec2::new(b.x + b.w / 2.0, b.y), 3, 0.8, now);
+            }
+        }
+        self.prev_state = state;
+
+        // Облачка разлетаются, замедляются и тают.
+        self.puffs.retain(|p| now - p.born < p.life);
+        for p in &mut self.puffs {
+            p.origin = p.origin + p.vel * dt;
+            p.vel = p.vel * (1.0 - (3.5 * dt).min(1.0));
+        }
     }
 
     /// Сытость/энергия/настроение для мини-шкал меню.
@@ -2021,11 +2136,18 @@ impl DaemonApp {
         } else {
             1.0
         };
-        pet.state = PetState::Walk;
+        pet.state = PetState::Idle;
         pet.state_time = 0.0;
+        pet.state_left = BYE_WAVE_SECS as f32;
         pet.vel = Vec2::default();
+        // Сначала помахать (фаза G6), убежать — через мгновение.
+        self.overlay = Some(Overlay {
+            look: ActionLook::Waving,
+            from: now,
+            until: now + BYE_WAVE_SECS,
+        });
         self.bubble = Some(text_bubble(&fl!("bubble-bye"), now, 1.4));
-        self.presence_anim = Some(PresenceAnim::RunOff { dir });
+        self.bye_run_at = Some((now + BYE_WAVE_SECS, dir));
         self.dismiss_after_run = true;
         Response::Ok
     }
@@ -2061,7 +2183,7 @@ impl DaemonApp {
             if let Some(pet) = &self.pet {
                 let b = pet.bounds();
                 let w = (b.w * 0.6) as u32;
-                let frame = radial::puddle_frame(w, QUEASY_GREEN);
+                let frame = driftling_core::effects::puddle_frame(w, QUEASY_GREEN);
                 let dir = pet.facing.sign();
                 self.puddle = Some(Puddle {
                     origin: Vec2::new(
@@ -2085,6 +2207,18 @@ impl DaemonApp {
             } else if now >= self.hiccup_next {
                 self.bubble = Some(text_bubble(&fl!("bubble-hiccup"), now, 0.6));
                 self.hiccup_next = now + 2.4 + 2.2 * noise(now);
+            }
+        }
+
+        // Прощание: взмах кончился — пора убегать.
+        if let Some((at, dir)) = self.bye_run_at {
+            if now >= at {
+                self.bye_run_at = None;
+                if let Some(pet) = &mut self.pet {
+                    pet.state = PetState::Walk;
+                    pet.state_time = 0.0;
+                    self.presence_anim = Some(PresenceAnim::RunOff { dir });
+                }
             }
         }
 
@@ -2367,6 +2501,8 @@ impl App for DaemonApp {
         self.menu_tick(now);
         // Характер и реакции (G5).
         self.reactions_tick(now);
+        // Живое тело (G6): пыль и кадры эффектов.
+        self.body_fx_tick(now, dt);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -2399,6 +2535,8 @@ impl App for DaemonApp {
                     overlay: self.overlay.as_ref().map(|o| o.look),
                     surface: pet.surface,
                     idle_action: pet.idle_action(),
+                    // На кромке окна питомец сидит, свесив лапки (G6).
+                    on_ledge: pet.surface == Surface::Floor && pet.pos.y < world.ground_y() - 1.0,
                 };
                 // Фаза анимации оверлея — от его старта, не от state_time;
                 // у мелких занятий в покое (фаза G) — своя фаза.
@@ -2406,13 +2544,40 @@ impl App for DaemonApp {
                     Some(o) => (now - o.from) as f32,
                     None => pet.anim_time(),
                 };
-                let mut sprites = Vec::with_capacity(4);
-                // Лужица — под питомцем (рисуется первой).
+                let mut sprites = Vec::with_capacity(8);
+                // Тень на опоре под питомцем: чем выше он над ней, тем
+                // тень бледнее и меньше (фаза G6).
+                if !self.shadow.argb.is_empty() {
+                    let feet = pet.bounds().bottom();
+                    let support = physics::support_below(world, pet.pos.x, feet - 1.0);
+                    let height = (support - feet).max(0.0);
+                    if height < SHADOW_FADE_PX {
+                        let k = 1.0 - height / SHADOW_FADE_PX;
+                        let scale = 0.55 + 0.45 * k;
+                        let (sw, sh) = (self.shadow.w as f32, self.shadow.h as f32);
+                        sprites.push(SpriteInstance {
+                            frame: &self.shadow,
+                            origin: Vec2::new(pet.pos.x - sw / 2.0, support - sh * 0.6),
+                            orient: Orient::IDENTITY,
+                            deform: Deform {
+                                scale_x: scale,
+                                scale_y: scale,
+                                lean: 0.0,
+                                anchor_x: 0.5,
+                                anchor_y: 0.5,
+                            },
+                            alpha: SHADOW_ALPHA * k * k,
+                        });
+                    }
+                }
+                // Лужица — под питомцем.
                 if let Some(puddle) = &self.puddle {
                     sprites.push(SpriteInstance {
                         frame: &puddle.frame,
                         origin: puddle.origin,
                         orient: Orient::IDENTITY,
+                        deform: Deform::NONE,
+                        alpha: 1.0,
                     });
                 }
                 sprites.push(SpriteInstance {
@@ -2420,7 +2585,28 @@ impl App for DaemonApp {
                     origin: Vec2::new(bounds.x, bounds.y),
                     // Поворот под поверхность + зеркало по взгляду (фаза G).
                     orient: pet.orient(),
+                    // Мягкое тело: сплющивание, растяжение, завал (фаза G6).
+                    deform: pet.deform(),
+                    alpha: 1.0,
                 });
+                // Пыль поверх питомца: она перед ним, у самых ног.
+                for puff in &self.puffs {
+                    let age = ((now - puff.born) / puff.life).clamp(0.0, 1.0) as f32;
+                    let scale = puff.scale * (1.0 + 1.6 * age);
+                    sprites.push(SpriteInstance {
+                        frame: &self.puff,
+                        origin: puff.origin,
+                        orient: Orient::IDENTITY,
+                        deform: Deform {
+                            scale_x: scale,
+                            scale_y: scale,
+                            lean: 0.0,
+                            anchor_x: 0.5,
+                            anchor_y: 0.5,
+                        },
+                        alpha: (1.0 - age) * 0.75,
+                    });
+                }
                 // Пробегающего мимо (run-off/run-in, фаза E) не поймать:
                 // хит-области нет, указатель проходит насквозь.
                 let mut input_rects = if self.presence_anim.is_some() {
@@ -2447,6 +2633,8 @@ impl App for DaemonApp {
                         frame: &bubble.frame,
                         origin: Vec2::new(x, y),
                         orient: Orient::IDENTITY,
+                        deform: Deform::NONE,
+                        alpha: 1.0,
                     });
                 }
                 // Меню — поверх всего (последним в порядке блита) + хит-зона.
@@ -2455,6 +2643,8 @@ impl App for DaemonApp {
                         frame: &menu.frame,
                         origin: menu.origin,
                         orient: Orient::IDENTITY,
+                        deform: Deform::NONE,
+                        alpha: 1.0,
                     });
                     input_rects.push(menu.screen_rect());
                 }
@@ -2501,6 +2691,12 @@ impl App for DaemonApp {
                     // яйцо поздоровается после вылупления (B6).
                     if greeted && self.derived.stage != Stage::Egg {
                         self.bubble = Some(hello_bubble(now, HELLO_START_SECS));
+                        // Здоровается лапкой (фаза G6).
+                        self.overlay = Some(Overlay {
+                            look: ActionLook::Waving,
+                            from: now,
+                            until: now + HELLO_START_SECS.min(1.2),
+                        });
                     }
                     // Присутствие (фаза E): запуск демона = активность на
                     // этом устройстве, питомец перебегает сюда.
@@ -2931,6 +3127,107 @@ mod tests {
             EventKind::Dismissed
         ));
         assert!(!app.derived.summoned);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Фаза G6: живое тело ---------------------------------------------
+
+    /// Жёсткое приземление поднимает пыль; облачка живут доли секунды и
+    /// исчезают сами.
+    #[test]
+    fn hard_landing_raises_dust() {
+        let (mut app, _tx, dir) = adult_app("fx-dust");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        app.puffs.clear();
+        // Подкинуть повыше и уронить.
+        if let Some(pet) = &mut app.pet {
+            pet.pos.y = 200.0;
+            pet.vel = Vec2::new(0.0, 1500.0);
+            pet.state = PetState::Falling;
+        }
+        let mut seen = 0;
+        for _ in 0..120 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            seen = seen.max(app.puffs.len());
+        }
+        assert!(seen >= 3, "пыли от удара не видно: {seen}");
+        // Пыль недолговечна.
+        now += PUFF_LIFE + 0.2;
+        app.tick(now);
+        assert!(app.puffs.is_empty(), "пыль должна осесть");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Тень рисуется под питомцем на его опоре и тает с высотой.
+    #[test]
+    fn shadow_follows_the_pet_and_fades_with_height() {
+        let (mut app, _tx, dir) = adult_app("fx-shadow");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        let ground = app.world.as_ref().unwrap().ground_y();
+        let low = {
+            let scene = app.tick(now);
+            let s = &scene.sprites[0];
+            let r = s.screen_rect();
+            assert!(
+                (r.y + r.h / 2.0 - ground).abs() < 12.0,
+                "тень лежит на опоре: {r:?}"
+            );
+            s.alpha
+        };
+        // Подняли повыше — тень бледнее и меньше.
+        if let Some(pet) = &mut app.pet {
+            pet.pos.y = ground - 300.0;
+            pet.state = PetState::Falling;
+            pet.vel = Vec2::default();
+        }
+        now += 1.0 / 60.0;
+        let high = {
+            let scene = app.tick(now);
+            let s = &scene.sprites[0];
+            (s.alpha, s.screen_rect().w)
+        };
+        assert!(
+            high.0 < low * 0.6,
+            "тень не побледнела: {} -> {}",
+            low,
+            high.0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Прощание: сперва взмах лапкой на месте, и только потом пробежка.
+    #[test]
+    fn goodbye_waves_before_running() {
+        let (mut app, _tx, dir) = adult_app("fx-bye");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(app.dismiss_with_wave(now), Response::Ok);
+        assert!(
+            matches!(
+                app.overlay.as_ref().map(|o| o.look),
+                Some(ActionLook::Waving)
+            ),
+            "машет лапкой"
+        );
+        assert!(app.presence_anim.is_none(), "ещё не убегает");
+        now += BYE_WAVE_SECS + 0.05;
+        app.tick(now);
+        assert!(
+            matches!(app.presence_anim, Some(PresenceAnim::RunOff { .. })),
+            "после взмаха убегает"
+        );
+        settle(&mut app, &mut now, 8.0);
+        assert!(app.pet.is_none());
+        assert!(matches!(
+            journal_kinds(&dir).last().unwrap(),
+            EventKind::Dismissed
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3775,19 +4072,19 @@ mod tests {
         assert!(app.sprites.size > egg_size, "набор больше яичного");
 
         // Вылупление кончилось — показан пузырь без хит-области.
-        let counts = {
-            let scene = app.tick(1.0 + HATCH_SECS + 0.1);
-            (scene.sprites.len(), scene.input_rects.len())
-        };
+        // Сцену считаем по смыслу, а не по числу слоёв: с фазы G6 в ней
+        // ещё тень и пыль, а важно, что пузырь показан и хит-область одна.
+        let rects = app.tick(1.0 + HATCH_SECS + 0.1).input_rects.len();
         assert!(app.overlay.is_none());
-        assert_eq!(counts, (2, 1), "питомец + «Привет!» без хит-области");
+        assert!(app.bubble.is_some(), "«Привет!» показан");
+        assert_eq!(rects, 1, "пузырь без хит-области");
 
-        // Пузырь истёк — сцена снова обычная.
+        // Пузырь истёк — сцена снова обычная (питомец и его тень).
         let sprites_after = app
             .tick(1.0 + HATCH_SECS + HELLO_HATCH_SECS + 0.2)
             .sprites
             .len();
-        assert_eq!(sprites_after, 1);
+        assert!(sprites_after > 0);
         assert!(app.bubble.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3797,12 +4094,13 @@ mod tests {
     fn start_greets_existing_pet_with_bubble() {
         let (mut app, _tx, dir) = adult_app("greet");
         geometry(&mut app);
-        let scene = app.tick(0.0);
-        assert_eq!(scene.sprites.len(), 2, "питомец + приветствие");
-        assert_eq!(scene.input_rects.len(), 1);
+        let rects = app.tick(0.0).input_rects.len();
+        assert!(app.bubble.is_some(), "приветствие показано");
+        assert_eq!(rects, 1);
         assert_eq!(app.pace(), Pace::Active);
-        let scene = app.tick(HELLO_START_SECS + 0.1);
-        assert_eq!(scene.sprites.len(), 1, "пузырь истёк");
+        let sprites = app.tick(HELLO_START_SECS + 0.1).sprites.len();
+        assert!(app.bubble.is_none(), "пузырь истёк");
+        assert!(sprites > 0, "питомец остался на сцене");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3992,7 +4290,7 @@ mod tests {
         geometry(&mut app);
         let mut now = 0.0;
         settle(&mut app, &mut now, 3.0);
-        assert_eq!(app.tick(now).sprites.len(), 1);
+        assert!(!app.tick(now).sprites.is_empty(), "питомец на сцене");
         // Открытое меню не должно пережить скрытие.
         let p = app.pet.as_ref().unwrap().pos;
         assert!(app.event(Event::PointerMenu(p), now));
@@ -4013,7 +4311,7 @@ mod tests {
         now += 0.1;
         let sprites = app.tick(now).sprites.len();
         assert!(!app.fullscreen_hidden);
-        assert_eq!(sprites, 1, "питомец вернулся");
+        assert!(sprites > 0, "питомец вернулся");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
