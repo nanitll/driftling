@@ -29,11 +29,11 @@ const SCALE: u32 = 4;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
-        [_, m, o] if ["sheets", "icons", "surfaces", "radial"].contains(&m.as_str()) => {
+        [_, m, o] if ["sheets", "icons", "surfaces", "radial", "body"].contains(&m.as_str()) => {
             (m.as_str(), Path::new(o))
         }
         _ => {
-            eprintln!("использование: render_pack (sheets|icons|surfaces|radial) <каталог>");
+            eprintln!("использование: render_pack (sheets|icons|surfaces|radial|body) <каталог>");
             std::process::exit(2);
         }
     };
@@ -49,6 +49,7 @@ fn main() {
         "sheets" => sheets(pack, out),
         "surfaces" => surfaces(pack, out),
         "radial" => radial(pack, out),
+        "body" => body(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -85,6 +86,43 @@ impl Canvas {
                 if cx < self.w && cy < self.h {
                     self.px[(cy * self.w + cx) as usize] = p;
                 }
+            }
+        }
+    }
+
+    /// Блит с деформацией и прозрачностью — как это делает оверлей.
+    fn blit_deformed(
+        &mut self,
+        f: &Frame,
+        origin: driftling_core::Vec2,
+        deform: driftling_core::Deform,
+        alpha: f32,
+    ) {
+        let (ow, oh) = deform.output_size(f.w, f.h);
+        let (offx, offy) = deform.offset(f.w, f.h);
+        for dy in 0..oh {
+            for dx in 0..ow {
+                let (sx, sy) = deform.source_point((f.w, f.h), (ow, oh), dx, dy);
+                if sx < 0.0 || sy < 0.0 || sx as u32 >= f.w || sy as u32 >= f.h {
+                    continue;
+                }
+                let p = f.argb[(sy as u32 * f.w + sx as u32) as usize];
+                let a = (p >> 24) as f32 / 255.0 * alpha;
+                if a <= 0.004 {
+                    continue;
+                }
+                let (cx, cy) = (origin.x + offx + dx as f32, origin.y + offy + dy as f32);
+                if cx < 0.0 || cy < 0.0 || cx >= self.w as f32 || cy >= self.h as f32 {
+                    continue;
+                }
+                let i = (cy as u32 * self.w + cx as u32) as usize;
+                let d = self.px[i];
+                let ch = |sh: u32| -> u32 {
+                    let sc = ((p >> sh) & 0xff) as f32 * alpha;
+                    let dc = ((d >> sh) & 0xff) as f32;
+                    ((sc + dc * (1.0 - a)).round() as u32).min(255)
+                };
+                self.px[i] = 0xff00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0);
             }
         }
     }
@@ -132,6 +170,132 @@ impl Canvas {
     fn save(&self, path: &Path) {
         write_png(path, self.w, self.h, &self.px);
     }
+}
+
+/// Дев-пруф фазы G6: мягкое тело и мелочи вокруг него — растяжение в
+/// полёте с тенью далеко внизу, сплющивание об пол с пылью, взмах лапкой
+/// и сидение на карнизе со свешенными лапками.
+fn body(pack: &Pack, out: &Path) {
+    use driftling_core::effects::{puff_frame, shadow_frame};
+    use driftling_core::{Deform, Vec2};
+    const PET: u32 = 96;
+    let frames = |anim: &str| pack.frames(Stage::Adult, anim, PET, DEFAULT_PET_COLOR);
+    let (falling, landing) = (frames("falling"), frames("landing"));
+    let (wave, dangle) = (frames("wave"), frames("dangle"));
+    let shadow = shadow_frame((PET as f32 * 0.78) as u32);
+    let puff = puff_frame((PET as f32 * 0.34) as u32, 0xff_ef_e6_dc);
+
+    let mut c = Canvas::new(560, 300, DARK_BG);
+    let ground = 250u32;
+    let half = PET as f32 / 2.0;
+
+    // 1. В полёте: тело вытянуто, тень внизу маленькая и бледная.
+    let x = 70.0;
+    c.blit_deformed(
+        &shadow,
+        Vec2::new(
+            x - shadow.w as f32 / 2.0,
+            ground as f32 - shadow.h as f32 * 0.6,
+        ),
+        Deform {
+            scale_x: 0.62,
+            scale_y: 0.62,
+            lean: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+        },
+        0.28,
+    );
+    c.blit_deformed(
+        &falling[0],
+        Vec2::new(x - half, 40.0),
+        Deform {
+            scale_x: 0.9,
+            scale_y: 1.2,
+            lean: 5.0,
+            ..Deform::NONE
+        },
+        1.0,
+    );
+
+    // 2. Удар о пол: тело сплющено, из-под ног летит пыль.
+    let x = 210.0;
+    c.blit_deformed(
+        &shadow,
+        Vec2::new(
+            x - shadow.w as f32 / 2.0,
+            ground as f32 - shadow.h as f32 * 0.6,
+        ),
+        Deform::NONE,
+        0.85,
+    );
+    c.blit_deformed(
+        &landing[0],
+        Vec2::new(x - half, ground as f32 - PET as f32),
+        Deform {
+            scale_x: 1.22,
+            scale_y: 0.72,
+            lean: -3.0,
+            ..Deform::NONE
+        },
+        1.0,
+    );
+    for (dx, dy, k, a) in [
+        (-46.0, -6.0, 1.4, 0.6),
+        (44.0, -10.0, 1.1, 0.5),
+        (-24.0, -22.0, 0.8, 0.35),
+    ] {
+        c.blit_deformed(
+            &puff,
+            Vec2::new(
+                x + dx - puff.w as f32 / 2.0,
+                ground as f32 + dy - puff.h as f32,
+            ),
+            Deform {
+                scale_x: k,
+                scale_y: k,
+                lean: 0.0,
+                anchor_x: 0.5,
+                anchor_y: 0.5,
+            },
+            a,
+        );
+    }
+
+    // 3. Машет лапкой (приветствие/прощание).
+    let x = 350.0;
+    c.blit_deformed(
+        &shadow,
+        Vec2::new(
+            x - shadow.w as f32 / 2.0,
+            ground as f32 - shadow.h as f32 * 0.6,
+        ),
+        Deform::NONE,
+        0.85,
+    );
+    c.blit_deformed(
+        &wave[0],
+        Vec2::new(x - half, ground as f32 - PET as f32),
+        Deform::NONE,
+        1.0,
+    );
+
+    // 4. Сидит на карнизе окна, свесив лапки.
+    let x = 480.0;
+    let ledge_y = ground as f32 - 60.0;
+    for yy in ledge_y as u32..(ledge_y as u32 + 6) {
+        for xx in 420..560 {
+            c.px[(yy * c.w + xx) as usize] = 0xff_4a_4c_58;
+        }
+    }
+    c.blit_deformed(
+        &dangle[0],
+        Vec2::new(x - half, ledge_y - PET as f32),
+        Deform::NONE,
+        1.0,
+    );
+    c.save(&out.join("body_dark.png"));
+    println!("пруф мягкого тела записан в {}", out.display());
 }
 
 /// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
