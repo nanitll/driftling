@@ -34,6 +34,12 @@ pub enum Icon {
     Paw,
     /// Колесо — прокатиться на транспорте.
     Wheel,
+    /// Жучок — незваные гости (режим войны).
+    Bug,
+    /// «Тсс» — тихий режим.
+    Hush,
+    /// Глаз — показываться ли поверх полноэкранного окна.
+    Eye,
     /// Месяц — уложить спать.
     Moon,
     /// Шестерёнка — настройки.
@@ -42,11 +48,47 @@ pub enum Icon {
     Cross,
 }
 
+/// Что кнопка показывает своим видом: обычное действие или переключатель
+/// в одном из положений. Переключатель обязан быть виден БЕЗ наведения —
+/// иначе внешнее кольцо превращается в лотерею.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ItemState {
+    /// Обычное действие: «сделай сейчас».
+    #[default]
+    Plain,
+    /// Переключатель включён.
+    On,
+    /// Переключатель выключен.
+    Off,
+}
+
 /// Кнопка меню: иконка + локализованная подпись (показывается при наведении).
 #[derive(Debug, Clone)]
 pub struct RadialItem {
     pub icon: Icon,
     pub label: String,
+    /// Положение переключателя; по умолчанию — обычное действие.
+    pub state: ItemState,
+}
+
+impl RadialItem {
+    /// Обычная кнопка-действие.
+    pub fn action(icon: Icon, label: impl Into<String>) -> Self {
+        Self {
+            icon,
+            label: label.into(),
+            state: ItemState::Plain,
+        }
+    }
+
+    /// Кнопка-переключатель в положении `on`.
+    pub fn toggle(icon: Icon, label: impl Into<String>, on: bool) -> Self {
+        Self {
+            icon,
+            label: label.into(),
+            state: if on { ItemState::On } else { ItemState::Off },
+        }
+    }
 }
 
 /// Геометрия меню в координатах кадра. Кадр — прямоугольник на экране
@@ -65,7 +107,16 @@ pub struct RadialLayout {
     /// Радиус кнопки.
     pub petal_r: f32,
     /// Центры кнопок (полностью выросшего меню), координаты кадра.
+    /// Плоская индексация: сперва внутреннее кольцо, затем внешнее — тогда
+    /// попадание, отрисовка и перехват указателя не знают о кольцах вовсе.
     pub petals: Vec<Vec2>,
+    /// Сколько кнопок во внутреннем кольце (остальные — внешние).
+    /// `petals.len()` — если внешнего кольца нет.
+    pub split: usize,
+    /// Радиус внешнего кольца; 0 — внешнего кольца нет.
+    pub outer_r: f32,
+    /// Радиус кнопки внешнего кольца (он меньше внутреннего).
+    pub outer_petal_r: f32,
     /// Левый верх капсулы мини-шкал (координаты кадра); None — места нет.
     pub stats_at: Option<Vec2>,
 }
@@ -133,14 +184,33 @@ fn longest_free_run(free: &[bool]) -> Option<(usize, usize)> {
 /// кнопки не перестанут наезжать друг на друга. Так меню у пола — веер
 /// над питомцем, в углу — четверть окружности наружу.
 pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect) -> RadialLayout {
+    radial_layout_rings(n, 0, pet_size, pet_center, screen)
+}
+
+/// То же, но с ВТОРЫМ кольцом переключателей снаружи (фаза I).
+///
+/// Сектор ищется по внутреннему кольцу — ровно как раньше, — а внешнее
+/// кольцо укладывается ВНУТРИ уже найденного сектора вторым проходом.
+/// Иначе пришлось бы искать общий сектор по большему радиусу, и рабочее
+/// меню сузилось бы там, где питомец бывает чаще всего: у стены и в углу.
+/// Не поместилось — `split == petals.len()`, внешнего кольца просто нет, и
+/// переключатели живут в окне настроек.
+pub fn radial_layout_rings(
+    n: usize,
+    outer: usize,
+    pet_size: f32,
+    pet_center: Vec2,
+    screen: Rect,
+) -> RadialLayout {
     let n = n.max(1);
     let petal_r = (pet_size * 0.26).clamp(15.0, 24.0);
     let base_r = pet_size * 0.72 + GAP + petal_r;
     let step = core::f32::consts::TAU / DIRECTIONS as f32;
     let start_angle = -core::f32::consts::FRAC_PI_2;
 
-    let mut chosen: Option<(f32, Vec<f32>)> = None;
-    let mut fallback: Option<(f32, Vec<f32>)> = None;
+    // (радиус, углы, начало сектора, длина сектора в направлениях)
+    let mut chosen: Option<(f32, Vec<f32>, usize, usize)> = None;
+    let mut fallback: Option<(f32, Vec<f32>, usize, usize)> = None;
     for k in [1.0f32, 1.15, 1.3, 1.5, 1.75, 2.0, 2.3] {
         let r = base_r * k;
         let free: Vec<bool> = (0..DIRECTIONS)
@@ -172,22 +242,62 @@ pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect)
         };
         let chord = 2.0 * r * (spacing / 2.0).sin();
         if fallback.is_none() || len == DIRECTIONS {
-            fallback = Some((r, angles.clone()));
+            fallback = Some((r, angles.clone(), from, len));
         }
         if chord >= petal_r * 2.15 {
-            chosen = Some((r, angles));
+            chosen = Some((r, angles, from, len));
             break;
         }
-        fallback = Some((r, angles));
+        fallback = Some((r, angles, from, len));
     }
-    let (ring_r, angles) = chosen.or(fallback).unwrap_or_else(|| {
+    let (ring_r, angles, sector_from, sector_len) = chosen.or(fallback).unwrap_or_else(|| {
         (
             base_r,
             (0..n)
                 .map(|i| start_angle + i as f32 * core::f32::consts::TAU / n as f32)
                 .collect(),
+            0,
+            DIRECTIONS,
         )
     });
+
+    // Внешнее кольцо: тот же сектор, свой радиус и кнопки помельче.
+    let outer_petal_r = (petal_r * 0.85).clamp(12.0, 20.0);
+    let mut outer_ring: Option<(f32, Vec<Vec2>)> = None;
+    if outer > 0 {
+        let min_r = ring_r + petal_r + outer_petal_r + GAP * 2.0;
+        for k in [1.0f32, 1.08, 1.18, 1.3, 1.45] {
+            let r = min_r * k;
+            let angles: Vec<f32> = if sector_len == DIRECTIONS {
+                (0..outer)
+                    .map(|i| start_angle + (i as f32 + 0.5) * core::f32::consts::TAU / outer as f32)
+                    .collect()
+            } else {
+                let span = sector_len as f32 * step;
+                let a0 = start_angle + sector_from as f32 * step;
+                (0..outer)
+                    .map(|i| a0 + (i as f32 + 0.5) * span / outer as f32)
+                    .collect()
+            };
+            let centers: Vec<Vec2> = angles
+                .iter()
+                .map(|a| Vec2::new(pet_center.x + r * a.cos(), pet_center.y + r * a.sin()))
+                .collect();
+            let fits = centers
+                .iter()
+                .all(|c| inside(screen, *c, outer_petal_r + 2.0));
+            let spacing = if sector_len == DIRECTIONS {
+                core::f32::consts::TAU / outer as f32
+            } else {
+                sector_len as f32 * step / outer as f32
+            };
+            let chord = 2.0 * r * (spacing / 2.0).sin();
+            if fits && chord >= outer_petal_r * 2.15 {
+                outer_ring = Some((r, centers));
+                break;
+            }
+        }
+    }
 
     // Центры кнопок в экранных координатах.
     let screen_petals: Vec<Vec2> = angles
@@ -255,6 +365,15 @@ pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect)
         x1 = x1.max(c.x + reach);
         y1 = y1.max(c.y + reach);
     }
+    if let Some((_, centers)) = &outer_ring {
+        let reach = outer_petal_r * 1.15 + MARGIN;
+        for c in centers {
+            x0 = x0.min(c.x - reach);
+            y0 = y0.min(c.y - reach);
+            x1 = x1.max(c.x + reach);
+            y1 = y1.max(c.y + reach);
+        }
+    }
     if let Some(p) = stats_screen {
         x0 = x0.min(p.x - 2.0);
         y0 = y0.min(p.y - 2.0);
@@ -268,6 +387,16 @@ pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect)
     let origin = Vec2::new(x0, y0);
     let to_frame = |p: Vec2| Vec2::new(p.x - origin.x, p.y - origin.y);
 
+    let split = screen_petals.len();
+    let mut petals: Vec<Vec2> = screen_petals.into_iter().map(to_frame).collect();
+    let (outer_r, outer_petal_r) = match outer_ring {
+        Some((r, centers)) => {
+            petals.extend(centers.into_iter().map(to_frame));
+            (r, outer_petal_r)
+        }
+        None => (0.0, 0.0),
+    };
+
     RadialLayout {
         origin,
         w: (x1 - x0).max(1.0) as u32,
@@ -275,7 +404,10 @@ pub fn radial_layout_in(n: usize, pet_size: f32, pet_center: Vec2, screen: Rect)
         center: to_frame(pet_center),
         ring_r,
         petal_r,
-        petals: screen_petals.into_iter().map(to_frame).collect(),
+        petals,
+        split,
+        outer_r,
+        outer_petal_r,
         stats_at: stats_screen.map(to_frame),
     }
 }
@@ -298,22 +430,31 @@ fn petal_at(layout: &RadialLayout, i: usize, grow: f32) -> (Vec2, f32) {
     let k = ease(grow);
     let p = layout.petals[i];
     let c = layout.center;
+    let r = petal_radius(layout, i);
     (
         Vec2::new(c.x + (p.x - c.x) * k, c.y + (p.y - c.y) * k),
-        layout.petal_r * (0.4 + 0.6 * k),
+        r * (0.4 + 0.6 * k),
     )
+}
+
+/// Радиус кнопки `i`: внешнее кольцо мельче внутреннего.
+fn petal_radius(layout: &RadialLayout, i: usize) -> f32 {
+    if i >= layout.split && layout.outer_petal_r > 0.0 {
+        layout.outer_petal_r
+    } else {
+        layout.petal_r
+    }
 }
 
 /// Индекс кнопки под точкой `local` (координаты кадра) у выросшего меню.
 /// Захват чуть шире самой кнопки — попадать пальцем/мышью должно быть легко.
 pub fn radial_hit(layout: &RadialLayout, local: Vec2) -> Option<usize> {
-    let reach = layout.petal_r * 1.35;
     layout
         .petals
         .iter()
         .enumerate()
         .map(|(i, p)| (i, (p.x - local.x).hypot(p.y - local.y)))
-        .filter(|(_, d)| *d <= reach)
+        .filter(|(i, d)| *d <= petal_radius(layout, *i) * 1.35)
         .min_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(i, _)| i)
 }
@@ -540,6 +681,84 @@ fn draw_icon(frame: &mut Frame, icon: Icon, c: Vec2, s: f32, accent: u32) {
             }
             disc(frame, c, s * 0.26, accent, 1.0);
         }
+        Icon::Bug => {
+            // Тельце со швом, усики и лапки — тот же силуэт, что у гостя.
+            disc(frame, Vec2::new(c.x, c.y + s * 0.1), s * 0.72, accent, 1.0);
+            line(
+                frame,
+                Vec2::new(c.x, c.y - s * 0.62),
+                Vec2::new(c.x, c.y + s * 0.82),
+                s * 0.14,
+                PETAL_BG,
+            );
+            for sign in [-1.0f32, 1.0] {
+                line(
+                    frame,
+                    Vec2::new(c.x + sign * s * 0.3, c.y - s * 0.55),
+                    Vec2::new(c.x + sign * s * 0.75, c.y - s * 1.0),
+                    s * 0.13,
+                    accent,
+                );
+                for dy in [-0.15f32, 0.25, 0.6] {
+                    line(
+                        frame,
+                        Vec2::new(c.x + sign * s * 0.55, c.y + s * dy),
+                        Vec2::new(c.x + sign * s * 1.0, c.y + s * (dy + 0.15)),
+                        s * 0.12,
+                        accent,
+                    );
+                }
+            }
+        }
+        Icon::Hush => {
+            // Три «z», уходящие вверх: тихий час читается без слов.
+            for (i, (dx, dy, k)) in [
+                (-0.35f32, 0.55f32, 0.45f32),
+                (0.05, 0.05, 0.55),
+                (0.45, -0.5, 0.7),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let w = s * k;
+                let (x, y) = (c.x + s * dx, c.y + s * dy);
+                let t = s * (0.1 + 0.02 * i as f32);
+                line(frame, Vec2::new(x, y), Vec2::new(x + w, y), t, accent);
+                line(
+                    frame,
+                    Vec2::new(x + w, y),
+                    Vec2::new(x, y + w * 0.8),
+                    t,
+                    accent,
+                );
+                line(
+                    frame,
+                    Vec2::new(x, y + w * 0.8),
+                    Vec2::new(x + w, y + w * 0.8),
+                    t,
+                    accent,
+                );
+            }
+        }
+        Icon::Eye => {
+            // Миндалевидный глаз со зрачком: «видно ли питомца».
+            disc(frame, c, s * 0.95, accent, 1.0);
+            disc(
+                frame,
+                Vec2::new(c.x, c.y - s * 1.05),
+                s * 0.95,
+                PETAL_BG,
+                1.0,
+            );
+            disc(
+                frame,
+                Vec2::new(c.x, c.y + s * 1.05),
+                s * 0.95,
+                PETAL_BG,
+                1.0,
+            );
+            disc(frame, c, s * 0.34, PETAL_BG, 1.0);
+        }
         Icon::Moon => {
             crescent(
                 frame,
@@ -690,25 +909,44 @@ pub fn radial_frame(
             0xff_00_00_00,
             0.25,
         );
-        disc(
-            &mut frame,
-            c,
-            r,
-            if hot { accent } else { PETAL_BG },
-            if hot { 0.55 } else { 0.94 },
-        );
+        // Переключатель виден без наведения: включённый подсвечен акцентом,
+        // выключенный — притушен и перечёркнут. Подложка всегда одна и та
+        // же непрозрачная: полупрозрачный акцент поверх пустоты выцветал бы
+        // на светлом фоне.
+        let on = item.state == ItemState::On;
+        let off = item.state == ItemState::Off;
+        disc(&mut frame, c, r, PETAL_BG, 0.94);
         if hot {
+            disc(&mut frame, c, r, accent, 0.55);
             disc(&mut frame, c, r, PETAL_BG, 0.35);
+        } else if on {
+            disc(&mut frame, c, r, accent, 0.42);
+        } else if off {
+            disc(&mut frame, c, r, 0xff_00_00_00, 0.3);
         }
         ring(
             &mut frame,
             c,
             r,
-            1.2,
-            if hot { accent } else { PETAL_STROKE },
+            if on { 2.0 } else { 1.2 },
+            if hot || on { accent } else { PETAL_STROKE },
             1.0,
         );
-        draw_icon(&mut frame, item.icon, c, r * 0.52, accent);
+        // На залитой акцентом кнопке знак рисуем светлым — иначе он тонет.
+        let icon_tone = if on { TEXT } else { accent };
+        draw_icon(&mut frame, item.icon, c, r * 0.52, icon_tone);
+        if off {
+            // Косая черта поверх знака: «сейчас выключено» читается и без
+            // цвета — на скриншоте, в тёмной теме и дальтоником.
+            let k = r * 0.62;
+            line(
+                &mut frame,
+                Vec2::new(c.x - k, c.y + k),
+                Vec2::new(c.x + k, c.y - k),
+                r * 0.14,
+                PETAL_STROKE,
+            );
+        }
     }
     if grown {
         if let Some(i) = hovered.filter(|&i| i < items.len()) {
@@ -734,6 +972,143 @@ pub fn radial_frame(
 
 #[cfg(test)]
 mod tests {
+    /// Второе кольцо: кнопки лежат снаружи первого, не наезжают на него и
+    /// не вылезают за экран. Проверяется в чистом поле, у пола, у каждой
+    /// стены и в каждом углу — там, где питомец бывает чаще всего.
+    #[test]
+    fn outer_ring_fits_everywhere_or_backs_off() {
+        let screen = Rect::new(0.0, 0.0, 1920.0, 1080.0);
+        let size = 96.0;
+        let spots = [
+            ("центр", Vec2::new(960.0, 540.0)),
+            ("пол", Vec2::new(960.0, 1080.0 - size / 2.0)),
+            ("потолок", Vec2::new(960.0, size / 2.0)),
+            ("левая стена", Vec2::new(size / 2.0, 540.0)),
+            ("правая стена", Vec2::new(1920.0 - size / 2.0, 540.0)),
+            ("угол лево-низ", Vec2::new(size / 2.0, 1080.0 - size / 2.0)),
+            (
+                "угол право-низ",
+                Vec2::new(1920.0 - size / 2.0, 1080.0 - size / 2.0),
+            ),
+            ("угол лево-верх", Vec2::new(size / 2.0, size / 2.0)),
+            (
+                "угол право-верх",
+                Vec2::new(1920.0 - size / 2.0, size / 2.0),
+            ),
+        ];
+        for (name, center) in spots {
+            let l = radial_layout_rings(8, 4, size, center, screen);
+            assert_eq!(l.split, 8, "{name}: внутреннее кольцо целое");
+            assert!(
+                l.petals.len() == 8 || l.petals.len() == 12,
+                "{name}: либо есть все четыре переключателя, либо ни одного"
+            );
+            let frame = Rect::new(l.origin.x, l.origin.y, l.w as f32, l.h as f32);
+            for (i, p) in l.petals.iter().enumerate() {
+                let r = if i >= l.split {
+                    l.outer_petal_r
+                } else {
+                    l.petal_r
+                };
+                let screen_p = Vec2::new(l.origin.x + p.x, l.origin.y + p.y);
+                assert!(
+                    screen_p.x - r >= screen.x && screen_p.x + r <= screen.right(),
+                    "{name}: кнопка {i} вылезла по горизонтали"
+                );
+                assert!(
+                    screen_p.y - r >= screen.y && screen_p.y + r <= screen.bottom(),
+                    "{name}: кнопка {i} вылезла по вертикали"
+                );
+                assert!(
+                    screen_p.x >= frame.x && screen_p.x <= frame.right(),
+                    "{name}: кнопка {i} вне кадра"
+                );
+            }
+            if l.petals.len() > l.split {
+                // Внешние кнопки не наезжают на внутренние.
+                for outer in &l.petals[l.split..] {
+                    for inner in &l.petals[..l.split] {
+                        let d = (outer.x - inner.x).hypot(outer.y - inner.y);
+                        assert!(
+                            d >= l.petal_r + l.outer_petal_r - 1.0,
+                            "{name}: кольца наехали друг на друга ({d:.0})"
+                        );
+                    }
+                }
+                assert!(l.outer_r > l.ring_r, "{name}: внешнее кольцо снаружи");
+            }
+        }
+    }
+
+    /// Попадание различает кольца: у внешних кнопок свой, меньший радиус.
+    #[test]
+    fn hit_test_knows_both_rings() {
+        let l = radial_layout_rings(
+            8,
+            4,
+            96.0,
+            Vec2::new(960.0, 540.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+        );
+        assert!(l.petals.len() > l.split, "в чистом поле кольца два");
+        for (i, p) in l.petals.iter().enumerate() {
+            assert_eq!(radial_hit(&l, *p), Some(i), "центр кнопки {i} ловится");
+        }
+        // Точка ровно между кольцами не принадлежит никому.
+        let inner = l.petals[0];
+        let outer = l.petals[l.split];
+        let mid = Vec2::new((inner.x + outer.x) / 2.0, (inner.y + outer.y) / 2.0);
+        let hit = radial_hit(&l, mid);
+        assert!(
+            hit.is_none() || hit == Some(0) || hit == Some(l.split),
+            "между кольцами ловится только соседняя кнопка"
+        );
+    }
+
+    /// Без внешнего кольца раскладка ровно такая же, как была: старый вызов
+    /// не должен ничего заметить.
+    #[test]
+    fn single_ring_layout_is_unchanged() {
+        let screen = Rect::new(0.0, 0.0, 1280.0, 800.0);
+        let a = radial_layout_in(6, 96.0, Vec2::new(200.0, 700.0), screen);
+        let b = radial_layout_rings(6, 0, 96.0, Vec2::new(200.0, 700.0), screen);
+        assert_eq!(a, b);
+        assert_eq!(a.split, a.petals.len());
+        assert_eq!(a.outer_r, 0.0);
+    }
+
+    /// Переключатель виден без наведения: включённая и выключенная кнопки
+    /// рисуются по-разному, а обычное действие — как раньше.
+    #[test]
+    fn toggle_state_changes_the_picture() {
+        let l = radial_layout_rings(
+            2,
+            2,
+            96.0,
+            Vec2::new(400.0, 300.0),
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+        );
+        let bake = |state: ItemState| {
+            let items = vec![
+                RadialItem::action(Icon::Cookie, "еда"),
+                RadialItem::action(Icon::Moon, "сон"),
+                RadialItem {
+                    icon: Icon::Paw,
+                    label: "гости".into(),
+                    state,
+                },
+                RadialItem::action(Icon::Wheel, "транспорт"),
+            ];
+            radial_frame(&l, &items, None, 1.0, None, 13.0, 0xff_e8_94_4a)
+        };
+        let on = bake(ItemState::On);
+        let off = bake(ItemState::Off);
+        let plain = bake(ItemState::Plain);
+        assert_ne!(on.argb, off.argb, "включённый и выключенный различимы");
+        assert_ne!(on.argb, plain.argb, "включённый отличается от действия");
+        assert_ne!(off.argb, plain.argb, "выключенный отличается от действия");
+    }
+
     use super::*;
 
     fn items() -> Vec<RadialItem> {
@@ -748,10 +1123,7 @@ mod tests {
             (Icon::Cross, "Убрать"),
         ]
         .into_iter()
-        .map(|(icon, l)| RadialItem {
-            icon,
-            label: l.to_string(),
-        })
+        .map(|(icon, l)| RadialItem::action(icon, l))
         .collect()
     }
 

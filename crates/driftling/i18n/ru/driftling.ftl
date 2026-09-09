@@ -152,6 +152,10 @@ menu-ride = Прокатиться
 menu-sleep = Уложить спать
 menu-settings = Настройки
 menu-dismiss = Убрать с экрана
+menu-guests = Гости
+menu-auto-rides = Транспорт сам
+menu-quiet = Тихий час
+menu-hide = Прятаться
 
 # --- Речевые пузыри (B5/B6) ---
 bubble-hello = Привет!

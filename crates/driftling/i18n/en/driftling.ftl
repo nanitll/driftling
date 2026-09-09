@@ -151,6 +151,10 @@ menu-ride = Ride
 menu-sleep = Put to sleep
 menu-settings = Settings
 menu-dismiss = Remove from screen
+menu-guests = Guests
+menu-auto-rides = Rides arrive
+menu-quiet = Quiet mode
+menu-hide = Hide for fullscreen
 
 # --- speech bubbles (B5/B6) ---
 bubble-hello = Hi!

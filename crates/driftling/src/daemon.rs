@@ -709,7 +709,8 @@ struct Menu {
     /// Размер спрайта питомца на момент открытия (радиус кнопок и кольца).
     pet_size: f32,
     /// Под какие фазу/шкалы испечён кадр (чтобы не перепекать зря).
-    baked: (f32, [i32; 3]),
+    /// Под какие фазу, шкалы и положения переключателей испечён кадр.
+    baked: (f32, [i32; 3], u32),
     /// Кегль подписей (масштаб из `[comfort] text_scale`).
     px: f32,
 }
@@ -737,7 +738,7 @@ impl Menu {
     /// изменилось. Возвращает true, если кадр действительно новый.
     fn rebake(&mut self, now: f64, stats: [f32; 3]) -> bool {
         let grow = self.grow(now);
-        let key = (grow, stats.map(|v| v.round() as i32));
+        let key = (grow, stats.map(|v| v.round() as i32), self.baked.2);
         if key == self.baked && !self.frame.argb.is_empty() {
             return false;
         }
@@ -763,7 +764,9 @@ impl Menu {
             return;
         }
         self.pet_center = pet_center;
-        let layout = radial::radial_layout_in(self.items.len(), self.pet_size, pet_center, *screen);
+        let inner = MENU_INNER.len();
+        let outer = MENU_OUTER.len();
+        let layout = radial::radial_layout_rings(inner, outer, self.pet_size, pet_center, *screen);
         if layout != self.layout {
             self.layout = layout;
             self.baked.0 = -1.0;
@@ -782,13 +785,21 @@ enum MenuAction {
     Toy,
     /// Прокатиться на случайном транспорте (фаза H5).
     Ride,
+    /// Переключатель: незваные гости ([game] war_mode).
+    ToggleWar,
+    /// Переключатель: транспорт приезжает сам ([game] rides).
+    ToggleRides,
+    /// Переключатель: тихий час ([comfort] quiet).
+    ToggleQuiet,
+    /// Переключатель: прятаться при полноэкранном окне.
+    ToggleHide,
     Sleep,
     Settings,
     Dismiss,
 }
 
-/// Порядок действий = порядок строк меню (B3).
-const MENU_ACTIONS: [MenuAction; 8] = [
+/// Внутреннее кольцо — «сделай сейчас»; порядок = порядок кнопок (B3).
+const MENU_INNER: [MenuAction; 8] = [
     MenuAction::Feed,
     MenuAction::Treat,
     MenuAction::Play,
@@ -799,39 +810,51 @@ const MENU_ACTIONS: [MenuAction; 8] = [
     MenuAction::Dismiss,
 ];
 
-/// Локализованные подписи кнопок меню, в порядке [`MENU_ACTIONS`].
-fn menu_rows() -> Vec<String> {
-    vec![
-        fl!("menu-feed"),
-        fl!("menu-treat"),
-        fl!("menu-play"),
-        fl!("menu-toy"),
-        fl!("menu-ride"),
-        fl!("menu-sleep"),
-        fl!("menu-settings"),
-        fl!("menu-dismiss"),
-    ]
-}
-
-/// Иконки кнопок меню, в порядке [`MENU_ACTIONS`].
-const MENU_ICONS: [radial::Icon; 8] = [
-    radial::Icon::Cookie,
-    radial::Icon::Candy,
-    radial::Icon::Paw,
-    radial::Icon::Ball,
-    radial::Icon::Wheel,
-    radial::Icon::Moon,
-    radial::Icon::Gear,
-    radial::Icon::Cross,
+/// Внешнее кольцо — «пусть будет так»: переключатели правил мира. Это
+/// ключи локального конфига, а не состояние питомца: журнал и синк они не
+/// трогают, поэтому «режимы» не требуют ни новых событий, ни семантики
+/// слияния между устройствами.
+const MENU_OUTER: [MenuAction; 4] = [
+    MenuAction::ToggleWar,
+    MenuAction::ToggleRides,
+    MenuAction::ToggleQuiet,
+    MenuAction::ToggleHide,
 ];
 
-/// Кнопки радиального меню: подпись + иконка.
-fn menu_items() -> Vec<radial::RadialItem> {
-    menu_rows()
-        .into_iter()
-        .zip(MENU_ICONS)
-        .map(|(label, icon)| radial::RadialItem { icon, label })
-        .collect()
+/// Локализованная подпись действия меню.
+fn menu_label(action: MenuAction) -> String {
+    match action {
+        MenuAction::Feed => fl!("menu-feed"),
+        MenuAction::Treat => fl!("menu-treat"),
+        MenuAction::Play => fl!("menu-play"),
+        MenuAction::Toy => fl!("menu-toy"),
+        MenuAction::Ride => fl!("menu-ride"),
+        MenuAction::Sleep => fl!("menu-sleep"),
+        MenuAction::Settings => fl!("menu-settings"),
+        MenuAction::Dismiss => fl!("menu-dismiss"),
+        MenuAction::ToggleWar => fl!("menu-guests"),
+        MenuAction::ToggleRides => fl!("menu-auto-rides"),
+        MenuAction::ToggleQuiet => fl!("menu-quiet"),
+        MenuAction::ToggleHide => fl!("menu-hide"),
+    }
+}
+
+/// Знак действия меню.
+fn menu_icon(action: MenuAction) -> radial::Icon {
+    match action {
+        MenuAction::Feed => radial::Icon::Cookie,
+        MenuAction::Treat => radial::Icon::Candy,
+        MenuAction::Play => radial::Icon::Paw,
+        MenuAction::Toy => radial::Icon::Ball,
+        MenuAction::Ride => radial::Icon::Wheel,
+        MenuAction::Sleep => radial::Icon::Moon,
+        MenuAction::Settings => radial::Icon::Gear,
+        MenuAction::Dismiss => radial::Icon::Cross,
+        MenuAction::ToggleWar => radial::Icon::Bug,
+        MenuAction::ToggleRides => radial::Icon::Wheel,
+        MenuAction::ToggleQuiet => radial::Icon::Hush,
+        MenuAction::ToggleHide => radial::Icon::Eye,
+    }
 }
 
 /// Минуты сна между моментами приложения `since` и `now`; None — сон
@@ -1720,11 +1743,18 @@ impl DaemonApp {
         let pet_size = self.sprites.size as f32;
         let b = pet.bounds();
         let center = Vec2::new(b.x + b.w / 2.0, b.y + b.h / 2.0);
-        let layout = radial::radial_layout_in(MENU_ACTIONS.len(), pet_size, center, world.screen);
+        let layout = radial::radial_layout_rings(
+            MENU_INNER.len(),
+            MENU_OUTER.len(),
+            pet_size,
+            center,
+            world.screen,
+        );
+        let items = self.menu_items(&layout);
         let mut menu = Menu {
             origin: layout.origin,
             layout,
-            items: menu_items(),
+            items,
             frame: Frame {
                 w: 0,
                 h: 0,
@@ -1736,11 +1766,71 @@ impl DaemonApp {
             opened_at: now,
             pet_center: center,
             pet_size,
-            baked: (-1.0, [0; 3]),
+            baked: (-1.0, [0; 3], 0),
             px: MENU_PX * self.comfort.text_scale.clamp(0.6, 3.0),
         };
         menu.rebake(now, self.menu_stats());
         self.menu = Some(menu);
+    }
+
+    /// Кнопки меню: внутреннее кольцо — действия, внешнее — переключатели
+    /// с живым положением из конфига. Если внешнее кольцо не поместилось
+    /// (узкий сектор у стены), переключателей просто нет — они остаются в
+    /// окне настроек, куда ведёт кнопка «Настройки».
+    fn menu_items(&self, layout: &radial::RadialLayout) -> Vec<radial::RadialItem> {
+        let mut items: Vec<radial::RadialItem> = MENU_INNER
+            .iter()
+            .map(|a| radial::RadialItem::action(menu_icon(*a), menu_label(*a)))
+            .collect();
+        if layout.petals.len() > layout.split {
+            items.extend(MENU_OUTER.iter().map(|a| {
+                radial::RadialItem::toggle(menu_icon(*a), menu_label(*a), self.toggle_on(*a))
+            }));
+        }
+        items
+    }
+
+    /// Положение переключателя внешнего кольца.
+    fn toggle_on(&self, action: MenuAction) -> bool {
+        match action {
+            MenuAction::ToggleWar => self.game.war_mode,
+            MenuAction::ToggleRides => self.game.rides,
+            MenuAction::ToggleQuiet => self.comfort.quiet,
+            MenuAction::ToggleHide => self.comfort.hide_on_fullscreen,
+            _ => false,
+        }
+    }
+
+    /// Маска положений переключателей — часть ключа перепечки кадра:
+    /// щёлкнул переключатель, а картинка не изменилась = сломанный тумблер.
+    fn toggle_mask(&self) -> u32 {
+        MENU_OUTER
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| self.toggle_on(**a))
+            .fold(0u32, |m, (i, _)| m | (1 << i))
+    }
+
+    /// Щёлкнуть переключателем мира: правка локального конфига, запись в
+    /// файл и применение на лету — тем же путём, что из окна настроек.
+    fn toggle_world(&mut self, action: MenuAction) {
+        let mut game = self.game.clone();
+        let mut comfort = self.comfort;
+        match action {
+            MenuAction::ToggleWar => game.war_mode = !game.war_mode,
+            MenuAction::ToggleRides => game.rides = !game.rides,
+            MenuAction::ToggleQuiet => comfort.quiet = !comfort.quiet,
+            MenuAction::ToggleHide => comfort.hide_on_fullscreen = !comfort.hide_on_fullscreen,
+            _ => return,
+        }
+        let patch = driftling_core::ConfigPatch {
+            game: Some(game),
+            comfort: Some(comfort),
+            ..Default::default()
+        };
+        if let Response::Error(e) = self.set_config(patch) {
+            log::warn!("меню: переключатель не сохранился: {e}");
+        }
     }
 
     /// Тень и пыль печём под текущий размер спрайта — один раз на набор.
@@ -2909,14 +2999,60 @@ impl DaemonApp {
     /// просто закрыть. Меню закрывается в обоих случаях; питомцу это
     /// нажатие не отдаётся (закрывающий клик не должен начинать drag).
     fn menu_press(&mut self, p: Vec2, now: f64) {
-        let Some(menu) = self.menu.take() else {
+        let Some(menu) = &self.menu else {
             return;
         };
         let local = Vec2::new(p.x - menu.origin.x, p.y - menu.origin.y);
-        let Some(idx) = radial::radial_hit(&menu.layout, local) else {
+        let hit = radial::radial_hit(&menu.layout, local);
+        let split = menu.layout.split;
+        let Some(idx) = hit else {
+            self.menu = None; // мимо кнопок — просто закрыть
             return;
         };
-        let action = MENU_ACTIONS[idx];
+        // Переключатель мира меню НЕ закрывает: щёлкнул — видно новое
+        // положение, можно щёлкнуть соседний. Закрывают только действия.
+        if idx >= split {
+            let Some(action) = MENU_OUTER.get(idx - split).copied() else {
+                return;
+            };
+            log::info!("меню: переключатель {action:?}");
+            self.toggle_world(action);
+            if let Some(menu) = &mut self.menu {
+                let items =
+                    MENU_INNER
+                        .iter()
+                        .map(|a| radial::RadialItem::action(menu_icon(*a), menu_label(*a)))
+                        .chain(MENU_OUTER.iter().map(|a| {
+                            radial::RadialItem::toggle(menu_icon(*a), menu_label(*a), false)
+                        }))
+                        .collect::<Vec<_>>();
+                menu.items = items;
+            }
+            let states: Vec<bool> = MENU_OUTER.iter().map(|a| self.toggle_on(*a)).collect();
+            if let Some(menu) = &mut self.menu {
+                for (i, on) in states.into_iter().enumerate() {
+                    if let Some(item) = menu.items.get_mut(split + i) {
+                        item.state = if on {
+                            radial::ItemState::On
+                        } else {
+                            radial::ItemState::Off
+                        };
+                    }
+                }
+                menu.baked.0 = -1.0;
+            }
+            let stats = self.menu_stats();
+            let mask = self.toggle_mask();
+            if let Some(menu) = &mut self.menu {
+                menu.baked.2 = mask;
+                menu.rebake(now, stats);
+            }
+            return;
+        }
+        self.menu = None;
+        let Some(action) = MENU_INNER.get(idx).copied() else {
+            return;
+        };
         log::info!("меню: выбрано {action:?}");
         let resp = match action {
             MenuAction::Feed => self.feed(false, now),
@@ -2930,6 +3066,8 @@ impl DaemonApp {
                 Response::Ok
             }
             MenuAction::Dismiss => self.dismiss_with_wave(now),
+            // Переключатели обработаны выше и сюда не доходят.
+            _ => Response::Ok,
         };
         if let Response::Error(e) = resp {
             log::warn!("меню: действие {action:?} не удалось: {e}");
@@ -6709,12 +6847,12 @@ mod tests {
 
     // --- B3: меню ПКМ -----------------------------------------------------
 
-    /// Порядок действий совпадает со строками меню — контракт диспатча.
+    /// Порядок действий внутреннего кольца — контракт диспатча; у каждого
+    /// действия есть и подпись, и знак (иначе кнопка выйдет немой).
     #[test]
-    fn menu_rows_match_actions_order() {
-        assert_eq!(menu_rows().len(), MENU_ACTIONS.len());
+    fn menu_rings_are_consistent() {
         assert_eq!(
-            MENU_ACTIONS,
+            MENU_INNER,
             [
                 MenuAction::Feed,
                 MenuAction::Treat,
@@ -6726,6 +6864,75 @@ mod tests {
                 MenuAction::Dismiss,
             ]
         );
+        assert_eq!(
+            MENU_OUTER,
+            [
+                MenuAction::ToggleWar,
+                MenuAction::ToggleRides,
+                MenuAction::ToggleQuiet,
+                MenuAction::ToggleHide,
+            ]
+        );
+        for action in MENU_INNER.into_iter().chain(MENU_OUTER) {
+            assert!(!menu_label(action).is_empty(), "{action:?} без подписи");
+            // Знак обязан быть у каждой кнопки: menu_icon — исчерпывающий
+            // match, так что достаточно его вызвать.
+            let _ = menu_icon(action);
+        }
+    }
+
+    /// Внешнее кольцо переключает правила мира и НЕ закрывает меню: щёлкнул
+    /// — увидел новое положение и можешь щёлкнуть соседнее.
+    #[test]
+    fn outer_ring_toggles_without_closing_the_menu() {
+        let (mut app, _tx, dir) = adult_app("menu-toggles");
+        geometry(&mut app);
+        let cfg_dir = dir.join("xdg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // SAFETY: каталог конфига свой, тест не делит его с другими.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_dir) };
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+
+        let p = app.pet.as_ref().unwrap().pos;
+        app.event(Event::PointerMenu(p), now);
+        let menu = app.menu.as_ref().expect("меню открыто");
+        assert!(
+            menu.layout.petals.len() > menu.layout.split,
+            "в чистом поле внешнее кольцо помещается"
+        );
+        let split = menu.layout.split;
+        let war_before = app.game.war_mode;
+        let target = Vec2::new(
+            menu.origin.x + menu.layout.petals[split].x,
+            menu.origin.y + menu.layout.petals[split].y,
+        );
+
+        app.event(Event::PointerPress(target), now);
+        assert!(app.menu.is_some(), "переключатель не закрывает меню");
+        assert_ne!(app.game.war_mode, war_before, "гости переключились");
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(
+            menu.items[split].state,
+            if app.game.war_mode {
+                radial::ItemState::On
+            } else {
+                radial::ItemState::Off
+            },
+            "положение видно на кнопке"
+        );
+        // И это записалось в конфиг, а не осталось в памяти.
+        assert_eq!(Config::load().unwrap().game.war_mode, app.game.war_mode);
+
+        // А действие внутреннего кольца меню закрывает, как раньше.
+        let menu = app.menu.as_ref().unwrap();
+        let feed = Vec2::new(
+            menu.origin.x + menu.layout.petals[0].x,
+            menu.origin.y + menu.layout.petals[0].y,
+        );
+        app.event(Event::PointerPress(feed), now + 0.1);
+        assert!(app.menu.is_none(), "действие закрывает меню");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ПКМ открывает меню (вторая хит-область, спрайт поверх, Active-темп

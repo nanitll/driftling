@@ -508,22 +508,32 @@ fn rides(pack: &Pack, out: &Path) {
 fn radial(pack: &Pack, out: &Path) {
     use driftling_core::radial::{radial_frame, Icon, RadialItem};
     const PET: u32 = 96;
-    let items: Vec<RadialItem> = [
+    let mut items: Vec<RadialItem> = [
         (Icon::Cookie, "Покормить"),
         (Icon::Candy, "Вкусняшка"),
         (Icon::Paw, "Поиграть"),
         (Icon::Ball, "Мяч"),
+        (Icon::Wheel, "Прокатиться"),
         (Icon::Moon, "Уложить спать"),
         (Icon::Gear, "Настройки"),
         (Icon::Cross, "Убрать с экрана"),
     ]
     .into_iter()
-    .map(|(icon, l)| RadialItem {
-        icon,
-        label: l.to_string(),
-    })
+    .map(|(icon, l)| RadialItem::action(icon, l))
     .collect();
-    use driftling_core::radial::radial_layout_in;
+    const INNER: usize = 8;
+    // Внешнее кольцо — переключатели правил мира.
+    items.extend(
+        [
+            (Icon::Bug, "Гости", true),
+            (Icon::Wheel, "Транспорт сам", true),
+            (Icon::Hush, "Тихий час", false),
+            (Icon::Eye, "Прятаться", true),
+        ]
+        .into_iter()
+        .map(|(icon, l, on)| RadialItem::toggle(icon, l, on)),
+    );
+    use driftling_core::radial::radial_layout_rings;
     use driftling_core::{Rect, Vec2};
     let idle = pack.frames(Stage::Adult, "idle", PET, DEFAULT_PET_COLOR);
     let accent = DEFAULT_PET_COLOR;
@@ -531,46 +541,46 @@ fn radial(pack: &Pack, out: &Path) {
     let half = PET as f32 / 2.0;
     // Экран-«комната» 520x400: питомец в чистом поле, у пола, в углу и под
     // потолком — меню обязано красиво уместиться в каждом случае.
-    let room = Rect::new(0.0, 0.0, 520.0, 400.0);
+    let room = Rect::new(0.0, 0.0, 640.0, 500.0);
     for (name, bg, center, hovered, grow) in [
         (
             "radial_light",
             LIGHT_BG,
-            Vec2::new(260.0, 200.0),
+            Vec2::new(320.0, 250.0),
             Some(0usize),
             1.0f32,
         ),
         (
             "radial_dark",
             DARK_BG,
-            Vec2::new(260.0, 200.0),
+            Vec2::new(320.0, 250.0),
             Some(3),
             1.0,
         ),
-        ("radial_grow", DARK_BG, Vec2::new(260.0, 200.0), None, 0.45),
+        ("radial_grow", DARK_BG, Vec2::new(320.0, 250.0), None, 0.45),
         (
             "radial_floor",
             DARK_BG,
-            Vec2::new(260.0, 400.0 - half),
+            Vec2::new(320.0, 500.0 - half),
             Some(2),
             1.0,
         ),
         (
             "radial_corner",
             DARK_BG,
-            Vec2::new(half, 400.0 - half),
+            Vec2::new(half, 500.0 - half),
             Some(1),
             1.0,
         ),
         (
             "radial_ceiling",
             DARK_BG,
-            Vec2::new(260.0, half),
+            Vec2::new(320.0, half),
             Some(4),
             1.0,
         ),
     ] {
-        let layout = radial_layout_in(items.len(), PET as f32, center, room);
+        let layout = radial_layout_rings(INNER, items.len() - INNER, PET as f32, center, room);
         let mut c = Canvas::new(room.w as u32, room.h as u32, bg);
         c.blit(&idle[0], (center.x - half) as u32, (center.y - half) as u32);
         let menu = radial_frame(&layout, &items, hovered, grow, stats, 13.0, accent);
