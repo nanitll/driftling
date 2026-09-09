@@ -35,6 +35,8 @@ pub enum PropKind {
     Bed,
     /// Мячик: бросишь — догонит и принесёт.
     Ball,
+    /// Домик: свой угол. В нём прячутся, спят и из него выходят здороваться.
+    House,
 }
 
 /// Неизменные свойства вида предмета.
@@ -56,6 +58,9 @@ pub struct PropClass {
     pub persist: bool,
     /// Коэффициент восстановления при ударе (у мяча высокий).
     pub restitution: f32,
+    /// Улетает ли вещь по скорости руки. Домик не улетает: его ставят,
+    /// а не швыряют через весь экран.
+    pub throwable: bool,
 }
 
 impl PropKind {
@@ -70,6 +75,7 @@ impl PropKind {
                 solid: false,
                 persist: false,
                 restitution: 0.1,
+                throwable: true,
             },
             PropKind::Bowl => PropClass {
                 anchor: Surface::Floor,
@@ -80,10 +86,11 @@ impl PropKind {
                 solid: false,
                 persist: true,
                 restitution: 0.15,
+                throwable: true,
             },
             PropKind::Bed => PropClass {
                 anchor: Surface::Floor,
-                size_scale: 1.15,
+                size_scale: 1.45,
                 aspect: 0.4,
                 density_scale: 0.35,
                 draggable: true,
@@ -91,6 +98,19 @@ impl PropKind {
                 solid: true,
                 persist: true,
                 restitution: 0.05,
+                throwable: true,
+            },
+            PropKind::House => PropClass {
+                anchor: Surface::Floor,
+                size_scale: 2.1,
+                aspect: 0.95,
+                density_scale: 1.4,
+                draggable: true,
+                // Крыша — такая же опора, как кромка окна.
+                solid: true,
+                persist: true,
+                restitution: 0.02,
+                throwable: false,
             },
             PropKind::Ball => PropClass {
                 anchor: Surface::Floor,
@@ -102,6 +122,7 @@ impl PropKind {
                 // Мяч живёт, пока с ним играют: его не хранят в журнале.
                 persist: false,
                 restitution: 0.62,
+                throwable: true,
             },
         }
     }
@@ -113,6 +134,7 @@ impl PropKind {
             PropKind::Bowl => "bowl",
             PropKind::Bed => "bed",
             PropKind::Ball => "ball",
+            PropKind::House => "house",
         }
     }
 }

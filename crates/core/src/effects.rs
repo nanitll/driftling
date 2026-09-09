@@ -148,25 +148,96 @@ pub fn bowl_frame(w: u32, body: u32, food: u32, filled: bool) -> Frame {
 }
 
 /// Лежанка: мягкий валик с углублением — на неё можно забраться.
+///
+/// Рисуется в два слоя: сама лежанка позади питомца и передний валик
+/// ([`bed_front_frame`]) поверх него. Иначе спящий питомец лежал бы НА
+/// лежанке, а не В ней — а вся суть лежанки в том, что в неё забираются.
 pub fn bed_frame(w: u32, body: u32) -> Frame {
+    bed_layer(w, body, false)
+}
+
+/// Передний валик лежанки: та же форма, но только ближняя к зрителю
+/// кромка — она рисуется поверх лежащего питомца.
+pub fn bed_front_frame(w: u32, body: u32) -> Frame {
+    bed_layer(w, body, true)
+}
+
+fn bed_layer(w: u32, body: u32, front_only: bool) -> Frame {
     let w = w.max(12);
     let h = (w * 2 / 5).max(8);
     let mut frame = blank(w, h);
     let (fw, fh) = (w as f32, h as f32);
     let edge = crate::palette::darken(body, 0.72);
+    let lip = crate::palette::darken(body, 0.62);
     let inner = crate::palette::lighten(body, 1.18);
     for y in 0..h {
         for x in 0..w {
             let nx = (x as f32 + 0.5 - fw / 2.0) / (fw / 2.0);
             let ny = (y as f32 + 0.5 - fh * 0.45) / (fh * 0.55);
-            if ny < -0.2 {
+            if ny < -0.2 || nx * nx + ny * ny >= 1.0 {
                 continue;
             }
-            if nx * nx + ny * ny < 1.0 {
-                // Углубление в середине — там питомец и лежит.
-                let dip = nx.abs() < 0.62 && (y as f32) < fh * 0.55;
-                put(&mut frame, x, y, if dip { inner } else { edge }, 1.0);
+            // Углубление в середине — там питомец и лежит.
+            let dip = nx.abs() < 0.62 && (y as f32) < fh * 0.55;
+            let front = (y as f32) >= fh * 0.52;
+            match (front_only, front) {
+                (true, false) => continue,
+                (true, true) => put(&mut frame, x, y, lip, 1.0),
+                (false, _) => put(&mut frame, x, y, if dip { inner } else { edge }, 1.0),
             }
+        }
+    }
+    frame
+}
+
+/// Домик: коробка со скатной крышей, дверью и окошком. Дверь — тёмный
+/// проём: в него питомец и уходит, когда прячется (фаза H3).
+pub fn house_frame(w: u32, body: u32, roof: u32) -> Frame {
+    let w = w.max(24);
+    let h = (w * 19 / 20).max(20);
+    let mut frame = blank(w, h);
+    let (fw, fh) = (w as f32, h as f32);
+    let wall = body;
+    let shade = crate::palette::darken(body, 0.82);
+    let dark = crate::palette::darken(body, 0.35);
+    let glass = crate::palette::lighten(body, 1.55);
+    let roof_lo = crate::palette::darken(roof, 0.8);
+    let wall_top = fh * 0.42;
+    // Стены: прямоугольник с чуть более тёмной правой половиной — объём.
+    for y in (wall_top as u32)..h {
+        for x in 0..w {
+            let inset = fw * 0.08;
+            if (x as f32) < inset || (x as f32) > fw - inset {
+                continue;
+            }
+            let right = (x as f32) > fw * 0.62;
+            put(&mut frame, x, y, if right { shade } else { wall }, 1.0);
+        }
+    }
+    // Крыша: треугольник с выносом за стены.
+    for y in 0..(wall_top as u32) {
+        let t = y as f32 / wall_top;
+        let half = fw * 0.5 * (0.12 + 0.88 * t);
+        let lo = (fw / 2.0 - half).max(0.0) as u32;
+        let hi = (fw / 2.0 + half).min(fw - 1.0) as u32;
+        for x in lo..=hi {
+            let edge = y as f32 > wall_top - 3.0;
+            put(&mut frame, x, y, if edge { roof_lo } else { roof }, 1.0);
+        }
+    }
+    // Дверь по центру и окошко сбоку.
+    let door_w = fw * 0.46;
+    let door_top = fh * 0.52;
+    for y in (door_top as u32)..h {
+        for x in ((fw / 2.0 - door_w / 2.0) as u32)..=((fw / 2.0 + door_w / 2.0) as u32).min(w - 1)
+        {
+            put(&mut frame, x, y, dark, 1.0);
+        }
+    }
+    let win = fw * 0.11;
+    for y in ((fh * 0.52) as u32)..=((fh * 0.52 + win) as u32) {
+        for x in ((fw * 0.17) as u32)..=((fw * 0.17 + win) as u32) {
+            put(&mut frame, x, y, glass, 1.0);
         }
     }
     frame
@@ -289,6 +360,17 @@ mod tests {
         assert!(bowl.w > bowl.h, "миска шире, чем выше");
         let bed = bed_frame(60, 0xff_b0_a2_94);
         assert!(ink(&bed) > 100 && bed.w > bed.h);
+        // Передний валик — часть той же формы: он меньше целой лежанки,
+        // но не пустой, иначе питомец не окажется «в» ней.
+        let lip = bed_front_frame(60, 0xff_b0_a2_94);
+        assert_eq!((lip.w, lip.h), (bed.w, bed.h), "слои совпадают по кадру");
+        assert!(
+            ink(&lip) > 20 && ink(&lip) < ink(&bed),
+            "валик — часть лежанки"
+        );
+        let house = house_frame(80, 0xff_b0_a2_94, 0xff_8a_5a_46);
+        assert!(ink(&house) > 2000, "домик — крупная вещь");
+        assert!(house.h < house.w, "домик шире, чем выше");
         let ball = ball_frame(30, 0xff_e8_94_4a, 0xff_f4_f4_f8);
         assert!(ink(&ball) > 300, "мяч круглый и плотный");
         assert_eq!(ball.w, ball.h);

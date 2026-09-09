@@ -29,11 +29,15 @@ const SCALE: u32 = 4;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
-        [_, m, o] if ["sheets", "icons", "surfaces", "radial", "body"].contains(&m.as_str()) => {
+        [_, m, o]
+            if ["sheets", "icons", "surfaces", "radial", "body", "props"].contains(&m.as_str()) =>
+        {
             (m.as_str(), Path::new(o))
         }
         _ => {
-            eprintln!("использование: render_pack (sheets|icons|surfaces|radial|body) <каталог>");
+            eprintln!(
+                "использование: render_pack (sheets|icons|surfaces|radial|body|props) <каталог>"
+            );
             std::process::exit(2);
         }
     };
@@ -50,6 +54,7 @@ fn main() {
         "surfaces" => surfaces(pack, out),
         "radial" => radial(pack, out),
         "body" => body(pack, out),
+        "props" => props(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -300,13 +305,127 @@ fn body(pack: &Pack, out: &Path) {
 
 /// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
 /// наведённой кнопкой и мини-шкалами, плюс фаза появления.
+/// Дев-пруф фаз H1/H2/H4: комната с вещами — миска, лежанка (питомец спит
+/// в ней), мяч в лапках и брошенный мяч со своей тенью.
+fn props(pack: &Pack, out: &Path) {
+    use driftling_core::effects::{
+        ball_frame, bed_frame, bed_front_frame, bowl_frame, house_frame, shadow_frame,
+    };
+    use driftling_core::palette::{darken, lighten};
+    use driftling_core::prop::{Prop, PropKind};
+    use driftling_core::{Deform, Vec2};
+    const PET: u32 = 96;
+    let color = DEFAULT_PET_COLOR;
+    let idle = pack.frames(Stage::Adult, "idle", PET, color);
+    let sleep = pack.frames(Stage::Adult, "sleep", PET, color);
+    let walk = pack.frames(Stage::Adult, "walk", PET, color);
+    let shadow = shadow_frame((PET as f32 * 0.78) as u32);
+    let width = |k: PropKind| (PET as f32 * k.class().size_scale) as u32;
+    let bowl = bowl_frame(
+        width(PropKind::Bowl),
+        darken(color, 0.62),
+        lighten(color, 1.25),
+        true,
+    );
+    let bed = bed_frame(width(PropKind::Bed), darken(color, 0.78));
+    let bed_front = bed_front_frame(width(PropKind::Bed), darken(color, 0.78));
+    let ball = ball_frame(
+        width(PropKind::Ball),
+        lighten(color, 1.4),
+        darken(color, 0.5),
+    );
+    let house = house_frame(
+        width(PropKind::House),
+        darken(color, 0.85),
+        darken(color, 0.5),
+    );
+
+    let (w, h) = (760u32, 300u32);
+    let ground = 260.0f32;
+    let mut c = Canvas::new(w, h, DARK_BG);
+    let put = |c: &mut Canvas, frame: &Frame, kind: PropKind, x: f32| {
+        let prop = Prop::new(1, kind, Vec2::new(x, ground), PET as f32);
+        let b = prop.bounds();
+        c.blit_deformed(
+            frame,
+            Vec2::new(b.x, b.y),
+            Deform {
+                scale_x: b.w / frame.w as f32,
+                scale_y: b.h / frame.h as f32,
+                ..Deform::NONE
+            },
+            1.0,
+        );
+        b
+    };
+    // Пол комнаты.
+    for x in 0..w {
+        for y in (ground as u32)..h {
+            c.px[(y * w + x) as usize] = if y < ground as u32 + 2 {
+                0xff_4a_4d_58
+            } else {
+                0xff_3d_40_49
+            };
+        }
+    }
+    // 1. Питомец ест у миски, подойдя сбоку.
+    let bowl_b = put(&mut c, &bowl, PropKind::Bowl, 120.0);
+    c.blit(
+        &idle[0],
+        (bowl_b.x + bowl_b.w + 8.0) as u32,
+        (ground - PET as f32) as u32,
+    );
+    // 2. Спит в лежанке: лежанка — рельеф, он стоит на её кромке.
+    let bed_b = put(&mut c, &bed, PropKind::Bed, 330.0);
+    c.blit(
+        &sleep[0],
+        (bed_b.x + bed_b.w / 2.0 - PET as f32 / 2.0) as u32,
+        (bed_b.y + bed_b.h * 0.62 - PET as f32) as u32,
+    );
+    c.blit_deformed(
+        &bed_front,
+        Vec2::new(bed_b.x, bed_b.y),
+        Deform {
+            scale_x: bed_b.w / bed_front.w as f32,
+            scale_y: bed_b.h / bed_front.h as f32,
+            ..Deform::NONE
+        },
+        1.0,
+    );
+    // 3. Домик в углу — питомец выходит из двери.
+    let house_b = put(&mut c, &house, PropKind::House, 470.0);
+    c.blit(
+        &idle[0],
+        (house_b.x + house_b.w / 2.0 - PET as f32 / 2.0) as u32,
+        (ground - PET as f32) as u32,
+    );
+
+    // 4. Мяч в полёте со своей тенью и питомец, бегущий за ним.
+    let bx = 690.0;
+    c.blit_deformed(
+        &shadow,
+        Vec2::new(bx - shadow.w as f32 / 2.0, ground - shadow.h as f32 * 0.6),
+        Deform {
+            scale_x: 0.32,
+            scale_y: 0.32,
+            ..Deform::NONE
+        },
+        0.35,
+    );
+    c.blit(&ball, (bx - ball.w as f32 / 2.0) as u32, 96);
+    c.blit(&walk[0], (bx - 120.0) as u32, (ground - PET as f32) as u32);
+    c.save(&out.join("props.png"));
+    println!("пруф вещей записан в {}", out.display());
+}
+
 fn radial(pack: &Pack, out: &Path) {
     use driftling_core::radial::{radial_frame, Icon, RadialItem};
     const PET: u32 = 96;
     let items: Vec<RadialItem> = [
         (Icon::Cookie, "Покормить"),
         (Icon::Candy, "Вкусняшка"),
-        (Icon::Ball, "Поиграть"),
+        (Icon::Paw, "Поиграть"),
+        (Icon::Ball, "Мяч"),
         (Icon::Moon, "Уложить спать"),
         (Icon::Gear, "Настройки"),
         (Icon::Cross, "Убрать с экрана"),

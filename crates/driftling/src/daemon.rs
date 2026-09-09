@@ -146,6 +146,15 @@ const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
 const CHORE_WALK_SPEED: f32 = 90.0;
 
+/// Возраст питомца, с которого у него появляется свой домик, суток.
+const HOUSE_AGE_DAYS: f64 = 3.0;
+/// Ближе этого к краю экрана домик прилипает к стене (в его ширинах).
+const HOUSE_SNAP: f32 = 0.75;
+/// Сколько питомец сидит в домике, когда уходит туда сам, сек.
+const HOUSE_STAY: (f64, f64) = (8.0, 22.0);
+/// Как редко (в секундах покоя) он вообще думает зайти домой.
+const HOUSE_IDLE_SECS: f64 = 45.0;
+
 /// Насколько в сторону от питомца ставится новая вещь (в его размерах).
 const PROP_PLACE_GAP: f32 = 1.7;
 /// Ближе этого расстояния к вещи идти незачем — уже пришёл.
@@ -568,7 +577,10 @@ struct Grab {
 /// Кадры вещей: пекутся под размер питомца вместе с прочими эффектами.
 struct PropArt {
     bowl: Frame,
+    house: Frame,
     bed: Frame,
+    /// Передний валик лежанки — рисуется поверх спящего в ней питомца.
+    bed_front: Frame,
     ball: Frame,
 }
 
@@ -581,7 +593,9 @@ impl PropArt {
         };
         Self {
             bowl: blank(),
+            house: blank(),
             bed: blank(),
+            bed_front: blank(),
             ball: blank(),
         }
     }
@@ -589,6 +603,7 @@ impl PropArt {
     fn frame(&self, kind: PropKind) -> Option<&Frame> {
         let f = match kind {
             PropKind::Bowl => &self.bowl,
+            PropKind::House => &self.house,
             PropKind::Bed => &self.bed,
             PropKind::Ball => &self.ball,
             // Швабра рисуется в лапках питомца отдельным кадром.
@@ -1050,6 +1065,14 @@ struct DaemonApp {
     fetch_home: Option<f32>,
     /// Мяч успокоился в этот момент — пауза перед погоней.
     ball_still_since: Option<f64>,
+    /// Питомец сидит в домике и выйдет в этот момент (H3). Пока он там,
+    /// сцена его не рисует и симуляция его не двигает.
+    indoors: Option<f64>,
+    /// Спрятался в домик из-за полноэкранного окна — выйдет, когда оно
+    /// закончится, а не по таймеру.
+    indoors_polite: bool,
+    /// Следующая проверка «не зайти ли домой».
+    home_check_at: f64,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1209,6 +1232,9 @@ impl DaemonApp {
             terrain: Vec::new(),
             fetch_home: None,
             ball_still_since: None,
+            indoors: None,
+            indoors_polite: false,
+            home_check_at: HOUSE_IDLE_SECS,
         }
     }
 
@@ -1219,6 +1245,8 @@ impl DaemonApp {
         // Вещи живут в журнале — свёртка их и приносит (в том числе
         // поставленные на другом устройстве).
         self.sync_props();
+        // Третьи сутки жизни — время своего угла (H3).
+        self.maybe_place_house();
         // Усталость -> длина сна (фаза G3): при нулевой энергии питомец
         // спит вшестеро дольше обычной дрёмы и просыпается заряженным.
         if let Some(pet) = &mut self.pet {
@@ -1630,6 +1658,15 @@ impl DaemonApp {
                 width(PropKind::Bed),
                 palette::darken(self.sprite_color, 0.78),
             ),
+            bed_front: driftling_core::effects::bed_front_frame(
+                width(PropKind::Bed),
+                palette::darken(self.sprite_color, 0.78),
+            ),
+            house: driftling_core::effects::house_frame(
+                width(PropKind::House),
+                palette::darken(self.sprite_color, 0.85),
+                palette::darken(self.sprite_color, 0.5),
+            ),
             ball: driftling_core::effects::ball_frame(
                 width(PropKind::Ball),
                 palette::lighten(self.sprite_color, 1.4),
@@ -1694,6 +1731,11 @@ impl DaemonApp {
                     self.props.push(Prop::new(pp.id, pp.kind, pos, size));
                 }
             }
+        }
+        // Твёрдая вещь становится опорой сразу, а не со следующего тика.
+        let wanted = platforms_with_props(&self.terrain, &self.props);
+        if let Some(world) = &mut self.world {
+            world.platforms = wanted;
         }
     }
 
@@ -1799,6 +1841,157 @@ impl DaemonApp {
         self.happy_until = Some(now + HAPPY_PET_SECS);
         log::info!("игра: питомцу выдан мяч");
         Response::Ok
+    }
+
+    /// Домик (H3): на третьи сутки жизни у питомца появляется свой угол.
+    /// Проверяется редко и один раз ставится в ближайший угол экрана.
+    fn maybe_place_house(&mut self) {
+        if self.prop_of(PropKind::House).is_some() || self.world.is_none() {
+            return;
+        }
+        let born = self.derived.born_ms;
+        if born == 0 {
+            return;
+        }
+        let days = wall_now_ms().saturating_sub(born) as f64 / 86_400_000.0;
+        if days < HOUSE_AGE_DAYS {
+            return;
+        }
+        let Some(world) = &self.world else {
+            return;
+        };
+        // В угол, противоположный питомцу: домик не должен падать ему на
+        // голову и заслонять то место, где он сейчас живёт.
+        let pet_x = self.pet.as_ref().map_or(world.screen.x, |p| p.pos.x);
+        let w = self.sprites.size as f32 * PropKind::House.class().size_scale;
+        let x = if pet_x - world.screen.x > world.screen.right() - pet_x {
+            world.screen.x + w / 2.0
+        } else {
+            world.screen.right() - w / 2.0
+        };
+        let (x, y) = (x, world.ground_y());
+        if let Err(e) = self.append_event(EventKind::PropPlaced {
+            kind: PropKind::House,
+            x,
+            y,
+        }) {
+            log::warn!("вещи: домик не записался в журнал: {e}");
+            return;
+        }
+        log::info!("вещи: питомцу построен домик ({days:.1} суток от роду)");
+        self.sync_props();
+    }
+
+    /// Крупная вещь у края экрана прилипает к стене: домик, поставленный
+    /// «примерно в угол», встаёт в угол ровно.
+    fn snap_to_wall(&mut self, id: u64) {
+        let Some(world) = &self.world else {
+            return;
+        };
+        let (left, right) = (world.screen.x, world.screen.right());
+        let Some(prop) = self.props.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        if prop.kind != PropKind::House {
+            return;
+        }
+        let half = prop.size / 2.0;
+        let snap = prop.size * HOUSE_SNAP;
+        if prop.pos.x - left < snap {
+            prop.pos.x = left + half;
+        } else if right - prop.pos.x < snap {
+            prop.pos.x = right - half;
+        }
+    }
+
+    /// Дверь домика — точка, куда питомец приходит, чтобы зайти внутрь.
+    fn house_door(&self) -> Option<(u64, f32)> {
+        self.prop_of(PropKind::House).map(|h| (h.id, h.pos.x))
+    }
+
+    /// Увести питомца в домик до момента `until` (None — пока не позовут).
+    fn enter_house(&mut self, now: f64, until: Option<f64>, polite: bool) -> bool {
+        let Some((_, door_x)) = self.house_door() else {
+            return false;
+        };
+        let Some(pet) = &mut self.pet else {
+            return false;
+        };
+        pet.pos.x = door_x;
+        pet.state = PetState::Idle;
+        pet.state_time = 0.0;
+        self.indoors = Some(until.unwrap_or(f64::INFINITY));
+        self.indoors_polite = polite;
+        self.drop_errand();
+        self.menu = None;
+        log::info!(
+            "домик: питомец зашёл внутрь{}",
+            if polite {
+                " (полноэкранное окно)"
+            } else {
+                ""
+            }
+        );
+        let _ = now;
+        true
+    }
+
+    /// Выйти из домика: питомец появляется у двери и машет лапкой.
+    fn leave_house(&mut self, now: f64) {
+        if self.indoors.take().is_none() {
+            return;
+        }
+        self.indoors_polite = false;
+        if let Some((_, door_x)) = self.house_door() {
+            if let Some(pet) = &mut self.pet {
+                pet.pos.x = door_x;
+                pet.state = PetState::Idle;
+                pet.state_time = 0.0;
+                pet.state_left = 0.8;
+            }
+        }
+        self.overlay = Some(Overlay {
+            look: ActionLook::Waving,
+            from: now,
+            until: now + BYE_WAVE_SECS,
+        });
+        log::info!("домик: питомец вышел из домика");
+    }
+
+    /// Домашняя жизнь (H3): изредка питомец уходит домой посидеть, а из
+    /// полноэкранной вежливости возвращается сам.
+    fn house_tick(&mut self, now: f64) {
+        // Пора выходить?
+        if let Some(until) = self.indoors {
+            let polite_over = self.indoors_polite && !self.fullscreen_hidden;
+            if polite_over || now >= until {
+                self.leave_house(now);
+            }
+            return;
+        }
+        if now < self.home_check_at || self.props.is_empty() {
+            return;
+        }
+        self.home_check_at = now + HOUSE_IDLE_SECS;
+        let calm = self.menu.is_none()
+            && self.overlay.is_none()
+            && self.errand.is_none()
+            && now - self.last_touch >= HOUSE_IDLE_SECS;
+        if !calm || !self.pet_afoot() || self.house_door().is_none() {
+            return;
+        }
+        // Не каждый раз: домик должен быть событием, а не расписанием.
+        if noise(now * 3.1) < 0.45 {
+            return;
+        }
+        let stay = HOUSE_STAY.0 + (HOUSE_STAY.1 - HOUSE_STAY.0) * noise(now * 7.7).abs();
+        if let Some((id, door_x)) = self.house_door() {
+            let mut errand = Errand::new(ErrandKind::Enter, door_x, 0.0);
+            errand.prop = Some(id);
+            self.errand = Some(errand);
+            self.home_check_at = now + HOUSE_IDLE_SECS + stay;
+            log::info!("домик: питомец пошёл домой посидеть ({stay:.0} с)");
+        }
     }
 
     /// Физика вещей: рука человека, падение, рельеф из твёрдых вещей и
@@ -1931,9 +2124,17 @@ impl DaemonApp {
                 };
                 let mut thrown = None;
                 if let Some(prop) = self.props.iter_mut().find(|q| q.id == grab.id) {
+                    // Домик не швыряют через экран — его ставят.
+                    let vel = if prop.kind.class().throwable {
+                        vel
+                    } else {
+                        Vec2::default()
+                    };
                     prop.release(vel);
                     thrown = Some((prop.kind, prop.pos));
                 }
+                // Домик, поставленный «примерно в угол», встаёт в угол ровно.
+                self.snap_to_wall(grab.id);
                 // Мяч питомец несёт туда, откуда его бросили: это и есть
                 // «принести человеку» — руки-то у человека здесь.
                 if let Some((PropKind::Ball, pos)) = thrown {
@@ -2004,7 +2205,7 @@ impl DaemonApp {
             ErrandKind::Fetch | ErrandKind::Carry => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
-            ErrandKind::Eat | ErrandKind::Nap => errand
+            ErrandKind::Enter | ErrandKind::Eat | ErrandKind::Nap => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
         }
@@ -2064,7 +2265,7 @@ impl DaemonApp {
                 let top = errand
                     .prop
                     .and_then(|id| self.props.iter().find(|p| p.id == id))
-                    .map(|bed| bed.bounds().y + bed.height() * 0.45);
+                    .map(|bed| bed.bounds().y + bed.height() * 0.62);
                 if let (Some(pet), Some(y)) = (&mut self.pet, top) {
                     pet.pos.y = y;
                     pet.force_sleep();
@@ -2105,6 +2306,11 @@ impl DaemonApp {
                     }
                     _ => {}
                 }
+            }
+            // Дошёл до двери — скрылся в домике.
+            ErrandKind::Enter => {
+                let stay = HOUSE_STAY.0 + (HOUSE_STAY.1 - HOUSE_STAY.0) * noise(now * 7.7).abs();
+                self.enter_house(now, Some(now + stay), false);
             }
             // Принёс мяч на место броска: кладёт и ждёт похвалы.
             ErrandKind::Carry => {
@@ -3163,6 +3369,11 @@ impl DaemonApp {
                 log::info!("вежливость (D5): полноэкранное окно — питомец прячется");
                 // Меню без сцены осталось бы висеть невидимо-некликабельным.
                 self.menu = None;
+                // Есть домик — прячется в него: когда окно закроется, он
+                // выйдет из двери и помашет, а не возникнет из воздуха.
+                if self.indoors.is_none() {
+                    self.enter_house(now, None, true);
+                }
             } else {
                 log::info!("вежливость (D5): fullscreen закончился — питомец возвращается");
             }
@@ -3213,7 +3424,10 @@ impl App for DaemonApp {
         let dt = (now - self.last_now.unwrap_or(now)).clamp(0.0, 1.5) as f32;
         self.last_now = Some(now);
 
-        if self.presence_anim.is_some() {
+        if self.indoors.is_some() {
+            // Питомец в домике (H3): физика ему сейчас не нужна — он там
+            // сидит, пока не выйдет сам или пока не кончится fullscreen.
+        } else if self.presence_anim.is_some() {
             // Пробежка присутствия (фаза E): демон ведёт питомца сам.
             self.presence_anim_tick(dt, now);
         } else if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
@@ -3243,7 +3457,11 @@ impl App for DaemonApp {
         // Вещи мира (H1): физика, рука человека, рельеф из твёрдых вещей.
         self.props_tick(now, dt);
         // Дела питомца (H1): уборка, миска, лежанка, мяч.
-        self.errand_tick(now, dt);
+        if self.indoors.is_none() {
+            self.errand_tick(now, dt);
+        }
+        // Домашняя жизнь (H3): уйти домой, выйти из домика.
+        self.house_tick(now);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -3257,6 +3475,9 @@ impl App for DaemonApp {
                 // пустое поле кадра иначе оставило бы питомца висеть в
                 // паре пикселей от неё. Хит-область едет вместе с рисунком.
                 let bounds = grip_shift(pet.bounds(), pet.surface, &self.sprites);
+                // В домике питомца не рисуем и мышью не ловим — вещи мира
+                // при этом на месте (H3).
+                let pet_visible = self.indoors.is_none();
                 // Полный вид (B2/B5): настроение из статов; «радостное»
                 // окно после игры/поглаживания перекрывает настроение.
                 let mood = if self.happy_until.is_some() {
@@ -3283,7 +3504,7 @@ impl App for DaemonApp {
                 let mut sprites = Vec::with_capacity(8);
                 // Тень на опоре под питомцем: чем выше он над ней, тем
                 // тень бледнее и меньше (фаза G6).
-                if !self.shadow.argb.is_empty() {
+                if !self.shadow.argb.is_empty() && pet_visible {
                     let feet = pet.bounds().bottom();
                     let support = physics::support_below(world, pet.pos.x, feet - 1.0);
                     let height = (support - feet).max(0.0);
@@ -3369,56 +3590,80 @@ impl App for DaemonApp {
                     });
                 }
                 let frame = self.sprites.frame_look(&look, t);
-                sprites.push(SpriteInstance {
-                    frame,
-                    origin: Vec2::new(bounds.x, bounds.y),
-                    // Поворот под поверхность + зеркало по взгляду (фаза G).
-                    orient: pet.orient(),
-                    // Мягкое тело: сплющивание, растяжение, завал (фаза G6).
-                    deform: pet.deform(),
-                    alpha: 1.0,
-                });
-                // Зелень укачанного наплывает и сходит плавно: тот же кадр
-                // зеленоватого набора поверх обычного с растущей
-                // прозрачностью (фаза H0 — «тошнота уходит мягко»).
-                let green = ((pet.nausea() - QUEASY_FADE_FROM) / QUEASY_FADE_SPAN).clamp(0.0, 1.0);
-                if green > 0.02 {
-                    if let Some((_, _, _, queasy)) = &self.queasy_sprites {
+                if pet_visible {
+                    sprites.push(SpriteInstance {
+                        frame,
+                        origin: Vec2::new(bounds.x, bounds.y),
+                        // Поворот под поверхность + зеркало по взгляду (фаза G).
+                        orient: pet.orient(),
+                        // Мягкое тело: сплющивание, растяжение, завал (фаза G6).
+                        deform: pet.deform(),
+                        alpha: 1.0,
+                    });
+                    // Зелень укачанного наплывает и сходит плавно: тот же кадр
+                    // зеленоватого набора поверх обычного с растущей
+                    // прозрачностью (фаза H0 — «тошнота уходит мягко»).
+                    let green =
+                        ((pet.nausea() - QUEASY_FADE_FROM) / QUEASY_FADE_SPAN).clamp(0.0, 1.0);
+                    if green > 0.02 {
+                        if let Some((_, _, _, queasy)) = &self.queasy_sprites {
+                            sprites.push(SpriteInstance {
+                                frame: queasy.frame_look(&look, t),
+                                origin: Vec2::new(bounds.x, bounds.y),
+                                orient: pet.orient(),
+                                deform: pet.deform(),
+                                alpha: green,
+                            });
+                        }
+                    }
+                    // Швабра в лапках, пока идёт уборка.
+                    let mopping = self.errand.as_ref().filter(|e| e.kind == ErrandKind::Mop);
+                    if let (Some(errand), false) = (mopping, self.mop.argb.is_empty()) {
+                        let swing = if !errand.walking() {
+                            ((now * 7.0).sin() * 0.35) as f32
+                        } else {
+                            0.08
+                        };
+                        let dir = pet.facing.sign();
+                        let b = pet.bounds();
                         sprites.push(SpriteInstance {
-                            frame: queasy.frame_look(&look, t),
-                            origin: Vec2::new(bounds.x, bounds.y),
-                            orient: pet.orient(),
-                            deform: pet.deform(),
-                            alpha: green,
+                            frame: &self.mop,
+                            origin: Vec2::new(
+                                b.x + b.w / 2.0 + dir * b.w * 0.34 - self.mop.w as f32 / 2.0,
+                                b.bottom() - self.mop.h as f32,
+                            ),
+                            orient: Orient::IDENTITY,
+                            deform: Deform {
+                                scale_x: 1.0,
+                                scale_y: 1.0,
+                                lean: swing * self.mop.h as f32 * 0.5,
+                                anchor_x: 0.5,
+                                anchor_y: 1.0,
+                            },
+                            alpha: 1.0,
                         });
                     }
                 }
-                // Швабра в лапках, пока идёт уборка.
-                let mopping = self.errand.as_ref().filter(|e| e.kind == ErrandKind::Mop);
-                if let (Some(errand), false) = (mopping, self.mop.argb.is_empty()) {
-                    let swing = if !errand.walking() {
-                        ((now * 7.0).sin() * 0.35) as f32
-                    } else {
-                        0.08
-                    };
-                    let dir = pet.facing.sign();
-                    let b = pet.bounds();
-                    sprites.push(SpriteInstance {
-                        frame: &self.mop,
-                        origin: Vec2::new(
-                            b.x + b.w / 2.0 + dir * b.w * 0.34 - self.mop.w as f32 / 2.0,
-                            b.bottom() - self.mop.h as f32,
-                        ),
-                        orient: Orient::IDENTITY,
-                        deform: Deform {
-                            scale_x: 1.0,
-                            scale_y: 1.0,
-                            lean: swing * self.mop.h as f32 * 0.5,
-                            anchor_x: 0.5,
-                            anchor_y: 1.0,
-                        },
-                        alpha: 1.0,
-                    });
+                // Передний валик лежанки — поверх питомца: так он лежит
+                // В лежанке, а не НА ней.
+                if !self.prop_art.bed_front.argb.is_empty() {
+                    let front = &self.prop_art.bed_front;
+                    for prop in self.props.iter().filter(|p| p.kind == PropKind::Bed) {
+                        let b = prop.bounds();
+                        sprites.push(SpriteInstance {
+                            frame: front,
+                            origin: Vec2::new(b.x, b.y),
+                            orient: Orient::IDENTITY,
+                            deform: Deform {
+                                scale_x: b.w / front.w.max(1) as f32,
+                                scale_y: b.h / front.h.max(1) as f32,
+                                lean: 0.0,
+                                anchor_x: 0.5,
+                                anchor_y: 1.0,
+                            },
+                            alpha: 1.0,
+                        });
+                    }
                 }
                 // Вещь в лапках — поверх питомца: он держит её перед собой.
                 for prop in self.props.iter().filter(|p| p.state == PropState::Carried) {
@@ -3459,7 +3704,7 @@ impl App for DaemonApp {
                 }
                 // Пробегающего мимо (run-off/run-in, фаза E) не поймать:
                 // хит-области нет, указатель проходит насквозь.
-                let mut input_rects = if self.presence_anim.is_some() {
+                let mut input_rects = if self.presence_anim.is_some() || !pet_visible {
                     Vec::new()
                 } else {
                     vec![bounds]
@@ -4348,6 +4593,152 @@ mod tests {
             "спит в лежанке, а не на полу: y={:.0}, пол {:.0}",
             pet.pos.y,
             world.ground_y()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- H3: домик ----------------------------------------------------------
+
+    /// Домик появляется на третьи сутки жизни и встаёт в угол экрана —
+    /// подальше от того места, где питомец живёт сейчас.
+    #[test]
+    fn house_arrives_on_the_third_day_and_stands_in_a_corner() {
+        let (mut app, _tx, dir) = adult_app("house-age");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+
+        // Сутки от роду — домика ещё нет.
+        app.derived.born_ms = wall_now_ms() - 86_400_000;
+        app.maybe_place_house();
+        assert!(app.prop_of(PropKind::House).is_none(), "рано для домика");
+
+        app.derived.born_ms = wall_now_ms() - 4 * 86_400_000;
+        app.maybe_place_house();
+        let house = app.prop_of(PropKind::House).expect("домик построен");
+        let screen = app.world.as_ref().unwrap().screen;
+        let to_wall = (house.pos.x - screen.x).min(screen.right() - house.pos.x);
+        assert!(
+            to_wall <= house.size / 2.0 + 1.0,
+            "домик стоит вплотную к стене: до стены {to_wall:.0}, полширины {:.0}",
+            house.size / 2.0
+        );
+        assert!(
+            app.world
+                .as_ref()
+                .unwrap()
+                .platforms
+                .iter()
+                .any(|p| p.id == house.id),
+            "крыша домика — опора"
+        );
+        // Второй раз домик не строится.
+        let id = house.id;
+        app.maybe_place_house();
+        assert_eq!(app.prop_of(PropKind::House).map(|h| h.id), Some(id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Полноэкранное окно уводит питомца в домик: сцена пустеет, а когда
+    /// окно кончилось — он выходит из двери и машет лапкой.
+    #[test]
+    fn fullscreen_sends_the_pet_into_its_house() {
+        let (mut app, sense, _tx, dir) = sense_app("house-fs");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.derived.born_ms = wall_now_ms() - 4 * 86_400_000;
+        app.maybe_place_house();
+        let door = app.prop_of(PropKind::House).expect("домик").pos.x;
+
+        sense.set(Some(world_snap(&[], None, true)));
+        now += 0.1;
+        app.tick(now); // первый тик только замечает окно
+        now += FULLSCREEN_GRACE + 0.2;
+        app.tick(now);
+        assert!(app.fullscreen_hidden);
+        assert!(app.indoors.is_some(), "спрятался в домик");
+        assert!(
+            (app.pet.as_ref().unwrap().pos.x - door).abs() < 1.0,
+            "питомец у двери домика"
+        );
+
+        sense.set(Some(world_snap(&[], None, false)));
+        now += 0.2;
+        let sprites = app.tick(now).sprites.len();
+        assert!(app.indoors.is_none(), "вышел из домика");
+        assert!(sprites > 0, "снова на сцене");
+        assert!(
+            matches!(
+                app.overlay,
+                Some(Overlay {
+                    look: ActionLook::Waving,
+                    ..
+                })
+            ),
+            "вышел и помахал"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Пока питомец в домике, его не видно и мышью не поймать, но сам
+    /// домик остаётся на сцене.
+    #[test]
+    fn indoors_pet_is_invisible_but_the_house_stays() {
+        let (mut app, _tx, dir) = adult_app("house-inside");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.derived.born_ms = wall_now_ms() - 4 * 86_400_000;
+        app.maybe_place_house();
+        let before = app.tick(now).sprites.len();
+
+        assert!(app.enter_house(now, Some(now + 5.0), false));
+        let (sprites, rects) = {
+            let scene = app.tick(now + 0.1);
+            (scene.sprites.len(), scene.input_rects.len())
+        };
+        assert_eq!(rects, 1, "ловится только домик, не питомец");
+        assert!(
+            sprites > 0 && sprites < before,
+            "домик на месте, питомца нет: было {before}, стало {sprites}"
+        );
+
+        // Таймер вышел — выходит сам.
+        app.tick(now + 6.0);
+        assert!(app.indoors.is_none(), "вышел по таймеру");
+        assert!(!app.tick(now + 6.1).sprites.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Домик, поставленный рукой рядом со стеной, прилипает к ней ровно.
+    #[test]
+    fn dropped_house_snaps_to_the_wall() {
+        let (mut app, _tx, dir) = adult_app("house-snap");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.derived.born_ms = wall_now_ms() - 4 * 86_400_000;
+        app.maybe_place_house();
+        let house = app.prop_of(PropKind::House).expect("домик").clone();
+        let screen = app.world.as_ref().unwrap().screen;
+
+        // Берём домик и ставим НЕ доводя до левой стены.
+        let grab_at = Vec2::new(house.pos.x, house.pos.y - house.height() / 2.0);
+        let target = Vec2::new(screen.x + house.size * 0.7, house.pos.y - 20.0);
+        app.event(Event::PointerPress(grab_at), now);
+        assert!(app.grab.is_some(), "домик в руке");
+        now += 0.05;
+        app.event(Event::PointerMotion(target), now);
+        now += 0.05;
+        app.event(Event::PointerRelease(target), now);
+        settle(&mut app, &mut now, 2.0);
+
+        let house = app.prop_of(PropKind::House).unwrap();
+        assert!(
+            (house.pos.x - (screen.x + house.size / 2.0)).abs() < 1.0,
+            "домик прилип к левой стене: x={:.0}",
+            house.pos.x
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
