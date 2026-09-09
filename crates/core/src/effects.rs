@@ -72,6 +72,39 @@ pub fn puddle_frame(w: u32, color: u32) -> Frame {
     frame
 }
 
+/// Швабра: палка с мочалкой на конце. Питомец достаёт её, чтобы убрать
+/// за собой лужу (фаза H0 — первый настоящий предмет в мире питомца).
+/// `h` — высота в пикселях (примерно рост питомца).
+pub fn mop_frame(h: u32, handle: u32, head: u32) -> Frame {
+    let h = h.max(10);
+    let w = (h / 3).max(5);
+    let mut frame = blank(w, h);
+    let fw = w as f32;
+    let fh = h as f32;
+    // Черенок: тонкая палка сверху вниз, чуть тоньше к верху.
+    let stick_x = fw * 0.5;
+    for y in 0..(fh * 0.72) as u32 {
+        let t = y as f32 / fh;
+        let half = (fw * (0.09 + 0.03 * t)).max(0.6);
+        for x in ((stick_x - half) as u32)..=((stick_x + half) as u32).min(w - 1) {
+            put(&mut frame, x, y, handle, 1.0);
+        }
+    }
+    // Мочалка: трапеция из вертикальных прядей.
+    let top = fh * 0.68;
+    for y in top as u32..h {
+        let t = (y as f32 - top) / (fh - top);
+        let half = fw * (0.22 + 0.28 * t);
+        let (x0, x1) = ((stick_x - half) as i32, (stick_x + half) as i32);
+        for x in x0.max(0)..=x1.min(w as i32 - 1) {
+            // Пряди: через одну чуть темнее — видно, что это мочалка.
+            let shade = if (x as u32 + y).is_multiple_of(3) { 0.75 } else { 1.0 };
+            put(&mut frame, x as u32, y, head, shade);
+        }
+    }
+    frame
+}
+
 fn blank(w: u32, h: u32) -> Frame {
     Frame {
         w,
@@ -136,6 +169,20 @@ mod tests {
         assert!(center >> 24 < 0xf0, "тень не глухая");
         // Углы пусты — это эллипс, а не прямоугольник.
         assert_eq!(f.argb[0] >> 24, 0);
+    }
+
+    /// Швабра: палка сверху, мочалка снизу, всё внутри кадра.
+    #[test]
+    fn mop_has_a_handle_and_a_head() {
+        let f = mop_frame(60, 0xff_8a_6a_44, 0xff_d8_d8_e0);
+        assert!(f.h > f.w * 2, "швабра вытянута вверх");
+        let row_ink = |y: u32| {
+            (0..f.w)
+                .filter(|&x| f.argb[(y * f.w + x) as usize] >> 24 != 0)
+                .count()
+        };
+        assert!(row_ink(2) >= 1, "черенок наверху");
+        assert!(row_ink(f.h - 2) > row_ink(2) * 2, "мочалка внизу шире");
     }
 
     /// Пыль и лужица рисуются и остаются premultiplied.

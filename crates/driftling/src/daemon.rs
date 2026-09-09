@@ -131,10 +131,22 @@ const SHADOW_FADE_PX: f32 = 420.0;
 const SHADOW_ALPHA: f32 = 0.85;
 /// Сколько живёт облачко пыли, сек.
 const PUFF_LIFE: f64 = 0.5;
+/// Лужа тает последние секунды жизни, а не исчезает мгновенно.
+const PUDDLE_FADE: f64 = 4.0;
+/// Сколько питомца не должны трогать, прежде чем он возьмётся за швабру.
+const CHORE_IDLE_SECS: f64 = 6.0;
+/// Сколько он трёт лужу.
+const MOP_SECS: f64 = 3.2;
+/// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
+const CHORE_WALK_SPEED: f32 = 90.0;
 
 /// Зелень укачанного: доля подмеса в цвет тела.
 const QUEASY_GREEN: u32 = 0xff_6f_c2_74;
 const QUEASY_MIX: f32 = 0.55;
+/// С какого уровня укачивания начинает проступать зелень и на каком
+/// диапазоне доходит до полной — чтобы тошнота наплывала и сходила плавно.
+const QUEASY_FADE_FROM: f32 = 0.3;
+const QUEASY_FADE_SPAN: f32 = 0.35;
 /// Пузырь «Привет!» после вылупления (B6), сек.
 const HELLO_HATCH_SECS: f64 = 4.0;
 /// Пузырь-приветствие при старте демона с призванным питомцем (B5), сек.
@@ -522,6 +534,16 @@ struct Overlay {
     from: f64,
     /// Момент окончания; истёкший оверлей снимает expire_effects.
     until: f64,
+}
+
+/// Дело по хозяйству (фаза H0): дойти до лужи и вытереть её шваброй.
+/// Первый предмет в мире питомца — по этому образцу дальше делаются
+/// домик, мячик и транспорт (см. docs/WORLD.md).
+struct Chore {
+    /// Куда идти (центр лужи по горизонтали).
+    target_x: f32,
+    /// Уже на месте и трёт — с этого момента.
+    mopping_since: Option<f64>,
 }
 
 /// Облачко пыли (фаза G6): живёт доли секунды, разлетается и тает.
@@ -928,6 +950,15 @@ struct DaemonApp {
     prev_state: Option<PetState>,
     /// Прощание (фаза G6): сперва машет лапкой, в этот момент — убегает.
     bye_run_at: Option<(f64, f32)>,
+
+    // ---- Дела по хозяйству (фаза H0) ----
+    /// Кадр швабры (печётся вместе с прочими эффектами).
+    mop: Frame,
+    /// Текущее дело: сходить к луже и вытереть её.
+    chore: Option<Chore>,
+    /// Когда пользователь последний раз трогал питомца — дела начинаются
+    /// только когда его оставили в покое.
+    last_touch: f64,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1072,6 +1103,13 @@ impl DaemonApp {
             puffs: Vec::new(),
             prev_state: None,
             bye_run_at: None,
+            mop: Frame {
+                w: 0,
+                h: 0,
+                argb: Vec::new(),
+            },
+            chore: None,
+            last_touch: 0.0,
         }
     }
 
@@ -1412,6 +1450,11 @@ impl DaemonApp {
             (size as f32 * 0.34) as u32,
             palette::lighten(self.sprite_color, 1.35),
         );
+        self.mop = driftling_core::effects::mop_frame(
+            (size as f32 * 0.95) as u32,
+            palette::darken(self.sprite_color, 0.55),
+            palette::lighten(self.sprite_color, 1.5),
+        );
     }
 
     /// Пыль из-под ног: `n` облачков в точке `at` с разлётом в стороны.
@@ -1436,6 +1479,94 @@ impl DaemonApp {
                 life: PUFF_LIFE * (0.75 + 0.5 * k) as f64,
                 scale: 0.55 + 0.35 * k,
             });
+        }
+    }
+
+    /// Дела по хозяйству (фаза H0): если после тряски питомца оставили в
+    /// покое, он достаёт швабру и убирает за собой лужу.
+    ///
+    /// Это первый предмет мира питомца и образец для остальных: дело
+    /// состоит из «дойти» и «поработать», прерывается вмешательством
+    /// человека и ничего не пишет в журнал — следов в истории ухода от
+    /// уборки не остаётся.
+    fn chore_tick(&mut self, now: f64, dt: f32) {
+        // Взялись за швабру: лужа есть, питомца не трогают, он на полу.
+        if self.chore.is_none() {
+            let calm = now - self.last_touch >= CHORE_IDLE_SECS
+                && self.menu.is_none()
+                && self.presence_anim.is_none()
+                && self.overlay.is_none();
+            let ready = self.pet.as_ref().is_some_and(|p| {
+                p.surface == Surface::Floor
+                    && matches!(p.state, PetState::Idle | PetState::Walk)
+                    && !p.queasy()
+            });
+            if let (true, true, Some(puddle)) = (calm, ready, self.puddle.as_ref()) {
+                let target_x = puddle.origin.x + puddle.frame.w as f32 / 2.0;
+                log::info!("дела: питомец идёт убирать за собой");
+                self.chore = Some(Chore {
+                    target_x,
+                    mopping_since: None,
+                });
+            }
+        }
+
+        let Some(chore) = &mut self.chore else {
+            return;
+        };
+        // Вмешался человек или лужа исчезла — дело отменяется.
+        let interrupted = now - self.last_touch < 1.0
+            || self.puddle.is_none()
+            || self
+                .pet
+                .as_ref()
+                .is_none_or(|p| p.state == PetState::Dragged || p.surface != Surface::Floor);
+        if interrupted {
+            self.chore = None;
+            return;
+        }
+        let Some(pet) = &mut self.pet else {
+            self.chore = None;
+            return;
+        };
+        match chore.mopping_since {
+            // Идём к луже: ведём питомца сами, как в пробежках присутствия.
+            None => {
+                let dx = chore.target_x - pet.pos.x;
+                if dx.abs() <= 6.0 {
+                    chore.mopping_since = Some(now);
+                    pet.state = PetState::Idle;
+                    pet.state_time = 0.0;
+                    pet.state_left = MOP_SECS as f32;
+                } else {
+                    let dir = dx.signum();
+                    pet.facing = if dir < 0.0 {
+                        Direction::Left
+                    } else {
+                        Direction::Right
+                    };
+                    pet.state = PetState::Walk;
+                    pet.state_time += dt;
+                    pet.state_left = f32::INFINITY;
+                    pet.pos.x += dir * CHORE_WALK_SPEED * dt;
+                }
+            }
+            // Трём: лужа тает вместе с прогрессом уборки.
+            Some(since) => {
+                pet.state = PetState::Idle;
+                pet.state_left = MOP_SECS as f32;
+                let done = (now - since) / MOP_SECS;
+                if let Some(puddle) = &mut self.puddle {
+                    // Ускоряем собственное угасание лужи до конца уборки.
+                    puddle.until = puddle.until.min(now + MOP_SECS * (1.0 - done).max(0.0));
+                }
+                if done >= 1.0 {
+                    log::info!("дела: лужа убрана");
+                    self.puddle = None;
+                    self.chore = None;
+                    self.happy_until = Some(now + HAPPY_PET_SECS); // доволен собой
+                }
+            }
         }
     }
 
@@ -2021,6 +2152,7 @@ impl DaemonApp {
     /// «обработано» — выходить из цикла оно не просит. Потреблённый клик
     /// (нажатие без захвата) — поглаживание (B5).
     fn pointer(&mut self, ev: PointerEvent, now: f64) -> bool {
+        self.last_touch = now;
         let mut clicked = false;
         let mut consumed = false;
         let mut dragged = false;
@@ -2503,6 +2635,8 @@ impl App for DaemonApp {
         self.reactions_tick(now);
         // Живое тело (G6): пыль и кадры эффектов.
         self.body_fx_tick(now, dt);
+        // Дела по хозяйству (H0): убрать за собой лужу.
+        self.chore_tick(now, dt);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -2512,11 +2646,6 @@ impl App for DaemonApp {
                 input_rects: Vec::new(),
             },
             (Some(pet), Some(world)) => {
-                // Укачанного рисуем зеленоватым набором (G5).
-                let set: &SpriteSet = match &self.queasy_sprites {
-                    Some((_, _, _, set)) if pet.queasy() => set,
-                    _ => &self.sprites,
-                };
                 // На стене и под потолком рисунок прижимается к поверхности:
                 // пустое поле кадра иначе оставило бы питомца висеть в
                 // паре пикселей от неё. Хит-область едет вместе с рисунком.
@@ -2570,18 +2699,28 @@ impl App for DaemonApp {
                         });
                     }
                 }
-                // Лужица — под питомцем.
+                // Лужица — под питомцем; последние секунды тает, а не
+                // пропадает мгновенно.
                 if let Some(puddle) = &self.puddle {
+                    let left = (puddle.until - now).max(0.0);
+                    let fade = (left / PUDDLE_FADE).min(1.0) as f32;
                     sprites.push(SpriteInstance {
                         frame: &puddle.frame,
                         origin: puddle.origin,
                         orient: Orient::IDENTITY,
-                        deform: Deform::NONE,
-                        alpha: 1.0,
+                        deform: Deform {
+                            scale_x: 0.75 + 0.25 * fade,
+                            scale_y: 0.75 + 0.25 * fade,
+                            lean: 0.0,
+                            anchor_x: 0.5,
+                            anchor_y: 1.0,
+                        },
+                        alpha: fade,
                     });
                 }
+                let frame = self.sprites.frame_look(&look, t);
                 sprites.push(SpriteInstance {
-                    frame: set.frame_look(&look, t),
+                    frame,
                     origin: Vec2::new(bounds.x, bounds.y),
                     // Поворот под поверхность + зеркало по взгляду (фаза G).
                     orient: pet.orient(),
@@ -2589,6 +2728,47 @@ impl App for DaemonApp {
                     deform: pet.deform(),
                     alpha: 1.0,
                 });
+                // Зелень укачанного наплывает и сходит плавно: тот же кадр
+                // зеленоватого набора поверх обычного с растущей
+                // прозрачностью (фаза H0 — «тошнота уходит мягко»).
+                let green = ((pet.nausea() - QUEASY_FADE_FROM) / QUEASY_FADE_SPAN).clamp(0.0, 1.0);
+                if green > 0.02 {
+                    if let Some((_, _, _, queasy)) = &self.queasy_sprites {
+                        sprites.push(SpriteInstance {
+                            frame: queasy.frame_look(&look, t),
+                            origin: Vec2::new(bounds.x, bounds.y),
+                            orient: pet.orient(),
+                            deform: pet.deform(),
+                            alpha: green,
+                        });
+                    }
+                }
+                // Швабра в лапках, пока идёт уборка.
+                if let (Some(chore), false) = (&self.chore, self.mop.argb.is_empty()) {
+                    let swing = if chore.mopping_since.is_some() {
+                        ((now * 7.0).sin() * 0.35) as f32
+                    } else {
+                        0.08
+                    };
+                    let dir = pet.facing.sign();
+                    let b = pet.bounds();
+                    sprites.push(SpriteInstance {
+                        frame: &self.mop,
+                        origin: Vec2::new(
+                            b.x + b.w / 2.0 + dir * b.w * 0.34 - self.mop.w as f32 / 2.0,
+                            b.bottom() - self.mop.h as f32,
+                        ),
+                        orient: Orient::IDENTITY,
+                        deform: Deform {
+                            scale_x: 1.0,
+                            scale_y: 1.0,
+                            lean: swing * self.mop.h as f32 * 0.5,
+                            anchor_x: 0.5,
+                            anchor_y: 1.0,
+                        },
+                        alpha: 1.0,
+                    });
+                }
                 // Пыль поверх питомца: она перед ним, у самых ног.
                 for puff in &self.puffs {
                     let age = ((now - puff.born) / puff.life).clamp(0.0, 1.0) as f32;
@@ -2747,6 +2927,7 @@ impl App for DaemonApp {
             }
             // ПКМ по питомцу — открыть меню (B3); повторный ПКМ закрывает.
             Event::PointerMenu(_) => {
+                self.last_touch = now;
                 self.user_claim();
                 if self.menu.take().is_none() {
                     self.open_menu(now);
@@ -3228,6 +3409,79 @@ mod tests {
             journal_kinds(&dir).last().unwrap(),
             EventKind::Dismissed
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- Фаза H0: дела по хозяйству --------------------------------------
+
+    /// Оставленный в покое питомец сам берёт швабру и убирает лужу; пока
+    /// его трогают — не берётся.
+    #[test]
+    fn pet_mops_up_after_itself_when_left_alone() {
+        let (mut app, _tx, dir) = adult_app("chore-mop");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        // Оставим лужу в стороне от питомца.
+        let pet_x = app.pet.as_ref().unwrap().pos.x;
+        app.sync_effects();
+        let frame = driftling_core::effects::puddle_frame(40, QUEASY_GREEN);
+        app.puddle = Some(Puddle {
+            origin: Vec2::new(pet_x + 260.0, 1040.0),
+            frame,
+            until: now + 60.0,
+        });
+
+        // Пока трогаем — за швабру не берётся.
+        app.last_touch = now;
+        settle(&mut app, &mut now, 2.0);
+        assert!(app.chore.is_none(), "при живом хозяине уборки нет");
+
+        // Оставили в покое: дошёл и вытер.
+        app.last_touch = now - CHORE_IDLE_SECS - 1.0;
+        settle(&mut app, &mut now, 1.0);
+        assert!(app.chore.is_some(), "взялся за швабру");
+        let start_x = app.pet.as_ref().unwrap().pos.x;
+        settle(&mut app, &mut now, 4.0);
+        assert!(
+            app.pet.as_ref().unwrap().pos.x > start_x + 100.0,
+            "пошёл к луже"
+        );
+        settle(&mut app, &mut now, 8.0);
+        assert!(app.puddle.is_none(), "лужа убрана");
+        assert!(app.chore.is_none(), "дело закончено");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Вмешательство человека прерывает уборку: питомец бросает швабру.
+    #[test]
+    fn touching_the_pet_interrupts_the_chore() {
+        let (mut app, _tx, dir) = adult_app("chore-stop");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 3.0);
+        app.sync_effects();
+        let pet_x = app.pet.as_ref().unwrap().pos.x;
+        app.puddle = Some(Puddle {
+            origin: Vec2::new(pet_x + 300.0, 1040.0),
+            frame: driftling_core::effects::puddle_frame(40, QUEASY_GREEN),
+            until: now + 60.0,
+        });
+        app.last_touch = now - CHORE_IDLE_SECS - 1.0;
+        settle(&mut app, &mut now, 1.0);
+        assert!(app.chore.is_some());
+
+        // Погладили — дело брошено, лужа осталась.
+        let p = app.pet.as_ref().unwrap().pos;
+        app.event(Event::PointerPress(Vec2::new(p.x, p.y - 10.0)), now);
+        app.event(
+            Event::PointerRelease(Vec2::new(p.x, p.y - 10.0)),
+            now + 0.05,
+        );
+        now += 0.1;
+        app.tick(now);
+        assert!(app.chore.is_none(), "уборка прервана");
+        assert!(app.puddle.is_some(), "лужа на месте");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
