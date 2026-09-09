@@ -121,6 +121,7 @@ tray-quit = Stop the daemon
 menu-feed = Feed
 menu-treat = Treat
 menu-play = Play
+menu-toy = Ball
 menu-sleep = Put to sleep
 menu-settings = Settings
 menu-dismiss = Remove from screen
@@ -134,6 +135,7 @@ bubble-sneeze = Achoo!
 bubble-bye = Bye!
 bubble-birthday = Happy birthday!
 bubble-wheee = Wheee!
+bubble-fetch = Fetch!
 bubble-yuck = Blergh…
 
 # --- pet ---

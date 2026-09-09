@@ -19,6 +19,13 @@ impl core::ops::Add for Vec2 {
     }
 }
 
+impl core::ops::Sub for Vec2 {
+    type Output = Vec2;
+    fn sub(self, rhs: Vec2) -> Vec2 {
+        Vec2::new(self.x - rhs.x, self.y - rhs.y)
+    }
+}
+
 impl core::ops::Mul<f32> for Vec2 {
     type Output = Vec2;
     fn mul(self, k: f32) -> Vec2 {

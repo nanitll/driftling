@@ -136,6 +136,31 @@ pub fn random_device_id() -> String {
 // События
 // ---------------------------------------------------------------------------
 
+/// Вещь в мире питомца, как её видит свёртка журнала.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedProp {
+    pub id: u64,
+    pub kind: crate::prop::PropKind,
+    pub pos: crate::geometry::Vec2,
+}
+
+/// Идентификатор вещи из метки события, которым её поставили: метка
+/// уникальна по построению (устройство + счётчик), значит и id уникален.
+pub fn prop_id(at: &Hlc) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in at
+        .device
+        .as_bytes()
+        .iter()
+        .chain(&at.wall_ms.to_le_bytes())
+        .chain(&at.counter.to_le_bytes())
+    {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
 /// Событие ухода. Журнал append-only; слияние — объединение множеств по
 /// `id` ([`merge`]). `id` глобально уникален по построению HLC.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -170,6 +195,18 @@ pub enum EventKind {
     Slept { minutes: f32 },
     /// Укачали до тошноты (фаза G5): настроение и здоровье страдают.
     Shaken,
+    /// В мире питомца появилась вещь (фаза H2): миска, лежанка, домик.
+    /// Идентификатор вещи — метка самого события, поэтому он уникален
+    /// между устройствами без всякой договорённости.
+    PropPlaced {
+        kind: crate::prop::PropKind,
+        x: f32,
+        y: f32,
+    },
+    /// Вещь переставили (перетащили мышью).
+    PropMoved { id: u64, x: f32, y: f32 },
+    /// Вещь убрали из мира.
+    PropTaken { id: u64 },
     /// Погладили (настроение↑ с часовым потолком — анти-фарм).
     Petted,
     /// Переименовали.
@@ -305,6 +342,8 @@ pub struct DerivedPet {
     /// Ошибки ухода: сколько раз видимый стат падал в 0 (по разу на
     /// «нулевой эпизод» на стат). Определит ветку взрослой формы (C2).
     pub care_mistakes: u32,
+    /// Вещи в мире питомца (фаза H2): миска, лежанка и прочее.
+    pub props: Vec<PlacedProp>,
     /// Время рождения (wall_ms первого Genesis).
     pub born_ms: u64,
     /// Болезнь: скрытое здоровье ниже порога (смерти нет).
@@ -328,6 +367,7 @@ struct FoldState {
     born_ms: Option<u64>,
     born_stage: Stage,
     care_mistakes: u32,
+    props: Vec<PlacedProp>,
     /// Стат сейчас в «нулевом эпизоде» (ошибка уже засчитана).
     zero_episode: [bool; 3],
     /// Несъеденная половина еды, капающая в сытость (анти-перекорм).
@@ -352,6 +392,7 @@ impl FoldState {
             born_ms: None,
             born_stage: Stage::Egg,
             care_mistakes: 0,
+            props: Vec::new(),
             zero_episode: [false; 3],
             pending_food: 0.0,
             treats: Vec::new(),
@@ -476,6 +517,21 @@ fn apply(st: &mut FoldState, ev: &Event, cfg: &FoldCfg) {
             st.stats.mood = (st.stats.mood - cfg.shaken_mood_cost).max(0.0);
             st.stats.health = (st.stats.health - cfg.shaken_health_cost).max(0.0);
         }
+        EventKind::PropPlaced { kind, x, y } => {
+            let id = prop_id(&ev.id);
+            st.props.retain(|p| p.kind != *kind); // одна вещь каждого вида
+            st.props.push(PlacedProp {
+                id,
+                kind: *kind,
+                pos: crate::geometry::Vec2::new(*x, *y),
+            });
+        }
+        EventKind::PropMoved { id, x, y } => {
+            if let Some(p) = st.props.iter_mut().find(|p| p.id == *id) {
+                p.pos = crate::geometry::Vec2::new(*x, *y);
+            }
+        }
+        EventKind::PropTaken { id } => st.props.retain(|p| p.id != *id),
         EventKind::Slept { minutes } => {
             let gain = minutes.max(0.0) * cfg.sleep_energy_per_min;
             st.stats.energy = (st.stats.energy + gain).min(100.0);
@@ -538,6 +594,7 @@ pub fn fold(events: &[Event], now_ms: u64, cfg: &FoldCfg) -> DerivedPet {
         stats: st.stats,
         summoned: st.summoned,
         care_mistakes: st.care_mistakes,
+        props: st.props.clone(),
         born_ms,
         ill,
         color: st.color,

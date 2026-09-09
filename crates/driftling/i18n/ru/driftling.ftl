@@ -122,6 +122,7 @@ tray-quit = Остановить демона
 menu-feed = Покормить
 menu-treat = Вкусняшка
 menu-play = Поиграть
+menu-toy = Мяч
 menu-sleep = Уложить спать
 menu-settings = Настройки
 menu-dismiss = Убрать с экрана
@@ -135,6 +136,7 @@ bubble-sneeze = Апчхи!
 bubble-bye = Пока!
 bubble-birthday = С днём рождения!
 bubble-wheee = Уиии!
+bubble-fetch = Держи!
 bubble-yuck = Бэ-э…
 
 # --- Питомец ---

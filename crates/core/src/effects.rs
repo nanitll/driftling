@@ -109,6 +109,97 @@ pub fn mop_frame(h: u32, handle: u32, head: u32) -> Frame {
     frame
 }
 
+/// Миска: половина эллипса с ободком и едой внутри, если `filled`.
+pub fn bowl_frame(w: u32, body: u32, food: u32, filled: bool) -> Frame {
+    let w = w.max(10);
+    let h = (w * 2 / 3).max(6);
+    let mut frame = blank(w, h);
+    let (fw, fh) = (w as f32, h as f32);
+    let rim = crate::palette::darken(body, 0.7);
+    // Чаша: нижняя половина эллипса.
+    for y in 0..h {
+        for x in 0..w {
+            let nx = (x as f32 + 0.5 - fw / 2.0) / (fw / 2.0);
+            let ny = (y as f32 + 0.5 - fh * 0.35) / (fh * 0.65);
+            if ny < 0.0 {
+                continue;
+            }
+            let d = (nx * nx + ny * ny).sqrt();
+            if d < 1.0 {
+                let color = if d > 0.82 { rim } else { body };
+                put(&mut frame, x, y, color, 1.0);
+            }
+        }
+    }
+    // Ободок и еда горкой.
+    for x in 0..w {
+        put(&mut frame, x, (fh * 0.33) as u32, rim, 0.9);
+    }
+    if filled {
+        for y in (fh * 0.16) as u32..(fh * 0.4) as u32 {
+            let t = (y as f32 - fh * 0.16) / (fh * 0.24);
+            let half = fw * 0.36 * t.max(0.15);
+            for x in ((fw / 2.0 - half) as u32)..=((fw / 2.0 + half) as u32).min(w - 1) {
+                put(&mut frame, x, y, food, 1.0);
+            }
+        }
+    }
+    frame
+}
+
+/// Лежанка: мягкий валик с углублением — на неё можно забраться.
+pub fn bed_frame(w: u32, body: u32) -> Frame {
+    let w = w.max(12);
+    let h = (w * 2 / 5).max(8);
+    let mut frame = blank(w, h);
+    let (fw, fh) = (w as f32, h as f32);
+    let edge = crate::palette::darken(body, 0.72);
+    let inner = crate::palette::lighten(body, 1.18);
+    for y in 0..h {
+        for x in 0..w {
+            let nx = (x as f32 + 0.5 - fw / 2.0) / (fw / 2.0);
+            let ny = (y as f32 + 0.5 - fh * 0.45) / (fh * 0.55);
+            if ny < -0.2 {
+                continue;
+            }
+            if nx * nx + ny * ny < 1.0 {
+                // Углубление в середине — там питомец и лежит.
+                let dip = nx.abs() < 0.62 && (y as f32) < fh * 0.55;
+                put(&mut frame, x, y, if dip { inner } else { edge }, 1.0);
+            }
+        }
+    }
+    frame
+}
+
+/// Мячик: шар с бликом и полосой.
+pub fn ball_frame(d: u32, body: u32, stripe: u32) -> Frame {
+    let d = d.max(6);
+    let mut frame = blank(d, d);
+    let r = d as f32 / 2.0;
+    disc(&mut frame, Vec2::new(r, r), r - 0.5, body, 1.0);
+    // Полоса поперёк и блик.
+    for y in 0..d {
+        let ny = (y as f32 + 0.5 - r) / r;
+        if ny.abs() < 0.18 {
+            for x in 0..d {
+                let nx = (x as f32 + 0.5 - r) / r;
+                if nx * nx + ny * ny < 0.92 {
+                    put(&mut frame, x, y, stripe, 1.0);
+                }
+            }
+        }
+    }
+    disc(
+        &mut frame,
+        Vec2::new(r * 0.68, r * 0.62),
+        r * 0.22,
+        0xff_ff_ff_ff,
+        0.5,
+    );
+    frame
+}
+
 fn blank(w: u32, h: u32) -> Frame {
     Frame {
         w,
@@ -187,6 +278,20 @@ mod tests {
         };
         assert!(row_ink(2) >= 1, "черенок наверху");
         assert!(row_ink(f.h - 2) > row_ink(2) * 2, "мочалка внизу шире");
+    }
+
+    /// Предметы рисуются, не пустые и в своих пропорциях.
+    #[test]
+    fn props_have_shape() {
+        let bowl = bowl_frame(40, 0xff_b0_a2_94, 0xff_d9_a0_66, true);
+        let empty = bowl_frame(40, 0xff_b0_a2_94, 0xff_d9_a0_66, false);
+        assert!(ink(&bowl) > ink(&empty), "в полной миске видно еду");
+        assert!(bowl.w > bowl.h, "миска шире, чем выше");
+        let bed = bed_frame(60, 0xff_b0_a2_94);
+        assert!(ink(&bed) > 100 && bed.w > bed.h);
+        let ball = ball_frame(30, 0xff_e8_94_4a, 0xff_f4_f4_f8);
+        assert!(ink(&ball) > 300, "мяч круглый и плотный");
+        assert_eq!(ball.w, ball.h);
     }
 
     /// Пыль и лужица рисуются и остаются premultiplied.

@@ -25,10 +25,12 @@ pub mod pack;
 pub mod palette;
 pub mod pet;
 pub mod physics;
+pub mod prop;
 pub mod radial;
 pub mod sprite;
 pub mod stats;
 pub mod sync;
+pub mod task;
 pub mod text;
 
 pub use attributes::{PetAttributes, PetRecord};
@@ -45,5 +47,7 @@ pub use journal::{
 pub use palette::{DEFAULT_PET_COLOR, PET_PRESETS};
 pub use pet::{Direction, Pet, PointerEvent, SimPace, World};
 pub use physics::{Deform, Orient, Surface};
+pub use prop::{Prop, PropKind, PropState};
 pub use stats::PetStats;
 pub use sync::{apply_remote, cursors_of, events_after, Cursors};
+pub use task::{Errand, ErrandKind, Progress};

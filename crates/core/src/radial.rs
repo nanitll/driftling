@@ -28,8 +28,10 @@ pub enum Icon {
     Cookie,
     /// Конфета — вкусняшка.
     Candy,
-    /// Мячик — поиграть.
+    /// Мячик — достать игрушку.
     Ball,
+    /// Лапка — поиграть с питомцем.
+    Paw,
     /// Месяц — уложить спать.
     Moon,
     /// Шестерёнка — настройки.
@@ -504,6 +506,24 @@ fn draw_icon(frame: &mut Frame, icon: Icon, c: Vec2, s: f32, accent: u32) {
             }
             ring(frame, c, s, s * 0.12, PETAL_STROKE, 1.0);
         }
+        Icon::Paw => {
+            // Подушечка и четыре пальца: читается даже в 20 пикселей.
+            disc(frame, Vec2::new(c.x, c.y + s * 0.34), s * 0.62, accent, 1.0);
+            for (dx, dy, r) in [
+                (-0.72f32, -0.28f32, 0.28f32),
+                (-0.26, -0.72, 0.3),
+                (0.26, -0.72, 0.3),
+                (0.72, -0.28, 0.28),
+            ] {
+                disc(
+                    frame,
+                    Vec2::new(c.x + s * dx, c.y + s * dy),
+                    s * r,
+                    accent,
+                    1.0,
+                );
+            }
+        }
         Icon::Moon => {
             crescent(
                 frame,
@@ -704,7 +724,8 @@ mod tests {
         [
             (Icon::Cookie, "Покормить"),
             (Icon::Candy, "Вкусняшка"),
-            (Icon::Ball, "Поиграть"),
+            (Icon::Paw, "Поиграть"),
+            (Icon::Ball, "Мяч"),
             (Icon::Moon, "Уложить спать"),
             (Icon::Gear, "Настройки"),
             (Icon::Cross, "Убрать"),

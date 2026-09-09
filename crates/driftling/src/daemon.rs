@@ -74,8 +74,10 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::Result;
 use driftling_core::palette;
 use driftling_core::physics::{self, Platform};
+use driftling_core::prop::{Prop, PropKind, PropState};
 use driftling_core::radial;
 use driftling_core::sprite::{self, mood_tier, ActionLook, Frame, Look, MoodTier, SpriteSet};
+use driftling_core::task::{Errand, ErrandKind, Progress};
 use driftling_core::{
     apply_remote, cursors_of, device_journal_path_in, fold, growth, text, Config, Deform,
     DerivedPet, Direction, Event as JournalEvent, EventKind, FoldCfg, HlcClock, Journal, Orient,
@@ -143,6 +145,17 @@ const CHORE_IDLE_SECS: f64 = 6.0;
 const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
 const CHORE_WALK_SPEED: f32 = 90.0;
+
+/// Насколько в сторону от питомца ставится новая вещь (в его размерах).
+const PROP_PLACE_GAP: f32 = 1.7;
+/// Ближе этого расстояния к вещи идти незачем — уже пришёл.
+const PROP_NEAR_PX: f32 = 26.0;
+/// Скорость бега за мячом: игра живее хозяйственного шага.
+const FETCH_SPEED: f32 = 165.0;
+/// Пауза, чтобы мяч успокоился, прежде чем питомец за ним побежит.
+const FETCH_SETTLE_SECS: f64 = 0.4;
+/// Сколько питомец возится с мячом, прежде чем взять его в лапки.
+const FETCH_PICKUP_SECS: f32 = 0.35;
 
 /// Зелень укачанного: доля подмеса в цвет тела.
 const QUEASY_GREEN: u32 = 0xff_6f_c2_74;
@@ -540,14 +553,49 @@ struct Overlay {
     until: f64,
 }
 
-/// Дело по хозяйству (фаза H0): дойти до лужи и вытереть её шваброй.
-/// Первый предмет в мире питомца — по этому образцу дальше делаются
-/// домик, мячик и транспорт (см. docs/WORLD.md).
-struct Chore {
-    /// Куда идти (центр лужи по горизонтали).
-    target_x: f32,
-    /// Уже на месте и трёт — с этого момента.
-    mopping_since: Option<f64>,
+/// Вещь в руке человека (фаза H1): миску и лежанку можно переставить, мяч —
+/// кинуть. Скорость руки считается тут же, чтобы бросок был по руке, как у
+/// питомца (фаза G3).
+struct Grab {
+    id: u64,
+    /// Смещение точки захвата от опорной точки вещи.
+    offset: Vec2,
+    last: Vec2,
+    last_t: f64,
+    vel: Vec2,
+}
+
+/// Кадры вещей: пекутся под размер питомца вместе с прочими эффектами.
+struct PropArt {
+    bowl: Frame,
+    bed: Frame,
+    ball: Frame,
+}
+
+impl PropArt {
+    fn empty() -> Self {
+        let blank = || Frame {
+            w: 0,
+            h: 0,
+            argb: Vec::new(),
+        };
+        Self {
+            bowl: blank(),
+            bed: blank(),
+            ball: blank(),
+        }
+    }
+
+    fn frame(&self, kind: PropKind) -> Option<&Frame> {
+        let f = match kind {
+            PropKind::Bowl => &self.bowl,
+            PropKind::Bed => &self.bed,
+            PropKind::Ball => &self.ball,
+            // Швабра рисуется в лапках питомца отдельным кадром.
+            PropKind::Mop => return None,
+        };
+        (!f.argb.is_empty()).then_some(f)
+    }
 }
 
 /// Облачко пыли (фаза G6): живёт доли секунды, разлетается и тает.
@@ -662,16 +710,19 @@ enum MenuAction {
     Feed,
     Treat,
     Play,
+    /// Достать/убрать мяч (фаза H4).
+    Toy,
     Sleep,
     Settings,
     Dismiss,
 }
 
 /// Порядок действий = порядок строк меню (B3).
-const MENU_ACTIONS: [MenuAction; 6] = [
+const MENU_ACTIONS: [MenuAction; 7] = [
     MenuAction::Feed,
     MenuAction::Treat,
     MenuAction::Play,
+    MenuAction::Toy,
     MenuAction::Sleep,
     MenuAction::Settings,
     MenuAction::Dismiss,
@@ -683,6 +734,7 @@ fn menu_rows() -> Vec<String> {
         fl!("menu-feed"),
         fl!("menu-treat"),
         fl!("menu-play"),
+        fl!("menu-toy"),
         fl!("menu-sleep"),
         fl!("menu-settings"),
         fl!("menu-dismiss"),
@@ -690,9 +742,10 @@ fn menu_rows() -> Vec<String> {
 }
 
 /// Иконки кнопок меню, в порядке [`MENU_ACTIONS`].
-const MENU_ICONS: [radial::Icon; 6] = [
+const MENU_ICONS: [radial::Icon; 7] = [
     radial::Icon::Cookie,
     radial::Icon::Candy,
+    radial::Icon::Paw,
     radial::Icon::Ball,
     radial::Icon::Moon,
     radial::Icon::Gear,
@@ -747,6 +800,20 @@ fn sleep_scale_for(energy: f32) -> f32 {
 }
 
 /// Пересечение прямоугольников (пустое — нулевой размер).
+/// Опоры мира = кромки окон (рельеф из worldsense) плюс верхние кромки
+/// твёрдых вещей: лежанка держит питомца ровно тем же кодом, что карниз
+/// окна, — отдельной физики «стоять на предмете» не существует (H1).
+fn platforms_with_props(terrain: &[Platform], props: &[Prop]) -> Vec<Platform> {
+    let mut out = terrain.to_vec();
+    out.extend(
+        props
+            .iter()
+            .filter(|p| p.state == PropState::Rest)
+            .filter_map(|p| p.platform()),
+    );
+    out
+}
+
 fn intersect(a: Rect, b: Rect) -> Rect {
     let x = a.x.max(b.x);
     let y = a.y.max(b.y);
@@ -961,11 +1028,28 @@ struct DaemonApp {
     // ---- Дела по хозяйству (фаза H0) ----
     /// Кадр швабры (печётся вместе с прочими эффектами).
     mop: Frame,
-    /// Текущее дело: сходить к луже и вытереть её.
-    chore: Option<Chore>,
+    /// Текущее дело: сходить куда-то и там поработать (`core::task`).
+    errand: Option<Errand>,
     /// Когда пользователь последний раз трогал питомца — дела начинаются
     /// только когда его оставили в покое.
     last_touch: f64,
+
+    // ---- Вещи мира (фазы H1/H2/H4, docs/WORLD.md) ----
+    /// Вещи на экране: постоянные (из журнала) и временные (мяч).
+    props: Vec<Prop>,
+    /// Кадры вещей под текущий размер питомца.
+    prop_art: PropArt,
+    /// Счётчик id для временных вещей (постоянные берут id из журнала).
+    next_prop_id: u64,
+    /// Вещь в руке человека.
+    grab: Option<Grab>,
+    /// Рельеф из worldsense БЕЗ вещей: платформы мира собираются из него
+    /// и верхних кромок твёрдых вещей.
+    terrain: Vec<Platform>,
+    /// Куда питомец несёт мяч — точка, из которой его бросил человек.
+    fetch_home: Option<f32>,
+    /// Мяч успокоился в этот момент — пауза перед погоней.
+    ball_still_since: Option<f64>,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1116,8 +1200,15 @@ impl DaemonApp {
                 h: 0,
                 argb: Vec::new(),
             },
-            chore: None,
+            errand: None,
             last_touch: 0.0,
+            props: Vec::new(),
+            prop_art: PropArt::empty(),
+            next_prop_id: 1,
+            grab: None,
+            terrain: Vec::new(),
+            fetch_home: None,
+            ball_still_since: None,
         }
     }
 
@@ -1125,6 +1216,9 @@ impl DaemonApp {
     fn refold(&mut self) {
         self.derived = fold(&self.events, wall_now_ms(), &self.fold_cfg);
         self.last_fold = Instant::now();
+        // Вещи живут в журнале — свёртка их и приносит (в том числе
+        // поставленные на другом устройстве).
+        self.sync_props();
         // Усталость -> длина сна (фаза G3): при нулевой энергии питомец
         // спит вшестеро дольше обычной дрёмы и просыпается заряженным.
         if let Some(pet) = &mut self.pet {
@@ -1214,15 +1308,27 @@ impl DaemonApp {
     }
 
     /// Покормить (IPC и меню ПКМ): событие журнала + видимая еда (B5).
+    ///
+    /// С фазы H2 еда кладётся в миску: первая кормёжка заводит её в мире
+    /// (событие журнала — значит, миска переживёт рестарт и приедет на
+    /// второе устройство), а дальше питомец идёт есть к ней сам.
     fn feed(&mut self, treat: bool, now: f64) -> Response {
         let resp = self.care(EventKind::Fed { treat });
         if resp == Response::Ok && self.pet_visible_reactive() {
             self.wake_pet_for_action();
-            self.overlay = Some(Overlay {
-                look: ActionLook::Eating,
-                from: now,
-                until: now + EATING_SECS,
-            });
+            self.ensure_prop(PropKind::Bowl);
+            // Дойти — дело; сама еда показывается оверлеем по приходе.
+            match self.walk_to_prop(PropKind::Bowl, ErrandKind::Eat, 0.0) {
+                // Пошёл к миске — есть будет по приходе (finish_errand).
+                true => log::info!("еда: питомец идёт к миске"),
+                false => {
+                    self.overlay = Some(Overlay {
+                        look: ActionLook::Eating,
+                        from: now,
+                        until: now + EATING_SECS,
+                    })
+                }
+            }
             // Перекорм вкусняшками (фаза G5): три за минуту — икота.
             if treat {
                 self.treat_times.retain(|t| now - t <= 60.0);
@@ -1250,9 +1356,18 @@ impl DaemonApp {
 
     /// Уложить спать (IPC и меню ПКМ): событие журнала + сон прямо сейчас
     /// (B5). Энергию вернёт Slept, когда сон закончится (note_sleep).
-    fn put_to_sleep(&mut self) -> Response {
+    fn put_to_sleep(&mut self, _now: f64) -> Response {
         let resp = self.care(EventKind::PutToSleep);
         if resp == Response::Ok {
+            // Лежанка (H2): первый сон по команде заводит её, дальше
+            // питомец идёт спать в неё, а не на голый пол.
+            if self.pet_visible_reactive() {
+                self.ensure_prop(PropKind::Bed);
+                if self.walk_to_prop(PropKind::Bed, ErrandKind::Nap, 0.0) {
+                    log::info!("сон: питомец идёт в лежанку");
+                    return resp;
+                }
+            }
             if let Some(pet) = &mut self.pet {
                 if pet.force_sleep() {
                     log::info!("сон: питомец уложен принудительно");
@@ -1260,6 +1375,45 @@ impl DaemonApp {
             }
         }
         resp
+    }
+
+    /// Питомец стоит на полу и способен пойти по делу: не в полёте, не в
+    /// руке, не на стене. Дела гоняют его ногами, поэтому в воздухе они
+    /// запрещены — иначе он «шёл» бы по пустоте.
+    fn pet_afoot(&self) -> bool {
+        self.pet.as_ref().is_some_and(|p| {
+            p.surface == Surface::Floor && matches!(p.state, PetState::Idle | PetState::Walk)
+        })
+    }
+
+    /// Отправить питомца к вещи. `false` — идти незачем или некому: вещи
+    /// нет, он уже рядом, его держат в руке или он не на полу.
+    fn walk_to_prop(&mut self, kind: PropKind, errand: ErrandKind, work_secs: f32) -> bool {
+        let Some(prop) = self.prop_of(kind) else {
+            return false;
+        };
+        let (id, x) = (prop.id, prop.pos.x);
+        if !self.pet_afoot() {
+            return false;
+        }
+        let Some(pet) = &self.pet else {
+            return false;
+        };
+        // К миске подходят сбоку (иначе питомец стоял бы прямо на ней и
+        // перекрывал её собой), в лежанку — забираются целиком.
+        let target = if errand == ErrandKind::Nap {
+            x
+        } else {
+            let side = if pet.pos.x < x { -1.0 } else { 1.0 };
+            let prop_w = self.prop_of(kind).map_or(0.0, |p| p.size);
+            x + side * (self.sprites.size as f32 * 0.5 + prop_w * 0.5)
+        };
+        if (pet.pos.x - target).abs() <= PROP_NEAR_PX && errand != ErrandKind::Nap {
+            return false;
+        }
+        self.drop_errand();
+        self.errand = Some(Errand::new(errand, target, work_secs).about(id));
+        true
     }
 
     /// Убрать питомца с экрана (IPC, меню, трей): закрыть период сна,
@@ -1463,6 +1617,29 @@ impl DaemonApp {
             palette::darken(self.sprite_color, 0.55),
             palette::lighten(self.sprite_color, 1.5),
         );
+        // Вещи мира (H1): кадр под ширину из класса предмета.
+        let width = |kind: PropKind| (size as f32 * kind.class().size_scale) as u32;
+        self.prop_art = PropArt {
+            bowl: driftling_core::effects::bowl_frame(
+                width(PropKind::Bowl),
+                palette::darken(self.sprite_color, 0.62),
+                palette::lighten(self.sprite_color, 1.25),
+                true,
+            ),
+            bed: driftling_core::effects::bed_frame(
+                width(PropKind::Bed),
+                palette::darken(self.sprite_color, 0.78),
+            ),
+            ball: driftling_core::effects::ball_frame(
+                width(PropKind::Ball),
+                palette::lighten(self.sprite_color, 1.4),
+                palette::darken(self.sprite_color, 0.5),
+            ),
+        };
+        // Питомец подрос — вещи растут вместе с ним.
+        for prop in &mut self.props {
+            prop.size = (size as f32 * prop.kind.class().size_scale).max(6.0);
+        }
     }
 
     /// Пыль из-под ног: `n` облачков в точке `at` с разлётом в стороны.
@@ -1490,91 +1667,481 @@ impl DaemonApp {
         }
     }
 
-    /// Дела по хозяйству (фаза H0): если после тряски питомца оставили в
-    /// покое, он достаёт швабру и убирает за собой лужу.
-    ///
-    /// Это первый предмет мира питомца и образец для остальных: дело
-    /// состоит из «дойти» и «поработать», прерывается вмешательством
-    /// человека и ничего не пишет в журнал — следов в истории ухода от
-    /// уборки не остаётся.
-    fn chore_tick(&mut self, now: f64, dt: f32) {
-        // Взялись за швабру: лужа есть, питомца не трогают, он на полу.
-        if self.chore.is_none() {
-            let calm = now - self.last_touch >= CHORE_IDLE_SECS
-                && self.menu.is_none()
-                && self.presence_anim.is_none()
-                && self.overlay.is_none();
-            let ready = self.pet.as_ref().is_some_and(|p| {
-                p.surface == Surface::Floor
-                    && matches!(p.state, PetState::Idle | PetState::Walk)
-                    && !p.queasy()
+    // ---- Вещи мира и дела питомца (фазы H0-H4, docs/WORLD.md) ----
+
+    /// Привести список вещей в соответствие с журналом: постоянные вещи
+    /// (миска, лежанка) существуют ровно там, где записано в истории, —
+    /// значит переживают рестарт и приезжают на второе устройство.
+    fn sync_props(&mut self) {
+        let size = self.sprites.size as f32;
+        let placed = self.derived.props.clone();
+        // Записи больше нет (вещь убрали здесь или на другом устройстве).
+        self.props
+            .retain(|p| !p.kind.class().persist || placed.iter().any(|q| q.id == p.id));
+        for pp in placed {
+            let pos = self.fit_prop_pos(pp.kind, pp.pos, size);
+            match self.props.iter_mut().find(|p| p.id == pp.id) {
+                // Позицию из журнала не навязываем вещи в полёте или в
+                // руке: иначе брошенная миска дёргалась бы обратно.
+                Some(p) => {
+                    let moved = (p.pos.x - pos.x).abs() > 1.0 || (p.pos.y - pos.y).abs() > 1.0;
+                    if p.state == PropState::Rest && moved {
+                        p.pos = pos;
+                    }
+                }
+                None => {
+                    log::info!("вещи: {} появляется на экране", pp.kind.as_str());
+                    self.props.push(Prop::new(pp.id, pp.kind, pos, size));
+                }
+            }
+        }
+    }
+
+    /// Уместить вещь в текущий экран: у второго устройства и разрешение,
+    /// и пол свои, поэтому координата из журнала — пожелание, а не приказ.
+    fn fit_prop_pos(&self, kind: PropKind, pos: Vec2, size: f32) -> Vec2 {
+        let Some(world) = &self.world else {
+            return pos;
+        };
+        let half = size * kind.class().size_scale / 2.0;
+        let x = pos.x.clamp(
+            world.screen.x + half,
+            (world.screen.right() - half).max(world.screen.x + half),
+        );
+        // Вещи стоят на полу; кромки окон под них не занимаем.
+        Vec2::new(x, world.ground_y())
+    }
+
+    /// Место для новой вещи: сбоку от питомца, в сторону простора и не
+    /// поверх уже стоящих вещей.
+    fn place_spot(&self, kind: PropKind) -> Option<Vec2> {
+        let world = self.world.as_ref()?;
+        let size = self.sprites.size as f32;
+        let pet_x = self
+            .pet
+            .as_ref()
+            .map_or(world.screen.x + world.screen.w / 2.0, |p| p.pos.x);
+        let dir = if pet_x - world.screen.x > world.screen.right() - pet_x {
+            -1.0
+        } else {
+            1.0
+        };
+        let mut x = pet_x + dir * size * PROP_PLACE_GAP;
+        // Толкаем в ту же сторону, пока не перестанем накладываться.
+        for _ in 0..8 {
+            let clash = self.props.iter().any(|p| {
+                (p.pos.x - x).abs() < (p.size + size * kind.class().size_scale) / 2.0 + 4.0
             });
-            if let (true, true, Some(puddle)) = (calm, ready, self.puddle.as_ref()) {
-                let target_x = puddle.origin.x + puddle.frame.w as f32 / 2.0;
-                log::info!("дела: питомец идёт убирать за собой");
-                self.chore = Some(Chore {
-                    target_x,
-                    mopping_since: None,
+            if !clash {
+                break;
+            }
+            x += dir * size * 0.9;
+        }
+        Some(self.fit_prop_pos(kind, Vec2::new(x, world.ground_y()), size))
+    }
+
+    /// Найти вещь по виду.
+    fn prop_of(&self, kind: PropKind) -> Option<&Prop> {
+        self.props.iter().find(|p| p.kind == kind)
+    }
+
+    /// Завести постоянную вещь, если её ещё нет: событие журнала (значит,
+    /// переживёт рестарт и уедет на другое устройство) + вещь на экране.
+    fn ensure_prop(&mut self, kind: PropKind) -> bool {
+        if self.prop_of(kind).is_some() {
+            return false;
+        }
+        let Some(pos) = self.place_spot(kind) else {
+            return false;
+        };
+        let kind_name = kind.as_str();
+        if let Err(e) = self.append_event(EventKind::PropPlaced {
+            kind,
+            x: pos.x,
+            y: pos.y,
+        }) {
+            log::warn!("вещи: {kind_name} не записалась в журнал: {e}");
+            return false;
+        }
+        log::info!("вещи: в мире появилась {kind_name}");
+        self.sync_props();
+        true
+    }
+
+    /// Достать/убрать мяч (меню «Мяч», фаза H4). Мяч временный: в журнале
+    /// его нет, после перезапуска он не воскресает.
+    fn toggle_ball(&mut self, now: f64) -> Response {
+        if let Some(idx) = self.props.iter().position(|p| p.kind == PropKind::Ball) {
+            self.props.remove(idx);
+            self.drop_errand_if(|e| e.kind == ErrandKind::Fetch || e.kind == ErrandKind::Carry);
+            self.ball_still_since = None;
+            log::info!("игра: мяч убран");
+            return Response::Ok;
+        }
+        let (Some(world), Some(pet)) = (&self.world, &self.pet) else {
+            return Response::Error(fl!("daemon-output-not-ready"));
+        };
+        let size = self.sprites.size as f32;
+        let id = self.next_prop_id;
+        self.next_prop_id += 1;
+        // Мяч падает питомцу под ноги — сразу видно, что он появился.
+        let x = (pet.pos.x + size * 0.9).clamp(world.screen.x + size, world.screen.right() - size);
+        let mut ball = Prop::new(
+            id,
+            PropKind::Ball,
+            Vec2::new(x, pet.pos.y - size * 1.6),
+            size,
+        );
+        ball.state = PropState::Falling;
+        self.props.push(ball);
+        self.fetch_home = None;
+        self.ball_still_since = None;
+        self.happy_until = Some(now + HAPPY_PET_SECS);
+        log::info!("игра: питомцу выдан мяч");
+        Response::Ok
+    }
+
+    /// Физика вещей: рука человека, падение, рельеф из твёрдых вещей и
+    /// запись переезда постоянной вещи в журнал.
+    fn props_tick(&mut self, now: f64, dt: f32) {
+        if self.props.is_empty() {
+            return;
+        }
+        let cfg = self
+            .pet
+            .as_ref()
+            .map(|p| p.config().clone())
+            .unwrap_or_default();
+        if let Some(world) = &self.world {
+            for prop in &mut self.props {
+                prop.tick(world, &cfg, dt);
+            }
+        }
+        // Вещь в лапках питомца едет вместе с ним.
+        if let Some(pet) = &self.pet {
+            let b = pet.bounds();
+            let dir = pet.facing.sign();
+            for prop in &mut self.props {
+                if prop.state == PropState::Carried {
+                    prop.pos =
+                        Vec2::new(b.x + b.w / 2.0 + dir * b.w * 0.3, b.bottom() - b.h * 0.12);
+                }
+            }
+        }
+        // Мяч встал — через паузу за ним можно бежать.
+        match self.prop_of(PropKind::Ball).map(|b| b.state) {
+            Some(PropState::Rest) => {
+                if self.ball_still_since.is_none() {
+                    self.ball_still_since = Some(now);
+                }
+            }
+            _ => self.ball_still_since = None,
+        }
+        // Переезд постоянной вещи — в журнал, когда она успокоилась.
+        let moves: Vec<(u64, Vec2)> = self
+            .props
+            .iter()
+            .filter(|p| p.kind.class().persist && p.state == PropState::Rest)
+            .filter_map(|p| {
+                let known = self.derived.props.iter().find(|q| q.id == p.id)?;
+                ((known.pos.x - p.pos.x).abs() > 2.0).then_some((p.id, p.pos))
+            })
+            .collect();
+        for (id, pos) in moves {
+            let _ = self.append_event(EventKind::PropMoved {
+                id,
+                x: pos.x,
+                y: pos.y,
+            });
+            log::info!("вещи: переставлена вещь {id:x} -> x={:.0}", pos.x);
+        }
+        // Рельеф: твёрдые вещи (лежанка) — такая же опора, как кромка окна.
+        let wanted = platforms_with_props(&self.terrain, &self.props);
+        if let Some(world) = &mut self.world {
+            if world.platforms != wanted {
+                world.platforms = wanted;
+                if let Some(pet) = &mut self.pet {
+                    pet.world_changed(world);
+                }
+            }
+        }
+    }
+
+    /// Указатель мимо питомца: вещи можно двигать и кидать той же рукой.
+    fn prop_pointer(&mut self, ev: PointerEvent, now: f64) -> bool {
+        match ev {
+            PointerEvent::Press(p) => {
+                // Сверху вниз по списку: последняя нарисованная — ближе.
+                let hit = self
+                    .props
+                    .iter()
+                    .rposition(|q| q.kind.class().draggable && q.bounds().contains(p));
+                let Some(idx) = hit else {
+                    return false;
+                };
+                let prop = &mut self.props[idx];
+                let offset = prop.pos - p;
+                let pos = prop.pos;
+                prop.hold(pos, false);
+                let id = prop.id;
+                self.grab = Some(Grab {
+                    id,
+                    offset,
+                    last: p,
+                    last_t: now,
+                    vel: Vec2::default(),
+                });
+                // Вещь из-под носа — дело про неё отменяется.
+                self.drop_errand_if(|e| e.prop == Some(id));
+                true
+            }
+            PointerEvent::Motion(p) => {
+                let Some(grab) = &mut self.grab else {
+                    return false;
+                };
+                let dt = (now - grab.last_t).max(1e-3) as f32;
+                // Сглаживаем скорость руки: один рывок не должен решать
+                // силу броска (та же логика, что у питомца в фазе G3).
+                let inst = (p - grab.last) * (1.0 / dt);
+                grab.vel = grab.vel * 0.55 + inst * 0.45;
+                grab.last = p;
+                grab.last_t = now;
+                let (id, target) = (grab.id, p + grab.offset);
+                if let Some(prop) = self.props.iter_mut().find(|q| q.id == id) {
+                    prop.hold(target, false);
+                }
+                true
+            }
+            PointerEvent::Release(_) => {
+                let Some(grab) = self.grab.take() else {
+                    return false;
+                };
+                let cfg = self
+                    .pet
+                    .as_ref()
+                    .map(|p| p.config().clone())
+                    .unwrap_or_default();
+                let limit = cfg.body.throw_limit_px();
+                let speed = grab.vel.x.hypot(grab.vel.y);
+                // Тот же мягкий предел, что у броска питомца.
+                let vel = if speed > limit {
+                    grab.vel * (limit / speed)
+                } else {
+                    grab.vel
+                };
+                let mut thrown = None;
+                if let Some(prop) = self.props.iter_mut().find(|q| q.id == grab.id) {
+                    prop.release(vel);
+                    thrown = Some((prop.kind, prop.pos));
+                }
+                // Мяч питомец несёт туда, откуда его бросили: это и есть
+                // «принести человеку» — руки-то у человека здесь.
+                if let Some((PropKind::Ball, pos)) = thrown {
+                    self.fetch_home = Some(pos.x);
+                    self.ball_still_since = None;
+                }
+                true
+            }
+        }
+    }
+
+    /// Дела питомца (`core::task`): выбрать дело, шагнуть, довести до конца.
+    ///
+    /// Правило одно на все дела: человек трогает питомца — дело бросается.
+    /// В журнал дела не пишут: история ухода — про человека.
+    fn errand_tick(&mut self, now: f64, dt: f32) {
+        if self.errand.is_some() && self.errand_interrupted(now) {
+            self.drop_errand();
+        }
+        if self.errand.is_none() {
+            self.pick_errand(now);
+        }
+        let Some(mut errand) = self.errand.take() else {
+            return;
+        };
+        let speed = match errand.kind {
+            ErrandKind::Fetch | ErrandKind::Carry => FETCH_SPEED,
+            _ => CHORE_WALK_SPEED,
+        };
+        let Some(pet) = &mut self.pet else {
+            return;
+        };
+        let progress = errand.step(pet, speed, now, dt);
+        match progress {
+            Progress::Going => self.errand = Some(errand),
+            Progress::Working { done } => {
+                // Уборка: лужа тает вместе с прогрессом.
+                if errand.kind == ErrandKind::Mop {
+                    if let Some(puddle) = &mut self.puddle {
+                        puddle.until = puddle.until.min(now + MOP_SECS * (1.0 - done) as f64);
+                    }
+                }
+                self.errand = Some(errand);
+            }
+            Progress::Finished => self.finish_errand(errand, now),
+        }
+    }
+
+    /// Дело отменяется: вмешался человек, питомца унесли, он не на полу
+    /// или предмет дела исчез.
+    fn errand_interrupted(&self, now: f64) -> bool {
+        let Some(errand) = &self.errand else {
+            return false;
+        };
+        // Уборку питомец затевает сам, «пока не видят»: тронули — бросил.
+        // Дела по команде человека (поесть, лечь) так бросать нельзя —
+        // сам же клик по меню и отменял бы их на первом тике.
+        if errand.kind == ErrandKind::Mop && now - self.last_touch < 1.0 {
+            return true;
+        }
+        // Дело живёт, только пока питомец на своих ногах: унесли, уронил
+        // в полёт, полез на стену или уснул — дело отменяется.
+        if !self.pet_afoot() {
+            return true;
+        }
+        match errand.kind {
+            ErrandKind::Mop => self.puddle.is_none(),
+            ErrandKind::Fetch | ErrandKind::Carry => errand
+                .prop
+                .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
+            ErrandKind::Eat | ErrandKind::Nap => errand
+                .prop
+                .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
+        }
+    }
+
+    /// Чем заняться, если питомец свободен: убрать лужу или принести мяч.
+    fn pick_errand(&mut self, now: f64) {
+        let calm = self.menu.is_none() && self.presence_anim.is_none() && self.overlay.is_none();
+        if !calm || !self.pet_afoot() {
+            return;
+        }
+        let left_alone = now - self.last_touch >= CHORE_IDLE_SECS;
+        let queasy = self.pet.as_ref().is_some_and(|p| p.queasy());
+        // Уборка: только когда его оставили в покое и уже не мутит.
+        if let (true, false, Some(puddle)) = (left_alone, queasy, self.puddle.as_ref()) {
+            let target_x = puddle.origin.x + puddle.frame.w as f32 / 2.0;
+            log::info!("дела: питомец идёт убирать за собой");
+            self.errand = Some(Errand::new(ErrandKind::Mop, target_x, MOP_SECS as f32));
+            return;
+        }
+        // Мяч: за ним бегут сразу, как он успокоится, — это игра, ждать
+        // тишины незачем. Но не с рук: пока человек его держит, нельзя.
+        let pet_x = self.pet.as_ref().map_or(0.0, |p| p.pos.x);
+        let settled = self
+            .ball_still_since
+            .is_some_and(|t| now - t >= FETCH_SETTLE_SECS);
+        if settled && !queasy {
+            if let Some(ball) = self.prop_of(PropKind::Ball) {
+                if (ball.pos.x - pet_x).abs() > PROP_NEAR_PX {
+                    let (id, x) = (ball.id, ball.pos.x);
+                    log::info!("игра: питомец побежал за мячом");
+                    self.errand =
+                        Some(Errand::new(ErrandKind::Fetch, x, FETCH_PICKUP_SECS).about(id));
+                }
+            }
+        }
+    }
+
+    /// Дело доведено до конца — что случается в награду.
+    fn finish_errand(&mut self, errand: Errand, now: f64) {
+        match errand.kind {
+            ErrandKind::Mop => {
+                log::info!("дела: лужа убрана");
+                self.puddle = None;
+                self.happy_until = Some(now + HAPPY_PET_SECS);
+            }
+            // Дошёл до миски — ест уже там.
+            ErrandKind::Eat => {
+                self.overlay = Some(Overlay {
+                    look: ActionLook::Eating,
+                    from: now,
+                    until: now + EATING_SECS,
                 });
             }
+            // Дошёл до лежанки — забирается в неё и засыпает.
+            ErrandKind::Nap => {
+                let top = errand
+                    .prop
+                    .and_then(|id| self.props.iter().find(|p| p.id == id))
+                    .map(|bed| bed.bounds().y + bed.height() * 0.45);
+                if let (Some(pet), Some(y)) = (&mut self.pet, top) {
+                    pet.pos.y = y;
+                    pet.force_sleep();
+                    log::info!("сон: питомец улёгся в лежанку");
+                }
+            }
+            // Догнал мяч — берёт в лапки и несёт к человеку.
+            ErrandKind::Fetch => {
+                let home = self.fetch_home;
+                let carried = errand.prop.and_then(|id| {
+                    let pos = self.pet.as_ref()?.pos;
+                    let prop = self.props.iter_mut().find(|p| p.id == id)?;
+                    prop.hold(pos, true);
+                    Some(id)
+                });
+                match (carried, home) {
+                    (Some(id), Some(x)) => {
+                        let mut back = Errand::new(ErrandKind::Carry, x, 0.0);
+                        back.prop = Some(id);
+                        self.errand = Some(back);
+                    }
+                    // Никто его не кидал (мяч просто выдали) — попинать.
+                    (Some(id), None) => {
+                        let dir = self.pet.as_ref().map_or(1.0, |p| p.facing.sign());
+                        let cfg = self
+                            .pet
+                            .as_ref()
+                            .map(|p| p.config().clone())
+                            .unwrap_or_default();
+                        if let Some(prop) = self.props.iter_mut().find(|p| p.id == id) {
+                            prop.release(Vec2::new(
+                                dir * cfg.body.mps_to_px(2.2),
+                                -cfg.body.mps_to_px(1.4),
+                            ));
+                        }
+                        self.ball_still_since = None;
+                        self.happy_until = Some(now + HAPPY_PET_SECS);
+                    }
+                    _ => {}
+                }
+            }
+            // Принёс мяч на место броска: кладёт и ждёт похвалы.
+            ErrandKind::Carry => {
+                if let Some(id) = errand.prop {
+                    if let Some(prop) = self.props.iter_mut().find(|p| p.id == id) {
+                        prop.release(Vec2::default());
+                    }
+                }
+                self.fetch_home = None;
+                self.ball_still_since = None;
+                self.happy_until = Some(now + HAPPY_PLAY_SECS);
+                self.bubble = Some(text_bubble(&fl!("bubble-fetch"), now, 0.9));
+                // Принесённый мяч — настоящая игра, она идёт в журнал.
+                let _ = self.append_event(EventKind::Played);
+                log::info!("игра: мяч принесён");
+            }
         }
+    }
 
-        let Some(chore) = &mut self.chore else {
+    /// Бросить текущее дело (вещь из лапок при этом падает на пол).
+    fn drop_errand(&mut self) {
+        let Some(errand) = self.errand.take() else {
             return;
         };
-        // Вмешался человек или лужа исчезла — дело отменяется.
-        let interrupted = now - self.last_touch < 1.0
-            || self.puddle.is_none()
-            || self
-                .pet
-                .as_ref()
-                .is_none_or(|p| p.state == PetState::Dragged || p.surface != Surface::Floor);
-        if interrupted {
-            self.chore = None;
-            return;
+        if let Some(id) = errand.prop {
+            if let Some(prop) = self.props.iter_mut().find(|p| p.id == id) {
+                if prop.state == PropState::Carried {
+                    prop.release(Vec2::default());
+                }
+            }
         }
-        let Some(pet) = &mut self.pet else {
-            self.chore = None;
-            return;
-        };
-        match chore.mopping_since {
-            // Идём к луже: ведём питомца сами, как в пробежках присутствия.
-            None => {
-                let dx = chore.target_x - pet.pos.x;
-                if dx.abs() <= 6.0 {
-                    chore.mopping_since = Some(now);
-                    pet.state = PetState::Idle;
-                    pet.state_time = 0.0;
-                    pet.state_left = MOP_SECS as f32;
-                } else {
-                    let dir = dx.signum();
-                    pet.facing = if dir < 0.0 {
-                        Direction::Left
-                    } else {
-                        Direction::Right
-                    };
-                    pet.state = PetState::Walk;
-                    pet.state_time += dt;
-                    pet.state_left = f32::INFINITY;
-                    pet.pos.x += dir * CHORE_WALK_SPEED * dt;
-                }
-            }
-            // Трём: лужа тает вместе с прогрессом уборки.
-            Some(since) => {
-                pet.state = PetState::Idle;
-                pet.state_left = MOP_SECS as f32;
-                let done = (now - since) / MOP_SECS;
-                if let Some(puddle) = &mut self.puddle {
-                    // Ускоряем собственное угасание лужи до конца уборки.
-                    puddle.until = puddle.until.min(now + MOP_SECS * (1.0 - done).max(0.0));
-                }
-                if done >= 1.0 {
-                    log::info!("дела: лужа убрана");
-                    self.puddle = None;
-                    self.chore = None;
-                    self.happy_until = Some(now + HAPPY_PET_SECS); // доволен собой
-                }
-            }
+    }
+
+    /// Бросить дело, если оно подходит под условие.
+    fn drop_errand_if(&mut self, pred: impl Fn(&Errand) -> bool) {
+        if self.errand.as_ref().is_some_and(pred) {
+            self.drop_errand();
         }
     }
 
@@ -1643,7 +2210,8 @@ impl DaemonApp {
             MenuAction::Feed => self.feed(false, now),
             MenuAction::Treat => self.feed(true, now),
             MenuAction::Play => self.play(now),
-            MenuAction::Sleep => self.put_to_sleep(),
+            MenuAction::Toy => self.toggle_ball(now),
+            MenuAction::Sleep => self.put_to_sleep(now),
             MenuAction::Settings => {
                 spawn_settings_detached();
                 Response::Ok
@@ -2020,7 +2588,7 @@ impl DaemonApp {
             }
             Request::Feed { treat } => self.feed(treat, now),
             Request::Play => self.play(now),
-            Request::PutToSleep => self.put_to_sleep(),
+            Request::PutToSleep => self.put_to_sleep(now),
             Request::Rename(name) => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
@@ -2165,6 +2733,11 @@ impl DaemonApp {
         let mut consumed = false;
         let mut dragged = false;
         let mut thrown_speed = 0.0f32;
+        // Вещь уже в руке — указатель принадлежит ей до отпускания.
+        if self.grab.is_some() {
+            self.prop_pointer(ev, now);
+            return true;
+        }
         if let (Some(pet), Some(world)) = (&mut self.pet, &self.world) {
             consumed = pet.pointer(world, ev, now as f32);
             clicked = pet.take_click();
@@ -2172,6 +2745,10 @@ impl DaemonApp {
             if matches!(ev, PointerEvent::Release(_)) && pet.state == PetState::Falling {
                 thrown_speed = pet.vel.x.hypot(pet.vel.y) / pet.config().body.px_per_m;
             }
+        }
+        // Мимо питомца — может, попали по вещи.
+        if !consumed && self.prop_pointer(ev, now) {
+            return true;
         }
         match ev {
             PointerEvent::Press(_) if consumed && !dragged => {
@@ -2516,11 +3093,13 @@ impl DaemonApp {
             None => (self.output_rect, Vec::new(), None, false),
         };
 
-        if world.platforms != platforms
+        if self.terrain != platforms
             || world.ground_y_override != ground_override
             || world.screen != screen
         {
-            world.platforms = platforms;
+            self.terrain = platforms;
+            // Вещи стоят поверх рельефа и сами являются опорами.
+            world.platforms = platforms_with_props(&self.terrain, &self.props);
             world.ground_y_override = ground_override;
             world.screen = screen;
             log::debug!(
@@ -2661,8 +3240,10 @@ impl App for DaemonApp {
         self.reactions_tick(now);
         // Живое тело (G6): пыль и кадры эффектов.
         self.body_fx_tick(now, dt);
-        // Дела по хозяйству (H0): убрать за собой лужу.
-        self.chore_tick(now, dt);
+        // Вещи мира (H1): физика, рука человека, рельеф из твёрдых вещей.
+        self.props_tick(now, dt);
+        // Дела питомца (H1): уборка, миска, лежанка, мяч.
+        self.errand_tick(now, dt);
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —
@@ -2744,6 +3325,49 @@ impl App for DaemonApp {
                         alpha: fade,
                     });
                 }
+                // Вещи мира (H1): лежат позади питомца, каждая со своей
+                // тенью на опоре — тем же приёмом, что и тень питомца.
+                for prop in self.props.iter().filter(|p| p.state != PropState::Carried) {
+                    let Some(frame) = self.prop_art.frame(prop.kind) else {
+                        continue;
+                    };
+                    let b = prop.bounds();
+                    if !self.shadow.argb.is_empty() {
+                        let support = physics::support_below(world, prop.pos.x, b.bottom() - 1.0);
+                        let height = (support - b.bottom()).max(0.0);
+                        if height < SHADOW_FADE_PX {
+                            let k = 1.0 - height / SHADOW_FADE_PX;
+                            let scale = (0.4 + 0.35 * k) * (b.w / self.shadow.w.max(1) as f32);
+                            let (sw, sh) = (self.shadow.w as f32, self.shadow.h as f32);
+                            sprites.push(SpriteInstance {
+                                frame: &self.shadow,
+                                origin: Vec2::new(prop.pos.x - sw / 2.0, support - sh * 0.6),
+                                orient: Orient::IDENTITY,
+                                deform: Deform {
+                                    scale_x: scale,
+                                    scale_y: scale,
+                                    lean: 0.0,
+                                    anchor_x: 0.5,
+                                    anchor_y: 0.5,
+                                },
+                                alpha: SHADOW_ALPHA * k * k * 0.8,
+                            });
+                        }
+                    }
+                    sprites.push(SpriteInstance {
+                        frame,
+                        origin: Vec2::new(b.x, b.y),
+                        orient: Orient::IDENTITY,
+                        deform: Deform {
+                            scale_x: b.w / frame.w.max(1) as f32,
+                            scale_y: b.h / frame.h.max(1) as f32,
+                            lean: 0.0,
+                            anchor_x: 0.5,
+                            anchor_y: 1.0,
+                        },
+                        alpha: 1.0,
+                    });
+                }
                 let frame = self.sprites.frame_look(&look, t);
                 sprites.push(SpriteInstance {
                     frame,
@@ -2770,8 +3394,9 @@ impl App for DaemonApp {
                     }
                 }
                 // Швабра в лапках, пока идёт уборка.
-                if let (Some(chore), false) = (&self.chore, self.mop.argb.is_empty()) {
-                    let swing = if chore.mopping_since.is_some() {
+                let mopping = self.errand.as_ref().filter(|e| e.kind == ErrandKind::Mop);
+                if let (Some(errand), false) = (mopping, self.mop.argb.is_empty()) {
+                    let swing = if !errand.walking() {
                         ((now * 7.0).sin() * 0.35) as f32
                     } else {
                         0.08
@@ -2794,6 +3419,25 @@ impl App for DaemonApp {
                         },
                         alpha: 1.0,
                     });
+                }
+                // Вещь в лапках — поверх питомца: он держит её перед собой.
+                for prop in self.props.iter().filter(|p| p.state == PropState::Carried) {
+                    if let Some(frame) = self.prop_art.frame(prop.kind) {
+                        let b = prop.bounds();
+                        sprites.push(SpriteInstance {
+                            frame,
+                            origin: Vec2::new(b.x, b.y),
+                            orient: Orient::IDENTITY,
+                            deform: Deform {
+                                scale_x: b.w / frame.w.max(1) as f32,
+                                scale_y: b.h / frame.h.max(1) as f32,
+                                lean: 0.0,
+                                anchor_x: 0.5,
+                                anchor_y: 1.0,
+                            },
+                            alpha: 1.0,
+                        });
+                    }
                 }
                 // Пыль поверх питомца: она перед ним, у самых ног.
                 for puff in &self.puffs {
@@ -2820,6 +3464,14 @@ impl App for DaemonApp {
                 } else {
                     vec![bounds]
                 };
+                // Вещи ловят мышь наравне с питомцем: миску переставляют,
+                // мяч кидают.
+                input_rects.extend(
+                    self.props
+                        .iter()
+                        .filter(|p| p.kind.class().draggable && p.state != PropState::Carried)
+                        .map(|p| p.bounds()),
+                );
                 // Пузырь — над питомцем, в пределах экрана, без хит-области.
                 // Под потолком (фаза G) места сверху нет — пузырь уходит вниз.
                 if let Some(bubble) = self.bubble.as_ref().filter(|b| now >= b.from) {
@@ -2889,6 +3541,9 @@ impl App for DaemonApp {
                     Some(world) => world.screen = screen,
                     None => self.world = Some(World::new(screen)),
                 }
+                // Вещи из журнала знают своё место только теперь, когда
+                // известен экран (после рестарта — и своё существование).
+                self.sync_props();
                 // Демон стартует с питомцем на экране — но только если его
                 // не убирали до рестарта (ТД-17: dismissed в журнале).
                 if first && self.derived.summoned {
@@ -2944,6 +3599,12 @@ impl App for DaemonApp {
             // Захват потерян не по воле пользователя: питомец выпадает из
             // руки на месте, БЕЗ броска (фаза G3).
             Event::PointerCancel(_) => {
+                // Вещь выпадает из руки на месте — как и питомец.
+                if let Some(grab) = self.grab.take() {
+                    if let Some(prop) = self.props.iter_mut().find(|p| p.id == grab.id) {
+                        prop.release(Vec2::default());
+                    }
+                }
                 if let Some(pet) = &mut self.pet {
                     if pet.cancel_drag() {
                         log::debug!("захват отменён — питомец выпал из руки, без броска");
@@ -3461,12 +4122,12 @@ mod tests {
         // Пока трогаем — за швабру не берётся.
         app.last_touch = now;
         settle(&mut app, &mut now, 2.0);
-        assert!(app.chore.is_none(), "при живом хозяине уборки нет");
+        assert!(app.errand.is_none(), "при живом хозяине уборки нет");
 
         // Оставили в покое: дошёл и вытер.
         app.last_touch = now - CHORE_IDLE_SECS - 1.0;
         settle(&mut app, &mut now, 1.0);
-        assert!(app.chore.is_some(), "взялся за швабру");
+        assert!(app.errand.is_some(), "взялся за швабру");
         let start_x = app.pet.as_ref().unwrap().pos.x;
         settle(&mut app, &mut now, 4.0);
         assert!(
@@ -3475,7 +4136,7 @@ mod tests {
         );
         settle(&mut app, &mut now, 8.0);
         assert!(app.puddle.is_none(), "лужа убрана");
-        assert!(app.chore.is_none(), "дело закончено");
+        assert!(app.errand.is_none(), "дело закончено");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3495,7 +4156,7 @@ mod tests {
         });
         app.last_touch = now - CHORE_IDLE_SECS - 1.0;
         settle(&mut app, &mut now, 1.0);
-        assert!(app.chore.is_some());
+        assert!(app.errand.is_some());
 
         // Погладили — дело брошено, лужа осталась.
         let p = app.pet.as_ref().unwrap().pos;
@@ -3506,8 +4167,188 @@ mod tests {
         );
         now += 0.1;
         app.tick(now);
-        assert!(app.chore.is_none(), "уборка прервана");
+        assert!(app.errand.is_none(), "уборка прервана");
         assert!(app.puddle.is_some(), "лужа на месте");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- H1/H2/H4: вещи мира ------------------------------------------------
+
+    /// Первая кормёжка заводит миску: она попадает в журнал (значит,
+    /// переживает рестарт и уезжает на второе устройство), а питомец
+    /// идёт есть к ней.
+    #[test]
+    fn first_feeding_places_a_bowl_that_survives_restart() {
+        let (mut app, tx, dir) = adult_app("bowl");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        let reply = send(&tx, Request::Feed { treat: false });
+        // Ждём, пока он дойдёт до миски и начнёт есть.
+        let mut eating_at = None;
+        for _ in 0..300 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if matches!(
+                app.overlay,
+                Some(Overlay {
+                    look: ActionLook::Eating,
+                    ..
+                })
+            ) {
+                eating_at = Some(app.pet.as_ref().unwrap().pos.x);
+                break;
+            }
+        }
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(
+            journal_kinds(&dir).iter().any(|k| matches!(
+                k,
+                EventKind::PropPlaced {
+                    kind: PropKind::Bowl,
+                    ..
+                }
+            )),
+            "миска записана в журнал"
+        );
+        let bowl = app
+            .prop_of(PropKind::Bowl)
+            .expect("миска на экране")
+            .clone();
+        let pet_x = eating_at.expect("питомец поел");
+        let reach = (app.sprites.size as f32 + bowl.size) / 2.0 + PROP_NEAR_PX;
+        assert!(
+            (bowl.pos.x - pet_x).abs() <= reach,
+            "ест у миски: миска {:.0}, питомец {pet_x:.0}",
+            bowl.pos.x
+        );
+
+        // Рестарт: миска на месте, второй раз не заводится.
+        let (mut app2, tx2) = app_in(&dir);
+        geometry(&mut app2);
+        assert!(
+            app2.prop_of(PropKind::Bowl).is_some(),
+            "миска пережила рестарт"
+        );
+        let placed = |dir: &Path| {
+            journal_kinds(dir)
+                .iter()
+                .filter(|k| matches!(k, EventKind::PropPlaced { .. }))
+                .count()
+        };
+        let before = placed(&dir);
+        let reply = send(&tx2, Request::Feed { treat: false });
+        let mut now2 = 0.0;
+        settle(&mut app2, &mut now2, 3.0);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert_eq!(placed(&dir), before, "вторая миска не появляется");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Вещь можно взять мышью, перенести и отпустить: она падает, ложится
+    /// и её новое место уходит в журнал.
+    #[test]
+    fn dragging_a_prop_moves_it_and_records_the_move() {
+        let (mut app, tx, dir) = adult_app("prop-drag");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        let _ = send(&tx, Request::Feed { treat: false });
+        settle(&mut app, &mut now, 3.0);
+        let bowl = app.prop_of(PropKind::Bowl).expect("миска").clone();
+        let from = Vec2::new(bowl.pos.x, bowl.pos.y - bowl.height() / 2.0);
+        let to = Vec2::new(bowl.pos.x - 400.0, bowl.pos.y - 200.0);
+
+        app.event(Event::PointerPress(from), now);
+        assert!(app.grab.is_some(), "миска в руке");
+        now += 0.05;
+        app.event(Event::PointerMotion(to), now);
+        assert_eq!(
+            app.prop_of(PropKind::Bowl).unwrap().state,
+            PropState::Held,
+            "пока держим — физика выключена"
+        );
+        now += 0.05;
+        app.event(Event::PointerRelease(to), now);
+        assert!(app.grab.is_none());
+        settle(&mut app, &mut now, 3.0);
+
+        let bowl = app.prop_of(PropKind::Bowl).unwrap();
+        assert_eq!(bowl.state, PropState::Rest, "упала и лежит");
+        assert!(bowl.pos.x < from.x - 200.0, "переехала налево");
+        assert!(
+            journal_kinds(&dir)
+                .iter()
+                .any(|k| matches!(k, EventKind::PropMoved { .. })),
+            "переезд записан в журнал"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Мяч из меню: питомец бежит за брошенным мячом, берёт его в лапки и
+    /// приносит туда, откуда его бросили.
+    #[test]
+    fn thrown_ball_is_fetched_and_brought_back() {
+        let (mut app, _tx, dir) = adult_app("fetch");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        assert_eq!(app.toggle_ball(now), Response::Ok);
+        settle(&mut app, &mut now, 2.0);
+
+        // «Бросок» рукой: берём мяч и отпускаем далеко от питомца.
+        let ball = app.prop_of(PropKind::Ball).expect("мяч").clone();
+        let grab_at = Vec2::new(ball.pos.x, ball.pos.y - ball.size / 2.0);
+        let home = grab_at;
+        let far = Vec2::new(ball.pos.x + 500.0, ball.pos.y - 40.0);
+        app.event(Event::PointerPress(grab_at), now);
+        now += 0.05;
+        app.event(Event::PointerMotion(far), now);
+        now += 0.05;
+        app.event(Event::PointerRelease(far), now);
+        app.fetch_home = Some(home.x);
+        settle(&mut app, &mut now, 12.0);
+
+        let ball = app.prop_of(PropKind::Ball).expect("мяч на месте");
+        assert!(
+            (ball.pos.x - home.x).abs() < 60.0,
+            "мяч принесён к месту броска: мяч {:.0}, бросок {:.0}",
+            ball.pos.x,
+            home.x
+        );
+        assert!(
+            journal_kinds(&dir)
+                .iter()
+                .any(|k| matches!(k, EventKind::Played)),
+            "принесённый мяч — это игра"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Лежанка — часть рельефа: её верхняя кромка попадает в опоры мира.
+    #[test]
+    fn bed_becomes_terrain_under_the_pet() {
+        let (mut app, tx, dir) = adult_app("bed-terrain");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        let reply = send(&tx, Request::PutToSleep);
+        settle(&mut app, &mut now, 3.0);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        let bed = app.prop_of(PropKind::Bed).expect("лежанка").clone();
+        let world = app.world.as_ref().unwrap();
+        assert!(
+            world.platforms.iter().any(|p| p.id == bed.id),
+            "лежанка попала в опоры мира"
+        );
+        let pet = app.pet.as_ref().unwrap();
+        assert_eq!(pet.state, PetState::Sleep, "спит");
+        assert!(
+            pet.pos.y < world.ground_y() - 1.0,
+            "спит в лежанке, а не на полу: y={:.0}, пол {:.0}",
+            pet.pos.y,
+            world.ground_y()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3996,6 +4837,7 @@ mod tests {
                 MenuAction::Feed,
                 MenuAction::Treat,
                 MenuAction::Play,
+                MenuAction::Toy,
                 MenuAction::Sleep,
                 MenuAction::Settings,
                 MenuAction::Dismiss,
@@ -4127,21 +4969,21 @@ mod tests {
             EventKind::Played
         ));
 
-        // «Уложить спать» — питомец засыпает прямо сейчас.
+        // «Уложить спать» — с фазы H2 питомец идёт в лежанку и ложится там.
         let mut now = 0.6;
         settle(&mut app, &mut now, 2.0);
         app.event(Event::PointerMenu(p), now);
-        let target = row_center(&app, 3);
+        let target = row_center(&app, 4);
         app.event(Event::PointerPress(target), now);
-        assert!(matches!(
-            journal_kinds(&dir).last().unwrap(),
-            EventKind::PutToSleep
-        ));
+        assert!(journal_kinds(&dir)
+            .iter()
+            .any(|k| matches!(k, EventKind::PutToSleep)));
+        settle(&mut app, &mut now, 3.0);
         assert_eq!(app.pet.as_ref().unwrap().state, PetState::Sleep);
 
         // «Убрать с экрана».
         app.event(Event::PointerMenu(p), now + 0.1);
-        let target = row_center(&app, 5);
+        let target = row_center(&app, 6);
         app.event(Event::PointerPress(target), now + 0.2);
         assert!(app.pet.is_none(), "Dismiss из меню убирает питомца");
         assert!(matches!(
@@ -4176,18 +5018,26 @@ mod tests {
     fn feed_shows_eating_overlay_until_expiry() {
         let (mut app, tx, dir) = adult_app("feedlook");
         geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5); // приземлился
         let reply = send(&tx, Request::Feed { treat: false });
-        app.tick(1.0);
+        settle(&mut app, &mut now, 3.0); // дошёл до миски и ест
         assert_eq!(reply.recv().unwrap(), Response::Ok);
-        assert!(matches!(
-            app.overlay,
-            Some(Overlay {
-                look: ActionLook::Eating,
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                app.overlay,
+                Some(Overlay {
+                    look: ActionLook::Eating,
+                    ..
+                })
+            ),
+            "у миски питомец ест; вещей {}, дело {:?}, состояние {:?}",
+            app.props.len(),
+            app.errand.as_ref().map(|e| e.kind),
+            app.pet.as_ref().map(|p| p.state)
+        );
         assert_eq!(app.pace(), Pace::Active, "оверлей анимируется в Active");
-        app.tick(1.0 + EATING_SECS + 0.1);
+        app.tick(now + EATING_SECS + 0.1);
         assert!(app.overlay.is_none(), "оверлей еды истёк");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4252,8 +5102,7 @@ mod tests {
         let mut now = 0.0;
         settle(&mut app, &mut now, 2.5);
         let reply = send(&tx, Request::PutToSleep);
-        now += 0.05;
-        app.tick(now);
+        settle(&mut app, &mut now, 3.0); // дошёл до лежанки и улёгся
         assert_eq!(reply.recv().unwrap(), Response::Ok);
         assert_eq!(app.pet.as_ref().unwrap().state, PetState::Sleep);
 
@@ -4286,8 +5135,7 @@ mod tests {
         let mut now = 0.0;
         settle(&mut app, &mut now, 2.5);
         let reply = send(&tx, Request::PutToSleep);
-        now += 0.05;
-        app.tick(now);
+        settle(&mut app, &mut now, 3.0); // дошёл до лежанки и улёгся
         assert_eq!(reply.recv().unwrap(), Response::Ok);
         assert_eq!(app.pet.as_ref().unwrap().state, PetState::Sleep);
 
