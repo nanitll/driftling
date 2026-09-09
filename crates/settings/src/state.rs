@@ -243,12 +243,17 @@ pub struct ActionOutcome {
 
 /// Разовая IPC-команда в короткоживущем потоке. Результат кладётся в слот,
 /// сразу после команды дёргается свежий опрос — UI не ждёт секунду.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_action(
     req: Request,
     ok_text: String,
     result: Arc<Mutex<Option<ActionOutcome>>>,
     poll: Arc<Mutex<PollState>>,
     want: Want,
+    // Счётчик летящих команд снимается ЗДЕСЬ же, в потоке команды: ждать
+    // появления результата в слоте нельзя — UI-поток забирает его первым,
+    // и ожидающий висел бы вечно, оставив кнопки выключенными навсегда.
+    inflight: Arc<Mutex<usize>>,
     ctx: egui::Context,
 ) {
     std::thread::spawn(move || {
@@ -292,6 +297,51 @@ pub fn spawn_action(
         };
         *result.lock().unwrap() = Some(outcome);
         poll_once(&poll, want.load(Ordering::Relaxed) & !FOCUS_BIT);
+        *inflight.lock().unwrap() -= 1;
         ctx.request_repaint();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Счётчик летящих команд обязан вернуться к нулю ДАЖЕ когда результат
+    /// уже забрал UI-поток. Раньше ожидающий поток крутился до появления
+    /// результата в слоте, UI забирал его первым — и кнопки оставались
+    /// выключенными навсегда.
+    #[test]
+    fn inflight_returns_to_zero_even_if_ui_took_the_result() {
+        let inflight = Arc::new(Mutex::new(1usize));
+        let result = Arc::new(Mutex::new(None));
+        let poll = Arc::new(Mutex::new(PollState::default()));
+        let want: Want = Arc::new(AtomicU8::new(0));
+        // Демона в тестах нет: команда честно вернётся ошибкой связи.
+        spawn_action(
+            Request::Status,
+            "ок".into(),
+            Arc::clone(&result),
+            poll,
+            want,
+            Arc::clone(&inflight),
+            egui::Context::default(),
+        );
+        // UI забирает результат сразу, как только он появился.
+        let mut taken = None;
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            if let Some(o) = result.lock().unwrap().take() {
+                taken = Some(o);
+                break;
+            }
+        }
+        assert!(taken.is_some(), "команда должна завершиться");
+        for _ in 0..200 {
+            if *inflight.lock().unwrap() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("счётчик команд завис — кнопки остались бы выключенными");
+    }
 }

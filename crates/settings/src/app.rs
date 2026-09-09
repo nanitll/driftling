@@ -184,23 +184,15 @@ impl SettingsApp {
     /// Отправить команду демону и показать результат уведомлением.
     pub fn command(&self, ui: &egui::Ui, req: Request, ok: String) {
         *self.inflight.lock().unwrap() += 1;
-        let inflight = Arc::clone(&self.inflight);
-        let action = Arc::clone(&self.action);
-        let poll = Arc::clone(&self.poll);
-        let want = Arc::clone(&self.want);
-        let ctx = ui.ctx().clone();
-        std::thread::spawn(move || {
-            state::spawn_action(req, ok, Arc::clone(&action), poll, want, ctx);
-            // Ждём, пока slot заполнится: spawn_action сам работает в
-            // потоке, поэтому здесь только снимаем счётчик «в полёте».
-            loop {
-                std::thread::sleep(Duration::from_millis(30));
-                if action.lock().unwrap().is_some() {
-                    break;
-                }
-            }
-            *inflight.lock().unwrap() -= 1;
-        });
+        state::spawn_action(
+            req,
+            ok,
+            Arc::clone(&self.action),
+            Arc::clone(&self.poll),
+            Arc::clone(&self.want),
+            Arc::clone(&self.inflight),
+            ui.ctx().clone(),
+        );
     }
 
     /// Идут ли сейчас команды: пока идут, кнопки не принимают повторных
