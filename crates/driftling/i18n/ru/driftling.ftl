@@ -11,6 +11,9 @@ cli-about-info = Карточка питомца: имя, стадия, стат
 cli-about-feed = Покормить питомца (обычная еда)
 cli-about-feed-treat = Дать вкусняшку (настроение выше; злоупотребление бьёт по здоровью)
 cli-about-play = Поиграть с питомцем
+cli-about-ride = Прокатить питомца (без вида — случайный транспорт)
+cli-about-ride-kind = Вид транспорта: skate, bike, moped, car, copter, plane
+daemon-unknown-vehicle = Неизвестный транспорт «{ $value }». Есть: { $known }
 cli-about-sleep = Уложить питомца спать
 cli-about-rename = Переименовать питомца
 cli-about-recolor = Перекрасить питомца (hex-цвет #rrggbb, например e8944a)
@@ -109,6 +112,7 @@ daemon-reply-timeout = демон не ответил вовремя
 daemon-output-not-ready = выход ещё не готов (нет геометрии)
 daemon-journal-append-failed = событие ухода не записано в журнал: { $error }
 daemon-rename-empty = имя не может быть пустым
+daemon-pet-busy = Питомец сейчас занят
 daemon-config-unreadable = config.toml не прочитан: { $error }
 
 # --- Трей (B7) ---
@@ -123,6 +127,7 @@ menu-feed = Покормить
 menu-treat = Вкусняшка
 menu-play = Поиграть
 menu-toy = Мяч
+menu-ride = Прокатиться
 menu-sleep = Уложить спать
 menu-settings = Настройки
 menu-dismiss = Убрать с экрана

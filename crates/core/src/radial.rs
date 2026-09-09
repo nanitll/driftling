@@ -32,6 +32,8 @@ pub enum Icon {
     Ball,
     /// Лапка — поиграть с питомцем.
     Paw,
+    /// Колесо — прокатиться на транспорте.
+    Wheel,
     /// Месяц — уложить спать.
     Moon,
     /// Шестерёнка — настройки.
@@ -524,6 +526,20 @@ fn draw_icon(frame: &mut Frame, icon: Icon, c: Vec2, s: f32, accent: u32) {
                 );
             }
         }
+        Icon::Wheel => {
+            ring(frame, c, s, s * 0.26, accent, 1.0);
+            for i in 0..4 {
+                let a = i as f32 * core::f32::consts::TAU / 4.0 + 0.4;
+                line(
+                    frame,
+                    c,
+                    Vec2::new(c.x + a.cos() * s * 0.9, c.y + a.sin() * s * 0.9),
+                    s * 0.18,
+                    accent,
+                );
+            }
+            disc(frame, c, s * 0.26, accent, 1.0);
+        }
         Icon::Moon => {
             crescent(
                 frame,
@@ -726,6 +742,7 @@ mod tests {
             (Icon::Candy, "Вкусняшка"),
             (Icon::Paw, "Поиграть"),
             (Icon::Ball, "Мяч"),
+            (Icon::Wheel, "Прокатиться"),
             (Icon::Moon, "Уложить спать"),
             (Icon::Gear, "Настройки"),
             (Icon::Cross, "Убрать"),

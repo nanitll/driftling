@@ -30,7 +30,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
         [_, m, o]
-            if ["sheets", "icons", "surfaces", "radial", "body", "props"].contains(&m.as_str()) =>
+            if [
+                "sheets", "icons", "surfaces", "radial", "body", "props", "rides",
+            ]
+            .contains(&m.as_str()) =>
         {
             (m.as_str(), Path::new(o))
         }
@@ -55,6 +58,7 @@ fn main() {
         "radial" => radial(pack, out),
         "body" => body(pack, out),
         "props" => props(pack, out),
+        "rides" => rides(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -416,6 +420,65 @@ fn props(pack: &Pack, out: &Path) {
     c.blit(&walk[0], (bx - 120.0) as u32, (ground - PET as f32) as u32);
     c.save(&out.join("props.png"));
     println!("пруф вещей записан в {}", out.display());
+}
+
+/// Дев-пруф фазы H5: весь транспорт с питомцем в седле.
+fn rides(pack: &Pack, out: &Path) {
+    use driftling_core::effects::vehicle_frame;
+    use driftling_core::palette::{darken, lighten};
+    use driftling_core::prop::{Prop, PropKind};
+    use driftling_core::{Deform, Vec2};
+    const PET: u32 = 96;
+    let color = DEFAULT_PET_COLOR;
+    let idle = pack.frames(Stage::Adult, "idle", PET, color);
+    let (cols, rows) = (3u32, 2u32);
+    let (cw, ch) = (300u32, 190u32);
+    let mut c = Canvas::new(cols * cw, rows * ch, DARK_BG);
+    for (i, kind) in PropKind::VEHICLES.iter().enumerate() {
+        let v = kind.vehicle().unwrap();
+        let (col, row) = (i as u32 % cols, i as u32 / cols);
+        let (ox, oy) = ((col * cw) as f32, (row * ch) as f32);
+        let ground = oy + ch as f32 - 30.0;
+        let width = (PET as f32 * kind.class().size_scale) as u32;
+        let frame = vehicle_frame(*kind, width, darken(color, 0.8), lighten(color, 1.2));
+        let prop = Prop::new(
+            1,
+            *kind,
+            Vec2::new(ox + cw as f32 / 2.0, ground),
+            PET as f32,
+        );
+        let b = prop.bounds();
+        let pet_y = b.y + b.h * v.seat - PET as f32;
+        let draw_pet = |c: &mut Canvas| {
+            c.blit(
+                &idle[0],
+                (b.x + b.w / 2.0 - PET as f32 / 2.0) as u32,
+                pet_y.max(oy) as u32,
+            );
+        };
+        let draw_ride = |c: &mut Canvas| {
+            c.blit_deformed(
+                &frame,
+                Vec2::new(b.x, b.y),
+                Deform {
+                    scale_x: b.w / frame.w as f32,
+                    scale_y: b.h / frame.h as f32,
+                    ..Deform::NONE
+                },
+                1.0,
+            );
+        };
+        // В автомобиле и в кабине питомца видно ЗА кузовом.
+        if v.rider_behind {
+            draw_pet(&mut c);
+            draw_ride(&mut c);
+        } else {
+            draw_ride(&mut c);
+            draw_pet(&mut c);
+        }
+    }
+    c.save(&out.join("rides.png"));
+    println!("пруф транспорта записан в {}", out.display());
 }
 
 fn radial(pack: &Pack, out: &Path) {

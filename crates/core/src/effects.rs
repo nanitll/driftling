@@ -271,6 +271,148 @@ pub fn ball_frame(d: u32, body: u32, stripe: u32) -> Frame {
     frame
 }
 
+/// Транспорт (фаза H5): вид сбоку, смотрит вправо. Кадр рисуется под
+/// класс предмета (ширина и пропорции — в [`crate::prop::PropKind::class`]),
+/// поэтому здесь только силуэт.
+///
+/// Арт процедурный: транспорт должен появиться на любом цвете питомца и в
+/// любом размере, а рисованных семейств в паке под каждую машинку нет.
+pub fn vehicle_frame(kind: crate::prop::PropKind, w: u32, body: u32, accent: u32) -> Frame {
+    use crate::prop::PropKind as K;
+    let class = kind.class();
+    let w = w.max(16);
+    let h = ((w as f32 * class.aspect) as u32).max(6);
+    let mut frame = blank(w, h);
+    let (fw, fh) = (w as f32, h as f32);
+    let dark = crate::palette::darken(body, 0.45);
+    let light = crate::palette::lighten(body, 1.3);
+    let glass = crate::palette::lighten(accent, 1.5);
+
+    let rect = |f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32, c: u32| {
+        for y in (y0.max(0.0) as u32)..=((y1.min(fh - 1.0)) as u32) {
+            for x in (x0.max(0.0) as u32)..=((x1.min(fw - 1.0)) as u32) {
+                put(f, x, y, c, 1.0);
+            }
+        }
+    };
+    let wheel = |f: &mut Frame, cx: f32, cy: f32, r: f32| {
+        disc(f, Vec2::new(cx, cy), r, dark, 1.0);
+        disc(f, Vec2::new(cx, cy), r * 0.38, light, 1.0);
+    };
+    match kind {
+        K::Skate => {
+            rect(&mut frame, 0.0, fh * 0.1, fw - 1.0, fh * 0.45, body);
+            wheel(&mut frame, fw * 0.22, fh * 0.72, fh * 0.26);
+            wheel(&mut frame, fw * 0.78, fh * 0.72, fh * 0.26);
+        }
+        K::Bike => {
+            let r = fh * 0.34;
+            wheel(&mut frame, fw * 0.2, fh - r - 1.0, r);
+            wheel(&mut frame, fw * 0.8, fh - r - 1.0, r);
+            // Рама и руль.
+            rect(&mut frame, fw * 0.2, fh * 0.42, fw * 0.8, fh * 0.52, accent);
+            rect(&mut frame, fw * 0.42, fh * 0.2, fw * 0.5, fh * 0.5, accent);
+            rect(&mut frame, fw * 0.74, fh * 0.14, fw * 0.86, fh * 0.24, dark);
+            rect(&mut frame, fw * 0.36, fh * 0.16, fw * 0.52, fh * 0.24, body);
+        }
+        K::Moped => {
+            let r = fh * 0.28;
+            wheel(&mut frame, fw * 0.22, fh - r - 1.0, r);
+            wheel(&mut frame, fw * 0.8, fh - r - 1.0, r);
+            rect(
+                &mut frame,
+                fw * 0.16,
+                fh * 0.44,
+                fw * 0.86,
+                fh * 0.68,
+                accent,
+            );
+            rect(&mut frame, fw * 0.3, fh * 0.28, fw * 0.6, fh * 0.46, body);
+            rect(&mut frame, fw * 0.74, fh * 0.16, fw * 0.9, fh * 0.28, dark);
+        }
+        K::Car => {
+            // Кабриолет: крыши нет — питомца видно целиком, а кузов
+            // закрывает ему ноги (он рисуется ЗА кузовом).
+            let r = fh * 0.26;
+            rect(&mut frame, 0.0, fh * 0.52, fw - 1.0, fh - r * 0.9, body);
+            // Капот и багажник чуть ниже линии борта.
+            rect(&mut frame, fw * 0.72, fh * 0.44, fw - 1.0, fh * 0.56, body);
+            rect(&mut frame, 0.0, fh * 0.46, fw * 0.24, fh * 0.56, body);
+            // Лобовое стекло и фара.
+            rect(&mut frame, fw * 0.62, fh * 0.2, fw * 0.68, fh * 0.52, glass);
+            rect(&mut frame, fw * 0.94, fh * 0.5, fw - 1.0, fh * 0.58, light);
+            wheel(&mut frame, fw * 0.24, fh - r - 1.0, r);
+            wheel(&mut frame, fw * 0.76, fh - r - 1.0, r);
+        }
+        K::Copter => {
+            // Кабина внизу, хвост назад, мачта и лопасти над головой седока.
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.38, fh * 0.72),
+                fh * 0.26,
+                body,
+                1.0,
+            );
+            rect(&mut frame, fw * 0.38, fh * 0.66, fw * 0.92, fh * 0.76, body);
+            rect(
+                &mut frame,
+                fw * 0.86,
+                fh * 0.44,
+                fw * 0.94,
+                fh * 0.74,
+                accent,
+            );
+            // Лыжи.
+            rect(&mut frame, fw * 0.18, fh * 0.94, fw * 0.62, fh - 1.0, dark);
+            // Мачта и лопасти — над питомцем, поэтому у самой верхней кромки.
+            rect(&mut frame, fw * 0.36, fh * 0.08, fw * 0.42, fh * 0.62, dark);
+            rect(&mut frame, fw * 0.02, fh * 0.02, fw * 0.8, fh * 0.08, dark);
+            let _ = glass;
+        }
+        K::Plane => {
+            // Фюзеляж с носом, крыло под ним, киль сзади и винт спереди.
+            rect(&mut frame, fw * 0.1, fh * 0.5, fw * 0.9, fh * 0.72, body);
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.9, fh * 0.61),
+                fh * 0.11,
+                body,
+                1.0,
+            );
+            rect(
+                &mut frame,
+                fw * 0.28,
+                fh * 0.72,
+                fw * 0.72,
+                fh * 0.86,
+                accent,
+            );
+            // Киль и стабилизатор — сзади (самолёт смотрит вправо).
+            rect(
+                &mut frame,
+                fw * 0.08,
+                fh * 0.28,
+                fw * 0.2,
+                fh * 0.54,
+                accent,
+            );
+            rect(
+                &mut frame,
+                fw * 0.04,
+                fh * 0.5,
+                fw * 0.24,
+                fh * 0.58,
+                accent,
+            );
+            // Винт.
+            rect(&mut frame, fw * 0.95, fh * 0.36, fw * 0.99, fh * 0.86, dark);
+        }
+        // Не транспорт — пустой кадр вместо паники: вызывающий сам решил.
+        _ => {}
+    }
+    frame
+}
+
 fn blank(w: u32, h: u32) -> Frame {
     Frame {
         w,

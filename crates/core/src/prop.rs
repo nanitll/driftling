@@ -37,6 +37,38 @@ pub enum PropKind {
     Ball,
     /// Домик: свой угол. В нём прячутся, спят и из него выходят здороваться.
     House,
+    /// Скейт: самый простой транспорт, катится по полу.
+    Skate,
+    /// Велосипед: быстрее скейта, у края тормозит.
+    Bike,
+    /// Мопед: ещё быстрее, с дымком.
+    Moped,
+    /// Автомобиль: питомца видно в окне.
+    Car,
+    /// Вертолёт: свободный полёт с зависанием.
+    Copter,
+    /// Самолёт: полёт по дуге через весь экран.
+    Plane,
+}
+
+/// Профиль транспорта (фаза H5): чем он отличается от остальных.
+/// Управление питомцу не нужно — он катается сам; транспорт это зрелище,
+/// а не способ быстрее двигаться по экрану.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vehicle {
+    /// Скорость хода, м/с «в жизни» (переводится через [`crate::body`]).
+    pub speed_mps: f32,
+    /// Летает (иначе катится по полу).
+    pub air: bool,
+    /// Сколько катается, сек (от и до).
+    pub ride_secs: (f32, f32),
+    /// Где сидит питомец: доля высоты транспорта от его верхней кромки
+    /// (0 — на самом верху, 1 — у земли).
+    pub seat: f32,
+    /// Амплитуда покачивания на ходу, доля высоты питомца.
+    pub bob: f32,
+    /// Питомца видно ЗА кузовом (автомобиль: он в окне).
+    pub rider_behind: bool,
 }
 
 /// Неизменные свойства вида предмета.
@@ -112,6 +144,37 @@ impl PropKind {
                 restitution: 0.02,
                 throwable: false,
             },
+            // Транспорт: не хранится в журнале (это событие, а не быт),
+            // мышью не таскается — питомец сам на него садится.
+            PropKind::Skate
+            | PropKind::Bike
+            | PropKind::Moped
+            | PropKind::Car
+            | PropKind::Copter
+            | PropKind::Plane => PropClass {
+                anchor: Surface::Floor,
+                size_scale: match self {
+                    PropKind::Car => 1.9,
+                    PropKind::Plane => 2.5,
+                    PropKind::Copter => 2.0,
+                    PropKind::Moped => 1.4,
+                    PropKind::Bike => 1.3,
+                    _ => 1.1,
+                },
+                aspect: match self {
+                    PropKind::Skate => 0.28,
+                    PropKind::Plane => 0.5,
+                    PropKind::Copter => 0.62,
+                    PropKind::Car => 0.55,
+                    _ => 0.6,
+                },
+                density_scale: 1.2,
+                draggable: false,
+                solid: false,
+                persist: false,
+                restitution: 0.05,
+                throwable: false,
+            },
             PropKind::Ball => PropClass {
                 anchor: Surface::Floor,
                 size_scale: 0.38,
@@ -127,6 +190,74 @@ impl PropKind {
         }
     }
 
+    /// Профиль транспорта; None — это не транспорт.
+    pub fn vehicle(self) -> Option<Vehicle> {
+        let v = match self {
+            PropKind::Mop | PropKind::Bowl | PropKind::Bed | PropKind::Ball | PropKind::House => {
+                return None
+            }
+            PropKind::Skate => Vehicle {
+                speed_mps: 1.6,
+                air: false,
+                ride_secs: (14.0, 24.0),
+                seat: 0.22,
+                bob: 0.04,
+                rider_behind: false,
+            },
+            PropKind::Bike => Vehicle {
+                speed_mps: 2.2,
+                air: false,
+                ride_secs: (16.0, 28.0),
+                seat: 0.36,
+                bob: 0.05,
+                rider_behind: false,
+            },
+            PropKind::Moped => Vehicle {
+                speed_mps: 3.2,
+                air: false,
+                ride_secs: (16.0, 26.0),
+                seat: 0.42,
+                bob: 0.03,
+                rider_behind: false,
+            },
+            PropKind::Car => Vehicle {
+                speed_mps: 2.8,
+                air: false,
+                ride_secs: (18.0, 30.0),
+                seat: 0.86,
+                bob: 0.02,
+                rider_behind: true,
+            },
+            PropKind::Copter => Vehicle {
+                speed_mps: 2.4,
+                air: true,
+                ride_secs: (20.0, 34.0),
+                seat: 0.62,
+                bob: 0.06,
+                rider_behind: false,
+            },
+            PropKind::Plane => Vehicle {
+                speed_mps: 4.5,
+                air: true,
+                ride_secs: (14.0, 22.0),
+                seat: 0.58,
+                bob: 0.03,
+                rider_behind: false,
+            },
+        };
+        Some(v)
+    }
+
+    /// Все виды транспорта — по этому списку он и выбирается случайно.
+    pub const VEHICLES: [PropKind; 6] = [
+        PropKind::Skate,
+        PropKind::Bike,
+        PropKind::Moped,
+        PropKind::Car,
+        PropKind::Copter,
+        PropKind::Plane,
+    ];
+
     /// Машинное имя (журнал, логи, тесты).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -135,6 +266,12 @@ impl PropKind {
             PropKind::Bed => "bed",
             PropKind::Ball => "ball",
             PropKind::House => "house",
+            PropKind::Skate => "skate",
+            PropKind::Bike => "bike",
+            PropKind::Moped => "moped",
+            PropKind::Car => "car",
+            PropKind::Copter => "copter",
+            PropKind::Plane => "plane",
         }
     }
 }
@@ -150,6 +287,8 @@ pub enum PropState {
     Held,
     /// В лапках питомца (швабра во время уборки).
     Carried,
+    /// На нём едут: позицию ведёт поездка, своей физики нет (H5).
+    Ridden,
 }
 
 /// Предмет в мире.
@@ -203,7 +342,10 @@ impl Prop {
     /// кромка окна или другой твёрдый предмет), отскок и затухание.
     /// В руке (`Held`/`Carried`) физика выключена — позицию ведёт хозяин.
     pub fn tick(&mut self, world: &World, cfg: &BehaviorConfig, dt: f32) {
-        if matches!(self.state, PropState::Held | PropState::Carried) {
+        if matches!(
+            self.state,
+            PropState::Held | PropState::Carried | PropState::Ridden
+        ) {
             return;
         }
         let class = self.kind.class();

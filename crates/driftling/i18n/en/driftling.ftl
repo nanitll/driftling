@@ -12,6 +12,9 @@ cli-about-info = Pet card: name, stage, stats, characteristics
 cli-about-feed = Feed the pet (regular food)
 cli-about-feed-treat = Give a treat instead (mood up; overuse hurts health)
 cli-about-play = Play with the pet
+cli-about-ride = Take the pet for a ride (random vehicle if omitted)
+cli-about-ride-kind = Vehicle: skate, bike, moped, car, copter, plane
+daemon-unknown-vehicle = Unknown vehicle "{ $value }". Available: { $known }
 cli-about-sleep = Put the pet to sleep
 cli-about-rename = Rename the pet
 cli-about-recolor = Recolor the pet (hex color #rrggbb, e.g. e8944a)
@@ -108,6 +111,7 @@ daemon-reply-timeout = the daemon did not reply in time
 daemon-output-not-ready = the output is not ready yet (no geometry)
 daemon-journal-append-failed = the care event was not written to the journal: { $error }
 daemon-rename-empty = the name must not be empty
+daemon-pet-busy = The pet is busy right now
 daemon-config-unreadable = config.toml could not be read: { $error }
 
 # --- tray (B7) ---
@@ -122,6 +126,7 @@ menu-feed = Feed
 menu-treat = Treat
 menu-play = Play
 menu-toy = Ball
+menu-ride = Ride
 menu-sleep = Put to sleep
 menu-settings = Settings
 menu-dismiss = Remove from screen

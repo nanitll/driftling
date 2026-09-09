@@ -146,6 +146,13 @@ const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
 const CHORE_WALK_SPEED: f32 = 90.0;
 
+/// Как часто (в секундах покоя) питомцу может САМОМУ приехать транспорт.
+const RIDE_CHECK_SECS: f64 = 900.0;
+/// Скорость подхода к транспорту.
+const RIDE_WALK_SPEED: f32 = 110.0;
+/// Высота полёта воздушного транспорта над полом, доли высоты экрана.
+const RIDE_ALT: (f32, f32) = (0.25, 0.6);
+
 /// Возраст питомца, с которого у него появляется свой домик, суток.
 const HOUSE_AGE_DAYS: f64 = 3.0;
 /// Ближе этого к краю экрана домик прилипает к стене (в его ширинах).
@@ -574,6 +581,18 @@ struct Grab {
     vel: Vec2,
 }
 
+/// Поездка (фаза H5): питомец в седле, транспорт ведёт демон.
+struct Ride {
+    prop: u64,
+    kind: PropKind,
+    /// До какого момента катается.
+    until: f64,
+    /// Куда едет: -1 влево, +1 вправо.
+    dir: f32,
+    /// Высота над полом для воздушного транспорта, px.
+    alt: f32,
+}
+
 /// Кадры вещей: пекутся под размер питомца вместе с прочими эффектами.
 struct PropArt {
     bowl: Frame,
@@ -606,8 +625,9 @@ impl PropArt {
             PropKind::House => &self.house,
             PropKind::Bed => &self.bed,
             PropKind::Ball => &self.ball,
-            // Швабра рисуется в лапках питомца отдельным кадром.
-            PropKind::Mop => return None,
+            // Швабра рисуется в лапках питомца отдельным кадром,
+            // транспорт печётся отдельно (ride_art).
+            _ => return None,
         };
         (!f.argb.is_empty()).then_some(f)
     }
@@ -727,17 +747,20 @@ enum MenuAction {
     Play,
     /// Достать/убрать мяч (фаза H4).
     Toy,
+    /// Прокатиться на случайном транспорте (фаза H5).
+    Ride,
     Sleep,
     Settings,
     Dismiss,
 }
 
 /// Порядок действий = порядок строк меню (B3).
-const MENU_ACTIONS: [MenuAction; 7] = [
+const MENU_ACTIONS: [MenuAction; 8] = [
     MenuAction::Feed,
     MenuAction::Treat,
     MenuAction::Play,
     MenuAction::Toy,
+    MenuAction::Ride,
     MenuAction::Sleep,
     MenuAction::Settings,
     MenuAction::Dismiss,
@@ -750,6 +773,7 @@ fn menu_rows() -> Vec<String> {
         fl!("menu-treat"),
         fl!("menu-play"),
         fl!("menu-toy"),
+        fl!("menu-ride"),
         fl!("menu-sleep"),
         fl!("menu-settings"),
         fl!("menu-dismiss"),
@@ -757,11 +781,12 @@ fn menu_rows() -> Vec<String> {
 }
 
 /// Иконки кнопок меню, в порядке [`MENU_ACTIONS`].
-const MENU_ICONS: [radial::Icon; 7] = [
+const MENU_ICONS: [radial::Icon; 8] = [
     radial::Icon::Cookie,
     radial::Icon::Candy,
     radial::Icon::Paw,
     radial::Icon::Ball,
+    radial::Icon::Wheel,
     radial::Icon::Moon,
     radial::Icon::Gear,
     radial::Icon::Cross,
@@ -1073,6 +1098,12 @@ struct DaemonApp {
     indoors_polite: bool,
     /// Следующая проверка «не зайти ли домой».
     home_check_at: f64,
+    /// Текущая поездка (H5).
+    riding: Option<Ride>,
+    /// Кадры транспорта под текущий размер питомца (по виду).
+    ride_art: BTreeMap<&'static str, Frame>,
+    /// Следующая проверка «не подать ли транспорт самому».
+    ride_check_at: f64,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1235,6 +1266,9 @@ impl DaemonApp {
             indoors: None,
             indoors_polite: false,
             home_check_at: HOUSE_IDLE_SECS,
+            riding: None,
+            ride_art: BTreeMap::new(),
+            ride_check_at: RIDE_CHECK_SECS,
         }
     }
 
@@ -1673,6 +1707,8 @@ impl DaemonApp {
                 palette::darken(self.sprite_color, 0.5),
             ),
         };
+        // Кадры транспорта пекутся под конкретную поездку — сбрасываем.
+        self.ride_art.clear();
         // Питомец подрос — вещи растут вместе с ним.
         for prop in &mut self.props {
             prop.size = (size as f32 * prop.kind.class().size_scale).max(6.0);
@@ -1994,6 +2030,179 @@ impl DaemonApp {
         }
     }
 
+    /// Кадр вещи: быт — из [`PropArt`], транспорт — из своего кэша.
+    fn prop_frame(&self, kind: PropKind) -> Option<&Frame> {
+        if kind.vehicle().is_some() {
+            return self
+                .ride_art
+                .get(kind.as_str())
+                .filter(|f| !f.argb.is_empty());
+        }
+        self.prop_art.frame(kind)
+    }
+
+    /// Подать транспорт (меню «Прокатиться», `ctl ride`). Повторный вызов
+    /// во время поездки — слезть: кнопка работает как переключатель.
+    fn summon_ride(&mut self, kind: Option<PropKind>, now: f64) -> Response {
+        if self.riding.is_some() {
+            self.end_ride(now);
+            return Response::Ok;
+        }
+        if !self.pet_afoot() || self.indoors.is_some() {
+            return Response::Error(fl!("daemon-pet-busy"));
+        }
+        let Some(world) = &self.world else {
+            return Response::Error(fl!("daemon-output-not-ready"));
+        };
+        // Случайный вид: транспорт — сюрприз, а не пункт прайс-листа.
+        let kind = kind.unwrap_or_else(|| {
+            let i = (noise(now * 11.3).abs() * PropKind::VEHICLES.len() as f64) as usize;
+            PropKind::VEHICLES[i.min(PropKind::VEHICLES.len() - 1)]
+        });
+        let size = self.sprites.size as f32;
+        let width = (size * kind.class().size_scale) as u32;
+        let frame = driftling_core::effects::vehicle_frame(
+            kind,
+            width,
+            palette::darken(self.sprite_color, 0.8),
+            palette::lighten(self.sprite_color, 1.25),
+        );
+        self.ride_art.insert(kind.as_str(), frame);
+        // Подаётся с той стороны, где больше места.
+        let pet_x = self.pet.as_ref().map_or(0.0, |p| p.pos.x);
+        let dir = if pet_x - world.screen.x > world.screen.right() - pet_x {
+            -1.0
+        } else {
+            1.0
+        };
+        let x = (pet_x + dir * size * 1.8).clamp(
+            world.screen.x + width as f32 / 2.0,
+            world.screen.right() - width as f32 / 2.0,
+        );
+        let id = self.next_prop_id;
+        self.next_prop_id += 1;
+        self.props
+            .push(Prop::new(id, kind, Vec2::new(x, world.ground_y()), size));
+        self.drop_errand();
+        let mut errand = Errand::new(ErrandKind::Ride, x, 0.0);
+        errand.prop = Some(id);
+        self.errand = Some(errand);
+        log::info!("транспорт: питомцу подан {}", kind.as_str());
+        Response::Ok
+    }
+
+    /// Сесть в седло: дальше транспорт ведёт демон.
+    fn mount_ride(&mut self, id: u64, now: f64) {
+        let Some(prop) = self.props.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        let kind = prop.kind;
+        let Some(v) = kind.vehicle() else {
+            return;
+        };
+        prop.state = PropState::Ridden;
+        let secs = v.ride_secs.0 + (v.ride_secs.1 - v.ride_secs.0) * noise(now * 5.3).abs() as f32;
+        let dir = self.pet.as_ref().map_or(1.0, |p| p.facing.sign());
+        self.riding = Some(Ride {
+            prop: id,
+            kind,
+            until: now + secs as f64,
+            dir,
+            alt: 0.0,
+        });
+        self.happy_until = Some(now + HAPPY_PLAY_SECS);
+        log::info!("транспорт: поехали на {} ({secs:.0} с)", kind.as_str());
+    }
+
+    /// Слезть: питомец падает на пол, транспорт уезжает (с облачком пыли).
+    fn end_ride(&mut self, now: f64) {
+        let Some(ride) = self.riding.take() else {
+            return;
+        };
+        let at = self
+            .props
+            .iter()
+            .find(|p| p.id == ride.prop)
+            .map(|p| Vec2::new(p.pos.x, p.pos.y));
+        self.props.retain(|p| p.id != ride.prop);
+        if let Some(at) = at {
+            self.spawn_puffs(at, 3, 0.9, now);
+        }
+        if let Some(pet) = &mut self.pet {
+            pet.state = PetState::Falling;
+            pet.state_time = 0.0;
+        }
+        log::info!("транспорт: {} уехал", ride.kind.as_str());
+    }
+
+    /// Ход поездки: транспорт едет сам, питомец сидит в седле.
+    fn ride_tick(&mut self, now: f64, dt: f32) {
+        // Изредка транспорт приезжает сам — как сюрприз, не по расписанию.
+        if self.riding.is_none() && now >= self.ride_check_at {
+            self.ride_check_at = now + RIDE_CHECK_SECS;
+            let calm = self.menu.is_none()
+                && self.errand.is_none()
+                && self.overlay.is_none()
+                && self.indoors.is_none()
+                && now - self.last_touch >= 60.0;
+            if calm && self.pet_afoot() && noise(now * 2.7) > 0.55 {
+                let _ = self.summon_ride(None, now);
+            }
+        }
+        let Some(ride) = &mut self.riding else {
+            return;
+        };
+        let (Some(world), Some(v)) = (&self.world, ride.kind.vehicle()) else {
+            return;
+        };
+        let cfg = self
+            .pet
+            .as_ref()
+            .map(|p| p.config().clone())
+            .unwrap_or_default();
+        let speed = cfg.body.mps_to_px(v.speed_mps);
+        let done = now >= ride.until;
+        // Воздушный транспорт набирает высоту и перед высадкой садится.
+        let cruise = world.screen.h * (RIDE_ALT.0 + (RIDE_ALT.1 - RIDE_ALT.0) * 0.5);
+        let target = if !v.air || done { 0.0 } else { cruise };
+        ride.alt += (target - ride.alt) * (1.5 * dt).min(1.0);
+        let (dir, alt) = (ride.dir, ride.alt);
+        let Some(prop) = self.props.iter_mut().find(|p| p.id == ride.prop) else {
+            self.riding = None;
+            return;
+        };
+        prop.pos.x += dir * speed * dt;
+        // У края разворачивается: экран — это дорога с двумя тупиками.
+        let margin = prop.size * 0.55;
+        if prop.pos.x < world.screen.x + margin {
+            prop.pos.x = world.screen.x + margin;
+            ride.dir = 1.0;
+        } else if prop.pos.x > world.screen.right() - margin {
+            prop.pos.x = world.screen.right() - margin;
+            ride.dir = -1.0;
+        }
+        let ground = physics::support_below(world, prop.pos.x, world.screen.y - 1.0);
+        prop.pos.y = ground - alt;
+        let (seat_y, prop_x) = (prop.bounds().y + prop.height() * v.seat, prop.pos.x);
+        // Питомец в седле: подпрыгивает на ходу вместе с транспортом.
+        let bob = (now * 9.0).sin() as f32 * v.bob * self.sprites.size as f32;
+        if let Some(pet) = &mut self.pet {
+            pet.pos.x = prop_x;
+            pet.pos.y = seat_y + bob;
+            pet.surface = Surface::Floor;
+            pet.state = PetState::Idle;
+            pet.state_left = 1.0;
+            pet.facing = if dir < 0.0 {
+                Direction::Left
+            } else {
+                Direction::Right
+            };
+        }
+        if done && (!v.air || alt < 6.0) {
+            self.end_ride(now);
+        }
+    }
+
     /// Физика вещей: рука человека, падение, рельеф из твёрдых вещей и
     /// запись переезда постоянной вещи в журнал.
     fn props_tick(&mut self, now: f64, dt: f32) {
@@ -2161,6 +2370,7 @@ impl DaemonApp {
             return;
         };
         let speed = match errand.kind {
+            ErrandKind::Ride => RIDE_WALK_SPEED,
             ErrandKind::Fetch | ErrandKind::Carry => FETCH_SPEED,
             _ => CHORE_WALK_SPEED,
         };
@@ -2205,7 +2415,7 @@ impl DaemonApp {
             ErrandKind::Fetch | ErrandKind::Carry => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
-            ErrandKind::Enter | ErrandKind::Eat | ErrandKind::Nap => errand
+            ErrandKind::Ride | ErrandKind::Enter | ErrandKind::Eat | ErrandKind::Nap => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
         }
@@ -2305,6 +2515,12 @@ impl DaemonApp {
                         self.happy_until = Some(now + HAPPY_PET_SECS);
                     }
                     _ => {}
+                }
+            }
+            // Дошёл до транспорта — садится.
+            ErrandKind::Ride => {
+                if let Some(id) = errand.prop {
+                    self.mount_ride(id, now);
                 }
             }
             // Дошёл до двери — скрылся в домике.
@@ -2417,6 +2633,7 @@ impl DaemonApp {
             MenuAction::Treat => self.feed(true, now),
             MenuAction::Play => self.play(now),
             MenuAction::Toy => self.toggle_ball(now),
+            MenuAction::Ride => self.summon_ride(None, now),
             MenuAction::Sleep => self.put_to_sleep(now),
             MenuAction::Settings => {
                 spawn_settings_detached();
@@ -2795,6 +3012,27 @@ impl DaemonApp {
             Request::Feed { treat } => self.feed(treat, now),
             Request::Play => self.play(now),
             Request::PutToSleep => self.put_to_sleep(now),
+            Request::Ride { kind } => {
+                let kind = match kind {
+                    None => None,
+                    Some(name) => match PropKind::VEHICLES
+                        .iter()
+                        .find(|k| k.as_str() == name.to_lowercase())
+                    {
+                        Some(k) => Some(*k),
+                        None => {
+                            let all: Vec<&str> =
+                                PropKind::VEHICLES.iter().map(|k| k.as_str()).collect();
+                            return Response::Error(fl!(
+                                "daemon-unknown-vehicle",
+                                value = name,
+                                known = all.join(", ")
+                            ));
+                        }
+                    },
+                };
+                self.summon_ride(kind, now)
+            }
             Request::Rename(name) => {
                 let name = name.trim().to_string();
                 if name.is_empty() {
@@ -3424,9 +3662,9 @@ impl App for DaemonApp {
         let dt = (now - self.last_now.unwrap_or(now)).clamp(0.0, 1.5) as f32;
         self.last_now = Some(now);
 
-        if self.indoors.is_some() {
-            // Питомец в домике (H3): физика ему сейчас не нужна — он там
-            // сидит, пока не выйдет сам или пока не кончится fullscreen.
+        if self.indoors.is_some() || self.riding.is_some() {
+            // Питомец в домике (H3) или в седле (H5): физика ему сейчас не
+            // нужна — его ведёт домик или транспорт.
         } else if self.presence_anim.is_some() {
             // Пробежка присутствия (фаза E): демон ведёт питомца сам.
             self.presence_anim_tick(dt, now);
@@ -3457,9 +3695,11 @@ impl App for DaemonApp {
         // Вещи мира (H1): физика, рука человека, рельеф из твёрдых вещей.
         self.props_tick(now, dt);
         // Дела питомца (H1): уборка, миска, лежанка, мяч.
-        if self.indoors.is_none() {
+        if self.indoors.is_none() && self.riding.is_none() {
             self.errand_tick(now, dt);
         }
+        // Поездка (H5): транспорт едет сам и везёт питомца.
+        self.ride_tick(now, dt);
         // Домашняя жизнь (H3): уйти домой, выйти из домика.
         self.house_tick(now);
 
@@ -3548,8 +3788,15 @@ impl App for DaemonApp {
                 }
                 // Вещи мира (H1): лежат позади питомца, каждая со своей
                 // тенью на опоре — тем же приёмом, что и тень питомца.
-                for prop in self.props.iter().filter(|p| p.state != PropState::Carried) {
-                    let Some(frame) = self.prop_art.frame(prop.kind) else {
+                let in_front = |p: &Prop| {
+                    p.state == PropState::Ridden && p.kind.vehicle().is_some_and(|v| v.rider_behind)
+                };
+                for prop in self
+                    .props
+                    .iter()
+                    .filter(|p| p.state != PropState::Carried && !in_front(p))
+                {
+                    let Some(frame) = self.prop_frame(prop.kind) else {
                         continue;
                     };
                     let b = prop.bounds();
@@ -3665,9 +3912,14 @@ impl App for DaemonApp {
                         });
                     }
                 }
-                // Вещь в лапках — поверх питомца: он держит её перед собой.
-                for prop in self.props.iter().filter(|p| p.state == PropState::Carried) {
-                    if let Some(frame) = self.prop_art.frame(prop.kind) {
+                // Вещь в лапках и кузов, за которым сидит седок, — поверх
+                // питомца (автомобиль: он в салоне).
+                for prop in self
+                    .props
+                    .iter()
+                    .filter(|p| p.state == PropState::Carried || in_front(p))
+                {
+                    if let Some(frame) = self.prop_frame(prop.kind) {
                         let b = prop.bounds();
                         sprites.push(SpriteInstance {
                             frame,
@@ -3888,7 +4140,8 @@ impl App for DaemonApp {
     /// видимы/анимируются — expire_effects и presence_anim_tick снимают
     /// их, и темп деэскалирует сам.
     fn pace(&self) -> Pace {
-        let effects_active = self.menu.is_some()
+        let effects_active = self.riding.is_some()
+            || self.menu.is_some()
             || self.overlay.is_some()
             || self.bubble.is_some()
             || self.happy_until.is_some()
@@ -4597,6 +4850,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- H5: транспорт ------------------------------------------------------
+
+    /// Питомец подходит к поданному транспорту, садится, катается и слезает;
+    /// транспорт после поездки уезжает.
+    #[test]
+    fn the_pet_mounts_a_vehicle_rides_and_gets_off() {
+        let (mut app, _tx, dir) = adult_app("ride");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        assert_eq!(app.summon_ride(Some(PropKind::Bike), now), Response::Ok);
+        assert!(app.prop_of(PropKind::Bike).is_some(), "велосипед подан");
+
+        // Доходит и садится.
+        let mut mounted = None;
+        for _ in 0..600 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app.riding.is_some() {
+                mounted = Some(now);
+                break;
+            }
+        }
+        let mounted = mounted.expect("сел на велосипед");
+        assert_eq!(
+            app.prop_of(PropKind::Bike).unwrap().state,
+            PropState::Ridden
+        );
+        assert_eq!(app.pace(), Pace::Active, "поездка анимируется");
+
+        // Едет: и питомец, и транспорт сдвинулись вместе.
+        let start = app.pet.as_ref().unwrap().pos.x;
+        settle(&mut app, &mut now, 3.0);
+        let pet_x = app.pet.as_ref().unwrap().pos.x;
+        let bike_x = app.prop_of(PropKind::Bike).unwrap().pos.x;
+        assert!(
+            (pet_x - start).abs() > 50.0,
+            "поехали: {start:.0} -> {pet_x:.0}"
+        );
+        assert!(
+            (pet_x - bike_x).abs() < 4.0,
+            "питомец в седле: он {pet_x:.0}, велосипед {bike_x:.0}"
+        );
+
+        // Поездка кончается сама, транспорт уезжает, питомец падает на пол.
+        let until = app.riding.as_ref().unwrap().until;
+        while now < until + 2.0 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+        }
+        assert!(app.riding.is_none(), "поездка кончилась");
+        assert!(app.prop_of(PropKind::Bike).is_none(), "транспорт уехал");
+        settle(&mut app, &mut now, 2.0);
+        let pet = app.pet.as_ref().unwrap();
+        let ground = app.world.as_ref().unwrap().ground_y();
+        assert!(
+            (pet.pos.y - ground).abs() < 2.0,
+            "питомец снова на полу: y={:.0}, пол {ground:.0}",
+            pet.pos.y
+        );
+        assert!(now > mounted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Воздушный транспорт поднимается над полом, а перед высадкой садится.
+    #[test]
+    fn air_vehicle_climbs_and_lands_before_dismount() {
+        let (mut app, _tx, dir) = adult_app("ride-air");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        assert_eq!(app.summon_ride(Some(PropKind::Copter), now), Response::Ok);
+        for _ in 0..900 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app.riding.is_some() {
+                break;
+            }
+        }
+        assert!(app.riding.is_some(), "сел в вертолёт");
+        settle(&mut app, &mut now, 6.0);
+        let ground = app.world.as_ref().unwrap().ground_y();
+        let pet_y = app.pet.as_ref().unwrap().pos.y;
+        assert!(
+            ground - pet_y > 100.0,
+            "вертолёт набрал высоту: питомец на y={pet_y:.0}, пол {ground:.0}"
+        );
+
+        let until = app.riding.as_ref().unwrap().until;
+        while now < until + 4.0 && app.riding.is_some() {
+            now += 1.0 / 60.0;
+            app.tick(now);
+        }
+        assert!(app.riding.is_none(), "высадился");
+        settle(&mut app, &mut now, 2.0);
+        assert!(
+            (app.pet.as_ref().unwrap().pos.y - ground).abs() < 2.0,
+            "сел на пол, а не упал с высоты"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Повторная команда «прокатиться» во время поездки высаживает питомца,
+    /// а неизвестный вид транспорта — понятная ошибка, а не паника.
+    #[test]
+    fn ride_command_toggles_and_validates() {
+        let (mut app, tx, dir) = adult_app("ride-ipc");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+
+        let reply = send(
+            &tx,
+            Request::Ride {
+                kind: Some("телепорт".into()),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert!(
+            matches!(reply.recv().unwrap(), Response::Error(_)),
+            "вида нет"
+        );
+
+        let reply = send(
+            &tx,
+            Request::Ride {
+                kind: Some("skate".into()),
+            },
+        );
+        for _ in 0..600 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app.riding.is_some() {
+                break;
+            }
+        }
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(app.riding.is_some(), "катается на скейте");
+
+        let reply = send(&tx, Request::Ride { kind: None });
+        now += 0.05;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(app.riding.is_none(), "повторная команда высаживает");
+        assert!(app.props.is_empty(), "скейт уехал");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- H3: домик ----------------------------------------------------------
 
     /// Домик появляется на третьи сутки жизни и встаёт в угол экрана —
@@ -5229,6 +5631,7 @@ mod tests {
                 MenuAction::Treat,
                 MenuAction::Play,
                 MenuAction::Toy,
+                MenuAction::Ride,
                 MenuAction::Sleep,
                 MenuAction::Settings,
                 MenuAction::Dismiss,
@@ -5364,7 +5767,7 @@ mod tests {
         let mut now = 0.6;
         settle(&mut app, &mut now, 2.0);
         app.event(Event::PointerMenu(p), now);
-        let target = row_center(&app, 4);
+        let target = row_center(&app, 5);
         app.event(Event::PointerPress(target), now);
         assert!(journal_kinds(&dir)
             .iter()
@@ -5374,7 +5777,7 @@ mod tests {
 
         // «Убрать с экрана».
         app.event(Event::PointerMenu(p), now + 0.1);
-        let target = row_center(&app, 6);
+        let target = row_center(&app, 7);
         app.event(Event::PointerPress(target), now + 0.2);
         assert!(app.pet.is_none(), "Dismiss из меню убирает питомца");
         assert!(matches!(

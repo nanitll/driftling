@@ -51,6 +51,12 @@ enum CtlAction {
         #[arg(long, help = fl!("cli-about-feed-treat"))]
         treat: bool,
     },
+    // Прокатить питомца на транспорте.
+    #[command(about = fl!("cli-about-ride"))]
+    Ride {
+        #[arg(help = fl!("cli-about-ride-kind"))]
+        kind: Option<String>,
+    },
     // Поиграть с питомцем.
     #[command(about = fl!("cli-about-play"))]
     Play,
@@ -123,6 +129,7 @@ fn main() -> Result<()> {
                 CtlAction::Feed { treat } => driftling_ipc::Request::Feed { treat },
                 CtlAction::Play => driftling_ipc::Request::Play,
                 CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
+                CtlAction::Ride { kind } => driftling_ipc::Request::Ride { kind },
                 CtlAction::Rename { name } => driftling_ipc::Request::Rename(name),
                 CtlAction::Recolor { color } => match parse_hex_color(&color) {
                     Some(argb) => driftling_ipc::Request::Recolor(argb),
