@@ -146,6 +146,32 @@ const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
 const CHORE_WALK_SPEED: f32 = 90.0;
 
+/// Как часто печатается отчёт о стоимости тиков (debug), сек.
+const PROFILE_SECS: f64 = 60.0;
+/// Тиков процессора в секунде (Linux, USER_HZ) — для честного CPU в отчёте.
+const CLK_TCK: f64 = 100.0;
+
+/// Процессорное время процесса (utime+stime) в тиках USER_HZ. Настенное
+/// время тика включает вытеснение планировщиком, поэтому «сколько мы
+/// СЪЕЛИ» меряется отдельно и только из /proc — без зависимостей.
+fn cpu_ticks() -> u64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return 0;
+    };
+    // Поля 14 и 15 после закрывающей скобки имени процесса.
+    let Some(rest) = stat.rsplit_once(") ").map(|(_, r)| r) else {
+        return 0;
+    };
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    match (f.get(11), f.get(12)) {
+        (Some(u), Some(s)) => u
+            .parse::<u64>()
+            .unwrap_or(0)
+            .saturating_add(s.parse::<u64>().unwrap_or(0)),
+        _ => 0,
+    }
+}
+
 /// Как часто демон думает, не запустить ли на экран моба (режим войны).
 const MOB_CHECK_SECS: f64 = 600.0;
 /// Скорость погони за мобом.
@@ -1144,6 +1170,15 @@ struct DaemonApp {
     folder_merged_at: Option<Instant>,
     /// Взводится обработчиком SIGTERM/SIGINT; tick превращает в exit.
     sig_exit: Arc<AtomicBool>,
+    /// Дешёвая диагностика бюджета (ТЗ §5): сколько тиков и сколько всего
+    /// времени они заняли с прошлого отчёта. Печатается раз в PROFILE_SECS
+    /// на уровне debug — «кто съел CPU» отвечается без профайлера.
+    profile: (u32, Duration, f64),
+    /// Из них — на пролог (IPC, синк, свёртка) и на мир вещей.
+    profile_parts: (Duration, Duration),
+    /// Тики процессора (utime+stime) на момент прошлого отчёта — честный
+    /// CPU против настенного времени тика.
+    profile_cpu: u64,
 }
 
 impl DaemonApp {
@@ -1246,6 +1281,9 @@ impl DaemonApp {
             folder_poll: FOLDER_POLL,
             folder_merged_at: None,
             sig_exit: Arc::new(AtomicBool::new(false)),
+            profile: (0, Duration::ZERO, 0.0),
+            profile_parts: (Duration::ZERO, Duration::ZERO),
+            profile_cpu: 0,
             queasy_sprites: None,
             puddle: None,
             press_since: None,
@@ -1299,8 +1337,17 @@ impl DaemonApp {
 
     /// Пересвернуть журнал в текущее состояние (декей до «сейчас»).
     fn refold(&mut self) {
+        let t = Instant::now();
         self.derived = fold(&self.events, wall_now_ms(), &self.fold_cfg);
         self.last_fold = Instant::now();
+        let cost = t.elapsed();
+        if cost > Duration::from_millis(5) {
+            log::debug!(
+                "свёртка: {} событий за {:.1} мс",
+                self.events.len(),
+                cost.as_secs_f64() * 1000.0
+            );
+        }
         // Вещи живут в журнале — свёртка их и приносит (в том числе
         // поставленные на другом устройстве).
         self.sync_props();
@@ -3853,6 +3900,7 @@ impl DaemonApp {
 
 impl App for DaemonApp {
     fn tick(&mut self, now: f64) -> Scene<'_> {
+        let started = Instant::now();
         // SIGTERM/SIGINT: graceful-выход (ТД-20). Сохранять нечего —
         // журнал пишется на диск в момент каждого события; только текущий
         // период сна закрывается событием Slept, чтобы не пропасть.
@@ -3880,8 +3928,9 @@ impl App for DaemonApp {
             self.refold();
         }
 
-        // Спрайты догоняют свёртку (стадия/размер, вылупление), истёкшие
-        // эффекты снимаются — pace() после тика видит честное состояние.
+        self.profile_parts.0 += started.elapsed(); // пролог: IPC, синк, свёртка
+                                                   // Спрайты догоняют свёртку (стадия/размер, вылупление), истёкшие
+                                                   // эффекты снимаются — pace() после тика видит честное состояние.
         self.sync_visuals(now);
         self.expire_effects(now);
 
@@ -3925,6 +3974,7 @@ impl App for DaemonApp {
         // Живое тело (G6): пыль и кадры эффектов.
         self.body_fx_tick(now, dt);
         // Вещи мира (H1): физика, рука человека, рельеф из твёрдых вещей.
+        let t_props = Instant::now();
         self.props_tick(now, dt);
         // Дела питомца (H1): уборка, миска, лежанка, мяч.
         if self.indoors.is_none() && self.riding.is_none() {
@@ -3934,8 +3984,35 @@ impl App for DaemonApp {
         self.ride_tick(now, dt);
         // Режим войны (H6): гости ходят и удирают.
         self.mob_tick(now, dt);
+        self.profile_parts.1 += t_props.elapsed();
         // Домашняя жизнь (H3): уйти домой, выйти из домика.
         self.house_tick(now);
+
+        // Бюджет (ТЗ §5): считаем стоимость симуляции и раз в минуту
+        // печатаем её в debug. Сцена собирается ниже и в счёт не идёт —
+        // она заимствует self, и после неё считать уже нечем.
+        self.profile.0 += 1;
+        self.profile.1 += started.elapsed();
+        if now - self.profile.2 >= PROFILE_SECS {
+            if self.profile.2 > 0.0 && log::log_enabled!(log::Level::Debug) {
+                let n = self.profile.0.max(1);
+                let span = now - self.profile.2;
+                let cpu = cpu_ticks().saturating_sub(self.profile_cpu) as f64 / CLK_TCK;
+                log::debug!(
+                    "бюджет: {n} тиков ({:.1} Гц), {:.0} мкс на тик \
+                     ({:.0} пролог + {:.0} вещи), CPU процесса {:.2}% ядра, вещей {}",
+                    n as f64 / span,
+                    self.profile.1.as_micros() as f64 / n as f64,
+                    self.profile_parts.0.as_micros() as f64 / n as f64,
+                    self.profile_parts.1.as_micros() as f64 / n as f64,
+                    cpu / span * 100.0,
+                    self.props.len()
+                );
+            }
+            self.profile = (0, Duration::ZERO, now);
+            self.profile_parts = (Duration::ZERO, Duration::ZERO);
+            self.profile_cpu = cpu_ticks();
+        }
 
         match (&self.pet, &self.world) {
             // Вежливость (D5): под fullscreen-приложением сцена пустая —

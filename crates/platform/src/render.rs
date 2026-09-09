@@ -28,6 +28,113 @@ pub(crate) fn scene_bounds(scene: &Scene<'_>) -> Option<(i32, i32, u32, u32)> {
     acc.map(|(x0, y0, x1, y1)| (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32))
 }
 
+/// Кластер сцены: группа спрайтов, которая рисуется в один буфер.
+///
+/// Зачем: один буфер на всю сцену означал бы буфер размером с экран, как
+/// только на нём появляются вещи по разным углам (питомец слева, домик
+/// справа). Это и память (8 МБ на кадр вместо десятков килобайт), и CPU —
+/// каждый перерисованный кадр чистит и заполняет весь экран. Разбиение по
+/// сгусткам возвращает буферы к размеру самих объектов.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Cluster {
+    /// Границы в логических экранных координатах.
+    pub bounds: (i32, i32, u32, u32),
+    /// Индексы спрайтов сцены, попавших в кластер (порядок сохранён —
+    /// это порядок блита).
+    pub sprites: Vec<usize>,
+}
+
+/// Разбить сцену на кластеры: спрайты, чьи прямоугольники пересекаются
+/// (с запасом `gap`), рисуются вместе. Кластеров не больше `max`: лишние
+/// сливаются с ближайшим — лучше один буфер побольше, чем десяток
+/// поверхностей, которые композитор будет складывать по одной.
+pub(crate) fn cluster_scene(scene: &Scene<'_>, gap: i32, max: usize) -> Vec<Cluster> {
+    let mut out: Vec<Cluster> = Vec::new();
+    for (i, s) in scene.sprites.iter().enumerate() {
+        if s.invisible() {
+            continue;
+        }
+        let r = s.screen_rect();
+        let b = (
+            r.x.round() as i32,
+            r.y.round() as i32,
+            r.w.max(1.0) as u32,
+            r.h.max(1.0) as u32,
+        );
+        // Ищем кластер, с которым спрайт соприкасается, и вливаем в него;
+        // после слияния кластер мог дотянуться до других — сливаем и их.
+        let mut hit: Option<usize> = None;
+        let mut j = 0;
+        while j < out.len() {
+            if touches(out[j].bounds, b, gap) {
+                match hit {
+                    None => {
+                        out[j].bounds = union(out[j].bounds, b);
+                        out[j].sprites.push(i);
+                        hit = Some(j);
+                    }
+                    Some(h) => {
+                        let merged = out.remove(j);
+                        out[h].bounds = union(out[h].bounds, merged.bounds);
+                        out[h].sprites.extend(merged.sprites);
+                        out[h].sprites.sort_unstable();
+                        continue;
+                    }
+                }
+            }
+            j += 1;
+        }
+        if hit.is_none() {
+            out.push(Cluster {
+                bounds: b,
+                sprites: vec![i],
+            });
+        }
+    }
+    // Слишком много сгустков — сливаем самые близкие, пока не уместимся.
+    while out.len() > max.max(1) {
+        let mut best = (0usize, 1usize, i64::MAX);
+        for a in 0..out.len() {
+            for b in (a + 1)..out.len() {
+                let cost = union_area(out[a].bounds, out[b].bounds)
+                    - area(out[a].bounds)
+                    - area(out[b].bounds);
+                if cost < best.2 {
+                    best = (a, b, cost);
+                }
+            }
+        }
+        let merged = out.remove(best.1);
+        out[best.0].bounds = union(out[best.0].bounds, merged.bounds);
+        out[best.0].sprites.extend(merged.sprites);
+        out[best.0].sprites.sort_unstable();
+    }
+    out
+}
+
+fn union(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> (i32, i32, u32, u32) {
+    let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+    let x1 = (a.0 + a.2 as i32).max(b.0 + b.2 as i32);
+    let y1 = (a.1 + a.3 as i32).max(b.1 + b.3 as i32);
+    (x0, y0, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+fn area(a: (i32, i32, u32, u32)) -> i64 {
+    a.2 as i64 * a.3 as i64
+}
+
+fn union_area(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> i64 {
+    area(union(a, b))
+}
+
+fn touches(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32), gap: i32) -> bool {
+    let ax1 = a.0 + a.2 as i32 + gap;
+    let ay1 = a.1 + a.3 as i32 + gap;
+    let bx1 = b.0 + b.2 as i32;
+    let by1 = b.1 + b.3 as i32;
+    a.0 - gap < bx1 && b.0 < ax1 && a.1 - gap < by1 && b.1 < ay1
+}
+
 /// Ключ содержимого буфера для dirty-check. Позиция сцены на экране в ключ
 /// НЕ входит: чистое перемещение не требует перерисовки, только сдвиг окна.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -55,12 +162,17 @@ struct SpriteKey {
     alpha: i32,
 }
 
-pub(crate) fn content_key(scene: &Scene<'_>, origin: (i32, i32), scale: u32) -> ContentKey {
+pub(crate) fn content_key(
+    scene: &Scene<'_>,
+    sprites: &[usize],
+    origin: (i32, i32),
+    scale: u32,
+) -> ContentKey {
     ContentKey {
         scale,
-        sprites: scene
-            .sprites
+        sprites: sprites
             .iter()
+            .filter_map(|i| scene.sprites.get(*i))
             .filter(|s| !s.invisible())
             .map(|s| SpriteKey {
                 argb: s.frame.argb.as_ptr() as usize,
@@ -104,11 +216,12 @@ pub(crate) fn compose(
     canvas: &mut [u8],
     size: (u32, u32),
     scene: &Scene<'_>,
+    sprites: &[usize],
     origin: (i32, i32),
     scale: u32,
 ) {
     canvas.fill(0); // 0x00000000 — полностью прозрачно
-    for s in &scene.sprites {
+    for s in sprites.iter().filter_map(|i| scene.sprites.get(*i)) {
         if s.invisible() {
             continue;
         }
@@ -223,6 +336,11 @@ fn fade(px: u32, alpha: f32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// Все спрайты сцены — как их видит бэкенд без кластеров (X11).
+    fn all_of(scene: &Scene<'_>) -> Vec<usize> {
+        (0..scene.sprites.len()).collect()
+    }
+
     use super::*;
     use crate::SpriteInstance;
     use driftling_core::Vec2;
@@ -519,7 +637,7 @@ mod tests {
         let (bx, by, bw, bh) = scene_bounds(&scene).unwrap();
         assert_eq!((bx, by, bw, bh), (100, 200, 2, 2));
         let mut canvas = vec![0u8; (bw * bh * 4) as usize];
-        compose(&mut canvas, (bw, bh), &scene, (bx, by), 1);
+        compose(&mut canvas, (bw, bh), &scene, &all_of(&scene), (bx, by), 1);
         // Спрайт лёг в (0,0) буфера, а не в экранные (100,200).
         assert_eq!(pixel(&canvas, bw, 0, 0), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, bw, 1, 1), 0);
@@ -532,6 +650,94 @@ mod tests {
         let f = frame_2x2();
         let scene = scene_one(&f, Vec2::new(10.6, -3.4), false);
         assert_eq!(scene_bounds(&scene), Some((11, -3, 2, 2)));
+    }
+
+    /// Далеко разнесённые вещи (питомец у одной стены, домик у другой)
+    /// живут в РАЗНЫХ буферах: иначе буфер был бы размером с экран.
+    #[test]
+    fn clusters_split_far_apart_sprites() {
+        let f = frame_2x2();
+        let at = |x: f32, y: f32| SpriteInstance {
+            frame: &f,
+            origin: Vec2::new(x, y),
+            orient: Orient::IDENTITY,
+            deform: Deform::NONE,
+            alpha: 1.0,
+        };
+        let scene = Scene {
+            sprites: vec![at(0.0, 0.0), at(3.0, 0.0), at(900.0, 500.0)],
+            input_rects: Vec::new(),
+        };
+        let clusters = cluster_scene(&scene, 4, 6);
+        assert_eq!(clusters.len(), 2, "два сгустка: {clusters:?}");
+        assert_eq!(clusters[0].sprites, vec![0, 1], "соседи вместе");
+        assert_eq!(clusters[0].bounds, (0, 0, 5, 2));
+        assert_eq!(clusters[1].sprites, vec![2]);
+        assert_eq!(clusters[1].bounds, (900, 500, 2, 2));
+    }
+
+    /// Спрайт-перемычка сливает уже созданные сгустки в один.
+    #[test]
+    fn clusters_merge_through_a_bridge() {
+        let f = frame_2x2();
+        let at = |x: f32| SpriteInstance {
+            frame: &f,
+            origin: Vec2::new(x, 0.0),
+            orient: Orient::IDENTITY,
+            deform: Deform::NONE,
+            alpha: 1.0,
+        };
+        let scene = Scene {
+            sprites: vec![at(0.0), at(20.0), at(10.0)],
+            input_rects: Vec::new(),
+        };
+        let clusters = cluster_scene(&scene, 9, 6);
+        assert_eq!(clusters.len(), 1, "перемычка склеила: {clusters:?}");
+        assert_eq!(clusters[0].sprites, vec![0, 1, 2]);
+    }
+
+    /// Сгустков не больше предела: лишние сливаются с ближайшими, а не
+    /// плодят поверхности.
+    #[test]
+    fn clusters_are_capped() {
+        let f = frame_2x2();
+        let scene = Scene {
+            sprites: (0..8)
+                .map(|i| SpriteInstance {
+                    frame: &f,
+                    origin: Vec2::new(i as f32 * 100.0, 0.0),
+                    orient: Orient::IDENTITY,
+                    deform: Deform::NONE,
+                    alpha: 1.0,
+                })
+                .collect(),
+            input_rects: Vec::new(),
+        };
+        let clusters = cluster_scene(&scene, 4, 3);
+        assert_eq!(clusters.len(), 3);
+        let total: usize = clusters.iter().map(|c| c.sprites.len()).sum();
+        assert_eq!(total, 8, "ни один спрайт не потерян");
+    }
+
+    /// Невидимые спрайты (спрятанный питомец) не создают сгустков.
+    #[test]
+    fn clusters_skip_invisible() {
+        let empty = Frame {
+            w: 0,
+            h: 0,
+            argb: Vec::new(),
+        };
+        let scene = Scene {
+            sprites: vec![SpriteInstance {
+                frame: &empty,
+                origin: Vec2::default(),
+                orient: Orient::IDENTITY,
+                deform: Deform::NONE,
+                alpha: 1.0,
+            }],
+            input_rects: Vec::new(),
+        };
+        assert!(cluster_scene(&scene, 4, 6).is_empty());
     }
 
     #[test]
@@ -582,8 +788,8 @@ mod tests {
         let f = frame_2x2();
         let a = scene_one(&f, Vec2::new(10.0, 20.0), false);
         let b = scene_one(&f, Vec2::new(300.0, 400.0), false);
-        let ka = content_key(&a, (10, 20), 1);
-        let kb = content_key(&b, (300, 400), 1);
+        let ka = content_key(&a, &all_of(&a), (10, 20), 1);
+        let kb = content_key(&b, &all_of(&b), (300, 400), 1);
         // Кадр тот же, позиция другая → перерисовка не нужна.
         assert_eq!(ka, kb);
     }
@@ -594,7 +800,10 @@ mod tests {
         let f2 = frame_2x2(); // другой Vec → другой адрес пикселей
         let a = scene_one(&f1, Vec2::new(0.0, 0.0), false);
         let b = scene_one(&f2, Vec2::new(0.0, 0.0), false);
-        assert_ne!(content_key(&a, (0, 0), 1), content_key(&b, (0, 0), 1));
+        assert_ne!(
+            content_key(&a, &all_of(&a), (0, 0), 1),
+            content_key(&b, &all_of(&b), (0, 0), 1)
+        );
     }
 
     #[test]
@@ -603,12 +812,12 @@ mod tests {
         let plain = scene_one(&f, Vec2::new(0.0, 0.0), false);
         let mirrored = scene_one(&f, Vec2::new(0.0, 0.0), true);
         assert_ne!(
-            content_key(&plain, (0, 0), 1),
-            content_key(&mirrored, (0, 0), 1)
+            content_key(&plain, &all_of(&plain), (0, 0), 1),
+            content_key(&mirrored, &all_of(&mirrored), (0, 0), 1)
         );
         assert_ne!(
-            content_key(&plain, (0, 0), 1),
-            content_key(&plain, (0, 0), 2)
+            content_key(&plain, &all_of(&plain), (0, 0), 1),
+            content_key(&plain, &all_of(&plain), (0, 0), 2)
         );
     }
 

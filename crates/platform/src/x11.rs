@@ -664,10 +664,12 @@ impl Renderer {
             self.last_geom = Some(geom);
         }
 
-        let key = content_key(scene, (bx, by), 1);
+        // X11-бэкенд рисует сцену целиком в одно окно (кластеров нет).
+        let all: Vec<usize> = (0..scene.sprites.len()).collect();
+        let key = content_key(scene, &all, (bx, by), 1);
         if !self.visible || self.last_content.as_ref() != Some(&key) {
             self.canvas.resize((bw * bh * 4) as usize, 0);
-            compose(&mut self.canvas, (bw, bh), scene, (bx, by), 1);
+            compose(&mut self.canvas, (bw, bh), scene, &all, (bx, by), 1);
             self.canvas_size = (bw, bh);
             self.repaint()?;
             self.last_content = Some(key);

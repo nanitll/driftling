@@ -87,7 +87,7 @@ use smithay_client_toolkit::{
     subcompositor::SubcompositorState,
 };
 
-use crate::render::{compose, content_key, local_input_rects, scene_bounds, ContentKey};
+use crate::render::{cluster_scene, compose, content_key, local_input_rects, ContentKey};
 use crate::supervise::{self, pace_delay, Outcome};
 use crate::{App, Event, Scene};
 
@@ -191,12 +191,9 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
     // Первый commit без буфера — маппинг слоя; композитор ответит configure.
     layer.commit();
 
-    // Питомец: desync-субповерхность якоря. Позиция — состояние якоря
-    // (применяется его коммитом), содержимое — своё (применяется сразу).
-    let (pet_subsurface, pet_surface) =
-        subcompositor.create_subsurface(layer.wl_surface().clone(), &qh);
-    pet_subsurface.set_desync();
-
+    // Поверхности сцены создаются по мере надобности (Renderer::part):
+    // desync-субповерхности якоря. Позиция — состояние якоря (применяется
+    // его коммитом), содержимое — своё (применяется сразу).
     // Пул вырастет сам при первом create_buffer нужного размера.
     let pool = setup!(SlotPool::new(64 * 1024, &shm), "SlotPool");
 
@@ -214,7 +211,7 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         shm,
-        _subcompositor: subcompositor,
+
         pointer: None,
         loop_handle,
         loop_signal: event_loop.get_signal(),
@@ -234,17 +231,14 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
             compositor,
             qh,
             layer,
-            pet_surface,
-            pet_subsurface,
+            subcompositor,
+            parts: Vec::new(),
             scale: 1,
             parent_mapped: false,
             anchor_full: true,
             visible: false,
             frame_done: true,
             last_draw: None,
-            last_content: None,
-            last_pos: None,
-            last_input: Vec::new(),
             anchor_input_full: false,
         },
     };
@@ -275,7 +269,6 @@ struct Backend {
     output_state: OutputState,
     shm: Shm,
     /// Понадобится живым для новых субповерхностей (мультипитомцы M4).
-    _subcompositor: SubcompositorState,
     pointer: Option<wl_pointer::WlPointer>,
     loop_handle: LoopHandle<'static, Backend>,
     loop_signal: LoopSignal,
@@ -317,8 +310,11 @@ struct Renderer {
     compositor: CompositorState,
     qh: QueueHandle<Backend>,
     layer: LayerSurface,
-    pet_surface: wl_surface::WlSurface,
-    pet_subsurface: wl_subsurface::WlSubsurface,
+    subcompositor: SubcompositorState,
+    /// Поверхности сцены: по одной на сгусток спрайтов (питомец, домик,
+    /// улетевший мяч). Одна поверхность на всю сцену означала бы буфер
+    /// размером с экран, как только вещи расходятся по углам.
+    parts: Vec<Part>,
     /// Целочисленный масштаб буфера (HiDPI). TODO(D6): дробный масштаб.
     scale: u32,
     /// Якорь замаплен (configure получен, прозрачный буфер прикреплён).
@@ -327,22 +323,54 @@ struct Renderer {
     /// принудительно включена), false — 1x1 (сцена пуста, сканаут отдан
     /// композитору). См. комментарий при создании слоя.
     anchor_full: bool,
-    /// У поверхности питомца есть буфер (сцена непустая).
+    /// Хоть у одной поверхности есть буфер (сцена непустая).
     visible: bool,
     /// Прошлый кадр показан композитором — можно рисовать следующий.
     frame_done: bool,
     /// Когда последний раз рисовали содержимое — страховка от голодания
     /// frame callback'ов (см. FRAME_CB_FALLBACK).
     last_draw: Option<Instant>,
-    /// Содержимое последнего нарисованного буфера (dirty-check).
-    last_content: Option<ContentKey>,
-    /// Последняя выставленная позиция субповерхности (логические координаты).
-    last_pos: Option<(i32, i32)>,
     /// Якорь ловит мышь на всём выходе (только на время захвата, см.
     /// set_anchor_input).
     anchor_input_full: bool,
-    /// Последний выставленный input region в локальных координатах питомца.
-    last_input: Vec<(i32, i32, i32, i32)>,
+}
+
+/// Насколько близко спрайты должны лежать, чтобы попасть в один буфер, px.
+/// Мелкий зазор склеивает питомца с его тенью, пылью и пузырём; далёкие
+/// вещи остаются в своих буферах.
+const CLUSTER_GAP: i32 = 24;
+/// Больше поверхностей композитор складывает по одной — дальше выгоднее
+/// один буфер побольше.
+const MAX_PARTS: usize = 6;
+
+/// Хит-области, попавшие в границы сгустка: input region поверхности не
+/// может выходить за её буфер, поэтому каждая область достаётся своей.
+fn cluster_input(scene: &Scene<'_>, bounds: (i32, i32, u32, u32)) -> Vec<driftling_core::Rect> {
+    let (bx, by, bw, bh) = bounds;
+    let (bx1, by1) = (bx + bw as i32, by + bh as i32);
+    scene
+        .input_rects
+        .iter()
+        .filter(|r| {
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            cx >= bx as f32 && cx < bx1 as f32 && cy >= by as f32 && cy < by1 as f32
+        })
+        .copied()
+        .collect()
+}
+
+/// Одна поверхность сцены со своим буфером: сгусток спрайтов.
+struct Part {
+    surface: wl_surface::WlSurface,
+    subsurface: wl_subsurface::WlSubsurface,
+    /// Содержимое последнего нарисованного буфера (dirty-check).
+    content: Option<ContentKey>,
+    /// Последняя выставленная позиция субповерхности (логические координаты).
+    pos: Option<(i32, i32)>,
+    /// Последний выставленный input region в локальных координатах.
+    input: Vec<(i32, i32, i32, i32)>,
+    /// У поверхности есть буфер (иначе она размаплена и ввод не ловит).
+    mapped: bool,
 }
 
 impl Renderer {
@@ -408,109 +436,142 @@ impl Renderer {
         self.layer.commit();
     }
 
-    /// Привести поверхности в соответствие сцене: перерисовать содержимое
-    /// (только если оно изменилось), передвинуть субповерхность (только если
-    /// сдвинулась), обновить input region (только если изменился).
+    /// Привести поверхности в соответствие сцене: разложить спрайты по
+    /// сгусткам, перерисовать те, чьё содержимое изменилось, передвинуть
+    /// сдвинувшиеся и обновить input region там, где он поменялся.
+    ///
+    /// Кластеры (`cluster_scene`) — ответ на мир вещей (фаза H): питомец у
+    /// одной стены и домик у другой в одном буфере дали бы буфер размером с
+    /// экран. Каждый сгусток живёт в своей субповерхности со своим буфером.
     fn sync(&mut self, scene: &Scene<'_>) {
         if !self.parent_mapped {
             return;
         }
-        let Some((bx, by, bw, bh)) = scene_bounds(scene) else {
+        let clusters = cluster_scene(scene, CLUSTER_GAP, MAX_PARTS);
+        if clusters.is_empty() {
             self.hide();
             return;
-        };
+        }
         // Питомец на экране — якорь на весь выход (композиция включена).
         self.set_anchor_full(true);
         let scale = self.scale.max(1);
-        let key = content_key(scene, (bx, by), scale);
-        let content_dirty = !self.visible || self.last_content.as_ref() != Some(&key);
-        let mut commit_pet = false;
 
-        let first_show = !self.visible;
         // Обычный такт задаёт callback композитора; его голодание (KWin
         // при прямом сканауте) не должно замораживать питомца навсегда.
         let may_draw = self.frame_done
             || self
                 .last_draw
                 .is_none_or(|t| t.elapsed() >= FRAME_CB_FALLBACK);
-        if content_dirty && may_draw {
-            let (pw, ph) = (bw * scale, bh * scale);
-            match self.pool.create_buffer(
-                pw as i32,
-                ph as i32,
-                pw as i32 * 4,
-                wl_shm::Format::Argb8888,
-            ) {
-                Ok((buffer, canvas)) => {
-                    compose(canvas, (pw, ph), scene, (bx, by), scale);
-                    self.pet_surface.set_buffer_scale(scale as i32);
-                    self.pet_surface.damage_buffer(0, 0, pw as i32, ph as i32);
-                    // Дросселирование: следующее содержимое — после показа
-                    // этого (frame callback). Запрашиваем на ЯКОРЕ: KWin не
-                    // шлёт callback'и субповерхностям (см. Backend::frame);
-                    // коммит якоря идёт следом в этом же sync. Пропущенная
-                    // перерисовка не теряется: dirty-check повторит её.
-                    let parent = self.layer.wl_surface();
-                    parent.frame(&self.qh, parent.clone());
-                    if let Err(e) = buffer.attach_to(&self.pet_surface) {
-                        log::error!("attach буфера питомца: {e}");
-                    }
-                    self.frame_done = false;
-                    self.last_draw = Some(Instant::now());
-                    self.visible = true;
-                    self.last_content = Some(key);
-                    commit_pet = true;
-                }
-                Err(e) => log::error!("shm-буфер {pw}x{ph}: {e}"),
+
+        // Лишние поверхности прошлого кадра — размапить (буфер отвязан,
+        // ввод не ловят); сами объекты переживают до следующего кадра.
+        while self.parts.len() > clusters.len() {
+            if let Some(part) = self.parts.pop() {
+                part.subsurface.destroy();
+                part.surface.destroy();
             }
         }
-        if !self.visible {
-            // Первый кадр ещё не нарисован (нет буфера) — позиция и input
-            // region подождут его.
-            return;
+        while self.parts.len() < clusters.len() {
+            let (subsurface, surface) = self
+                .subcompositor
+                .create_subsurface(self.layer.wl_surface().clone(), &self.qh);
+            subsurface.set_desync();
+            self.parts.push(Part {
+                surface,
+                subsurface,
+                content: None,
+                pos: None,
+                input: Vec::new(),
+                mapped: false,
+            });
         }
 
-        // Первый показ: позиция применяется ДО коммита содержимого, иначе
-        // питомец на один кадр композитора замапится в (0,0) якоря.
-        if first_show && self.last_pos != Some((bx, by)) {
-            self.pet_subsurface.set_position(bx, by);
-            self.layer.commit();
-            self.last_pos = Some((bx, by));
-        }
-
-        // Input region поверхности питомца — в ЕЁ локальных координатах:
-        // регион едет вместе с субповерхностью и меняется только при смене
-        // размеров спрайта. Пустой список прямоугольников недостижим здесь
-        // (пустая сцена ушла в hide), но и он дал бы пустой регион, не None.
-        let input = local_input_rects(&scene.input_rects, (bx, by));
-        if input != self.last_input {
-            match Region::new(&self.compositor) {
-                Ok(region) => {
-                    for &(x, y, w, h) in &input {
-                        region.add(x, y, w, h);
+        let mut drew = false;
+        let mut anchor_dirty = false;
+        for (part, cluster) in self.parts.iter_mut().zip(clusters.iter()) {
+            let (bx, by, bw, bh) = cluster.bounds;
+            let key = content_key(scene, &cluster.sprites, (bx, by), scale);
+            let first_show = !part.mapped;
+            let content_dirty = first_show || part.content.as_ref() != Some(&key);
+            let mut commit_part = false;
+            if content_dirty && may_draw {
+                let (pw, ph) = (bw * scale, bh * scale);
+                match self.pool.create_buffer(
+                    pw as i32,
+                    ph as i32,
+                    pw as i32 * 4,
+                    wl_shm::Format::Argb8888,
+                ) {
+                    Ok((buffer, canvas)) => {
+                        compose(canvas, (pw, ph), scene, &cluster.sprites, (bx, by), scale);
+                        part.surface.set_buffer_scale(scale as i32);
+                        part.surface.damage_buffer(0, 0, pw as i32, ph as i32);
+                        if let Err(e) = buffer.attach_to(&part.surface) {
+                            log::error!("attach буфера сцены: {e}");
+                        }
+                        part.content = Some(key);
+                        part.mapped = true;
+                        commit_part = true;
+                        drew = true;
                     }
-                    self.pet_surface.set_input_region(Some(region.wl_region()));
-                    self.last_input = input;
-                    commit_pet = true;
+                    Err(e) => log::error!("shm-буфер {pw}x{ph}: {e}"),
                 }
-                Err(e) => log::error!("wl_region: {e}"),
             }
+            if !part.mapped {
+                // Первый кадр этой поверхности ещё не нарисован — позиция и
+                // input region подождут его.
+                continue;
+            }
+            // Первый показ: позиция применяется ДО коммита содержимого,
+            // иначе поверхность на кадр композитора замапится в (0,0) якоря.
+            if first_show && part.pos != Some((bx, by)) {
+                part.subsurface.set_position(bx, by);
+                part.pos = Some((bx, by));
+                anchor_dirty = true;
+            }
+            // Input region — в локальных координатах поверхности; берём
+            // только те прямоугольники, что попали в этот сгусток.
+            let input = local_input_rects(&cluster_input(scene, cluster.bounds), (bx, by));
+            if input != part.input {
+                match Region::new(&self.compositor) {
+                    Ok(region) => {
+                        for &(x, y, w, h) in &input {
+                            region.add(x, y, w, h);
+                        }
+                        part.surface.set_input_region(Some(region.wl_region()));
+                        part.input = input;
+                        commit_part = true;
+                    }
+                    Err(e) => log::error!("wl_region: {e}"),
+                }
+            }
+            if commit_part {
+                part.surface.commit();
+            }
+            // Позиция субповерхности — состояние РОДИТЕЛЯ: set_position +
+            // коммит якоря. Самое частое действие (ходьба) стоит два
+            // крошечных запроса и ни одного пикселя.
+            if part.pos != Some((bx, by)) {
+                part.subsurface.set_position(bx, by);
+                part.pos = Some((bx, by));
+                anchor_dirty = true;
+            }
+            anchor_dirty |= commit_part;
         }
-        if commit_pet {
-            self.pet_surface.commit();
+        if drew {
+            // Дросселирование: следующее содержимое — после показа этого
+            // (frame callback). Запрашиваем на ЯКОРЕ: KWin не шлёт
+            // callback'и субповерхностям (см. Backend::frame); коммит якоря
+            // идёт следом. Пропущенная перерисовка не теряется:
+            // dirty-check повторит её.
+            let parent = self.layer.wl_surface();
+            parent.frame(&self.qh, parent.clone());
+            self.frame_done = false;
+            self.last_draw = Some(Instant::now());
+            self.visible = true;
+            anchor_dirty = true;
         }
-
-        // Позиция субповерхности — состояние РОДИТЕЛЯ: set_position +
-        // коммит якоря. Никаких пикселей и configure — самое частое действие
-        // (ходьба) стоит два крошечных запроса. Коммит якоря нужен и без
-        // движения, когда рисовалось содержимое: он применяет frame-запрос
-        // на якоре (см. блок отрисовки выше).
-        let moved = self.last_pos != Some((bx, by));
-        if moved {
-            self.pet_subsurface.set_position(bx, by);
-            self.last_pos = Some((bx, by));
-        }
-        if moved || commit_pet {
+        if anchor_dirty {
             self.layer.commit();
         }
     }
@@ -523,10 +584,13 @@ impl Renderer {
         if !self.visible {
             return;
         }
-        self.pet_surface.attach(None, 0, 0);
-        self.pet_surface.commit();
+        for part in &mut self.parts {
+            part.surface.attach(None, 0, 0);
+            part.surface.commit();
+            part.mapped = false;
+            part.content = None;
+        }
         self.visible = false;
-        self.last_content = None;
         // frame callback скрытой поверхности может не прийти никогда —
         // не дать ему заблокировать первый кадр после следующего summon.
         self.frame_done = true;
@@ -731,7 +795,9 @@ impl CompositorHandler for Backend {
         // субповерхностям layer-суфейсов вовсе (проверено живьём в фазе D —
         // ноль done за минуты анимации), а слою — шлёт. Принимаем оба на
         // случай других композиторов.
-        if *surface == self.renderer.pet_surface || surface == self.renderer.layer.wl_surface() {
+        let ours = self.renderer.parts.iter().any(|p| p.surface == *surface)
+            || surface == self.renderer.layer.wl_surface();
+        if ours {
             self.renderer.frame_done = true;
         }
     }
@@ -878,15 +944,19 @@ impl PointerHandler for Backend {
             // Мышь ловит поверхность питомца, а на время захвата — и якорь
             // (см. Renderer::set_anchor_input). Якорь растянут на весь
             // выход от (0, 0): его локальные координаты и есть экранные.
-            let on_pet = event.surface == self.renderer.pet_surface;
+            let part_pos = self
+                .renderer
+                .parts
+                .iter()
+                .find(|p| p.surface == event.surface)
+                .map(|p| p.pos.unwrap_or((0, 0)));
             let on_anchor = event.surface == *self.renderer.layer.wl_surface();
-            if !on_pet && !on_anchor {
+            if part_pos.is_none() && !on_anchor {
                 continue;
             }
-            let pos = if on_pet {
-                to_screen(event.position, self.renderer.last_pos.unwrap_or((0, 0)))
-            } else {
-                Vec2::new(event.position.0 as f32, event.position.1 as f32)
+            let pos = match part_pos {
+                Some(origin) => to_screen(event.position, origin),
+                None => Vec2::new(event.position.0 as f32, event.position.1 as f32),
             };
             let ev = match event.kind {
                 // Enter несёт позицию — отдаём как движение. Вернулся на
