@@ -113,6 +113,11 @@ pub struct BehaviorConfig {
     pub nausea_fade: f32,
     /// Выше этого уровня питомца мутит: зеленеет и шатается.
     pub queasy_at: f32,
+    /// Укачивает ли питомца вообще (настройка `[comfort] motion_sickness`).
+    /// Отдельный флаг, а не бесконечный `queasy_at`: бесконечность в
+    /// интерполяции зелени дала бы NaN, а ноль усиления — молчаливую
+    /// «тряску без последствий», которую трудно отличить от бага.
+    pub motion_sickness: bool,
 
     // ---- Фаза G6: мягкое тело ----
     /// Жёсткость пружины формы (squash & stretch), 1/с².
@@ -173,6 +178,7 @@ impl Default for BehaviorConfig {
             shake_reverse_dot: -0.3,
             nausea_fade: 0.25,
             queasy_at: 0.5,
+            motion_sickness: true,
 
             squash_spring: 190.0,
             // Затухание ~0.65 от критического: удар отыгрывается одним-двумя

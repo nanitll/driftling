@@ -16,25 +16,236 @@ pub struct Config {
     pub sync: SyncConfig,
     /// Физика мира (фаза G3).
     pub physics: PhysicsConfig,
-    /// Игровые режимы (фаза H6).
+    /// Игровые режимы: развлечения, которые можно выключить (фаза H).
     pub game: GameConfig,
+    /// Мир вещей питомца (фазы H1-H4).
+    pub world: WorldConfig,
+    /// Уживчивость: вежливость к работе и чувствительные реакции.
+    pub comfort: ComfortConfig,
 }
 
-/// Секция `[game]`: необязательные развлечения, выключенные по умолчанию.
+/// Патч конфига: правка ПО СЕКЦИЯМ, а не целым файлом.
+///
+/// Целый `Config` в запросе означал бы last-writer-wins по всему файлу:
+/// окно, сохраняя галочку про гостей, затирало бы токен синка (который
+/// демон наружу не отдаёт вовсе) и чужие правки, сделанные руками в
+/// соседней секции. Поэтому каждая секция — `Option`, а внутри синка
+/// `Option` и у каждого поля: `None` = «не трогать».
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigPatch {
+    pub sync: Option<SyncPatch>,
+    pub physics: Option<PhysicsConfig>,
+    pub game: Option<GameConfig>,
+    pub world: Option<WorldConfig>,
+    pub comfort: Option<ComfortConfig>,
+}
+
+/// Патч секции `[sync]`: токен отдельно, потому что демон его не отдаёт.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncPatch {
+    pub mode: Option<SyncMode>,
+    pub address: Option<String>,
+    /// `None` — оставить как есть (маска из GetConfig не должна затирать
+    /// настоящий токен).
+    pub token: Option<String>,
+    pub folder: Option<String>,
+}
+
+impl ConfigPatch {
+    /// Наложить патч и вернуть машинные имена изменённых секций — их
+    /// демон отдаёт клиенту в `applied`, а клиент локализует.
+    pub fn apply_to(&self, cfg: &mut Config) -> Vec<String> {
+        let mut applied = Vec::new();
+        if let Some(p) = &self.sync {
+            let before = cfg.sync.clone();
+            if let Some(m) = p.mode {
+                cfg.sync.mode = m;
+            }
+            if let Some(a) = &p.address {
+                cfg.sync.address = a.clone();
+            }
+            if let Some(t) = &p.token {
+                cfg.sync.token = t.clone();
+            }
+            if let Some(f) = &p.folder {
+                cfg.sync.folder = f.clone();
+            }
+            if cfg.sync != before {
+                applied.push("sync".into());
+            }
+        }
+        let mut set = |changed: bool, name: &str| {
+            if changed {
+                applied.push(name.into());
+            }
+        };
+        if let Some(v) = self.physics {
+            set(cfg.physics != v, "physics");
+            cfg.physics = v;
+        }
+        if let Some(v) = &self.game {
+            set(&cfg.game != v, "game");
+            cfg.game = v.clone();
+        }
+        if let Some(v) = self.world {
+            set(cfg.world != v, "world");
+            cfg.world = v;
+        }
+        if let Some(v) = self.comfort {
+            set(cfg.comfort != v, "comfort");
+            cfg.comfort = v;
+        }
+        applied
+    }
+}
+
+/// Секция `[game]`: развлечения — транспорт и незваные гости.
 ///
 /// ```toml
 /// [game]
-/// war_mode = true    # к питомцу изредка заходят незваные гости
+/// war_mode = true        # к питомцу изредка заходят незваные гости
+/// rides = true           # транспорт иногда приезжает сам
+/// ride_every_mins = 15   # как часто демон думает подать транспорт
+/// ride_kinds = ["bike", "copter"]   # пусто = все
 /// ```
 ///
 /// Режим войны — зрелище, а не бой: питомец гоняет мобов по экрану, никто
 /// никому не наносит урона, здоровье не трогается, и в журнал ухода эти
 /// стычки не попадают (см. `docs/WORLD.md`).
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+///
+/// Списки видов проверяются демоном по [`crate::prop::PropKind`]: неизвестное
+/// имя — предупреждение в лог, а не отказ загрузить конфиг.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GameConfig {
-    /// Пускать ли мобов на экран.
+    /// Пускать ли гостей на экран (режим войны).
     pub war_mode: bool,
+    /// Как часто демон думает, не позвать ли гостя, мин.
+    pub mob_every_mins: f32,
+    /// Какие гости допущены (машинные имена); пусто — все.
+    pub mob_kinds: Vec<String>,
+    /// Приезжает ли транспорт сам.
+    pub rides: bool,
+    /// Как часто демон думает подать транспорт, мин.
+    pub ride_every_mins: f32,
+    /// Какой транспорт допущен (машинные имена); пусто — весь.
+    pub ride_kinds: Vec<String>,
+}
+
+impl Default for GameConfig {
+    fn default() -> Self {
+        Self {
+            war_mode: false,
+            mob_every_mins: 10.0,
+            mob_kinds: Vec::new(),
+            rides: true,
+            ride_every_mins: 15.0,
+            ride_kinds: Vec::new(),
+        }
+    }
+}
+
+/// Секция `[world]`: вещи, которые заводятся у питомца сами.
+///
+/// ```toml
+/// [world]
+/// auto_bowl = true          # первая кормёжка ставит миску
+/// auto_bed = true           # первое «уложить спать» ставит лежанку
+/// auto_house = true         # на третьи сутки появляется домик
+/// house_age_days = 3.0
+/// puddles = true            # тошнота оставляет лужу, питомец её моет
+/// ```
+///
+/// Выключенный `auto_*` не убирает уже поставленную вещь: она принадлежит
+/// питомцу и живёт в журнале, убрать её — отдельное действие. Флаг лишь
+/// говорит демону не заводить её заново.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorldConfig {
+    /// Первая кормёжка ставит миску.
+    pub auto_bowl: bool,
+    /// Первое «уложить спать» ставит лежанку.
+    pub auto_bed: bool,
+    /// Домик появляется сам по возрасту.
+    pub auto_house: bool,
+    /// С какого возраста появляется домик, суток.
+    pub house_age_days: f32,
+    /// Как часто питомец думает зайти домой посидеть, мин.
+    pub house_visit_every_mins: f32,
+    /// Оставляет ли тошнота лужу (и есть ли что убирать шваброй).
+    pub puddles: bool,
+    /// Сколько питомца не трогают, прежде чем он берётся за уборку, сек.
+    pub chore_delay_secs: f32,
+    /// Появляются ли лужи и мусор — и есть ли что убирать шваброй.
+    pub litter: bool,
+    /// Чихает ли питомец в покое.
+    pub sneezes: bool,
+    /// Рисовать тень под питомцем и вещами.
+    pub shadow: bool,
+}
+
+impl Default for WorldConfig {
+    fn default() -> Self {
+        Self {
+            auto_bowl: true,
+            auto_bed: true,
+            auto_house: true,
+            house_age_days: 3.0,
+            house_visit_every_mins: 0.75,
+            puddles: true,
+            chore_delay_secs: 6.0,
+            litter: true,
+            sneezes: true,
+            shadow: true,
+        }
+    }
+}
+
+/// Секция `[comfort]`: как питомец уживается с работой человека.
+///
+/// ```toml
+/// [comfort]
+/// hide_on_fullscreen = true   # прячется при полноэкранном окне
+/// motion_sickness = true      # его укачивает от тряски мышью
+/// quiet = false               # тихий час: только явные действия человека
+/// surprises = 1.0             # множитель частоты «само собой» (0 = выкл)
+/// ```
+///
+/// `quiet` — один выключатель на всю самодеятельность: ни транспорта, ни
+/// гостей, ни походов домой, ни чихов. Питомец продолжает жить, но ничего
+/// не затевает сам.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComfortConfig {
+    /// Прятаться при полноэкранном окне (вежливость D5).
+    pub hide_on_fullscreen: bool,
+    /// Сколько окно должно продержаться, прежде чем питомец уйдёт, сек.
+    pub fullscreen_grace_secs: f32,
+    /// Укачивает ли питомца от тряски мышью.
+    pub motion_sickness: bool,
+    /// Тихий час: никакой самодеятельности.
+    pub quiet: bool,
+    /// Множитель частоты случайных событий: 0 — только явные действия.
+    /// Множит ИНТЕРВАЛЫ между проверками (секунды), а не веса поведения из
+    /// ста — иначе сон или прогулка стали бы недостижимы.
+    pub surprises: f32,
+    /// Размер подписей у питомца: пузыри и меню (0.8..2.0).
+    pub text_scale: f32,
+}
+
+impl Default for ComfortConfig {
+    fn default() -> Self {
+        Self {
+            hide_on_fullscreen: true,
+            fullscreen_grace_secs: 0.9,
+            motion_sickness: true,
+            quiet: false,
+            surprises: 1.0,
+            text_scale: 1.0,
+        }
+    }
 }
 
 /// Секция `[physics]`: единственная ручка — насколько питомец большой
@@ -259,6 +470,42 @@ pub use fs::{path, raw_text};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Новые секции читаются, а старый конфиг без них переживает загрузку:
+    /// у каждого поля есть дефолт, и он же — «как было до фазы H».
+    #[test]
+    fn world_and_comfort_default_to_previous_behaviour() {
+        let cfg = Config::default();
+        assert!(cfg.world.auto_bowl && cfg.world.auto_bed && cfg.world.auto_house);
+        assert_eq!(cfg.world.house_age_days, 3.0);
+        assert!(cfg.world.puddles && cfg.world.sneezes && cfg.world.shadow);
+        assert!(cfg.comfort.hide_on_fullscreen && cfg.comfort.motion_sickness);
+        assert_eq!(cfg.comfort.fullscreen_grace_secs, 0.9);
+        assert!(!cfg.comfort.quiet && cfg.comfort.surprises == 1.0);
+        assert_eq!(cfg.comfort.text_scale, 1.0);
+        // Транспорт ездит сам, война выключена — ровно как было в коде.
+        assert!(cfg.game.rides && !cfg.game.war_mode);
+        assert!(cfg.game.ride_kinds.is_empty() && cfg.game.mob_kinds.is_empty());
+
+        let old: Config = toml::from_str("[physics]\npet_height_cm = 25\n").unwrap();
+        assert_eq!(old.physics.pet_height_cm, 25.0);
+        assert_eq!(old.world, Config::default().world);
+        assert_eq!(old.comfort, Config::default().comfort);
+    }
+
+    /// Частичная секция не сбрасывает остальные поля в ноль.
+    #[test]
+    fn partial_sections_keep_other_defaults() {
+        let cfg: Config = toml::from_str(
+            "[world]\nauto_house = false\n[comfort]\nquiet = true\n[game]\nride_kinds = [\"bike\"]\n",
+        )
+        .unwrap();
+        assert!(!cfg.world.auto_house);
+        assert!(cfg.world.auto_bowl, "остальные вещи остались как были");
+        assert!(cfg.comfort.quiet && cfg.comfort.motion_sickness);
+        assert_eq!(cfg.game.ride_kinds, vec!["bike".to_string()]);
+        assert!(cfg.game.rides, "флаг самоподачи не сбросился");
+    }
 
     #[test]
     fn unknown_and_legacy_keys_do_not_break_load() {

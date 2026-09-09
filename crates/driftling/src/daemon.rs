@@ -131,16 +131,11 @@ const BYE_WAVE_SECS: f64 = 0.9;
 const SHADOW_FADE_PX: f32 = 420.0;
 /// Прозрачность тени, когда питомец стоит на опоре.
 const SHADOW_ALPHA: f32 = 0.85;
-/// Сколько полноэкранное окно должно продержаться, прежде чем питомец
-/// уйдёт с экрана: короткие вспышки вежливость игнорирует.
-const FULLSCREEN_GRACE: f64 = 0.9;
 
 /// Сколько живёт облачко пыли, сек.
 const PUFF_LIFE: f64 = 0.5;
 /// Лужа тает последние секунды жизни, а не исчезает мгновенно.
 const PUDDLE_FADE: f64 = 4.0;
-/// Сколько питомца не должны трогать, прежде чем он возьмётся за швабру.
-const CHORE_IDLE_SECS: f64 = 6.0;
 /// Сколько он трёт лужу.
 const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
@@ -187,8 +182,6 @@ const RIDE_WALK_SPEED: f32 = 110.0;
 /// Высота полёта воздушного транспорта над полом, доли высоты экрана.
 const RIDE_ALT: (f32, f32) = (0.25, 0.6);
 
-/// Возраст питомца, с которого у него появляется свой домик, суток.
-const HOUSE_AGE_DAYS: f64 = 3.0;
 /// Ближе этого к краю экрана домик прилипает к стене (в его ширинах).
 const HOUSE_SNAP: f32 = 0.75;
 /// Сколько питомец сидит в домике, когда уходит туда сам, сек.
@@ -356,14 +349,16 @@ pub fn run() -> Result<()> {
     }
     // Синк (фаза E): секция [sync] config.toml; битый конфиг не роняет
     // демона — просто работаем без синка (и говорим об этом).
-    let (sync_cfg, physics_cfg, game_cfg) = match Config::load() {
-        Ok(cfg) => (cfg.sync, cfg.physics, cfg.game),
+    let (sync_cfg, physics_cfg, game_cfg, world_cfg, comfort_cfg) = match Config::load() {
+        Ok(cfg) => (cfg.sync, cfg.physics, cfg.game, cfg.world, cfg.comfort),
         Err(e) => {
             log::warn!("config.toml не прочитан ({e}) — синк выключен");
             (
                 driftling_core::SyncConfig::default(),
                 PhysicsConfig::default(),
                 driftling_core::GameConfig::default(),
+                driftling_core::WorldConfig::default(),
+                driftling_core::ComfortConfig::default(),
             )
         }
     };
@@ -379,10 +374,7 @@ pub fn run() -> Result<()> {
         sync_cfg,
     );
     app.physics = physics_cfg;
-    app.game = game_cfg;
-    if app.game.war_mode {
-        log::info!("режим войны включён: к питомцу будут заходить незваные гости");
-    }
+    app.apply_game_config(game_cfg, world_cfg, comfort_cfg);
     // Разовая нормализация характеристик из эпохи ручного config.toml
     // (фаза G): 400 px/s и непоседливость 100 — это не характер, а баг.
     app.tame_attributes();
@@ -718,6 +710,8 @@ struct Menu {
     pet_size: f32,
     /// Под какие фазу/шкалы испечён кадр (чтобы не перепекать зря).
     baked: (f32, [i32; 3]),
+    /// Кегль подписей (масштаб из `[comfort] text_scale`).
+    px: f32,
 }
 
 /// Длительность появления кольца, сек.
@@ -754,7 +748,7 @@ impl Menu {
             self.hovered,
             grow,
             Some(stats),
-            MENU_PX,
+            self.px,
             self.accent,
         );
         true
@@ -849,9 +843,9 @@ fn slept_minutes(since: f64, now: f64) -> Option<f32> {
 
 /// Пузырь «Привет!» с окном показа [from, from + secs).
 /// Пузырь с произвольным текстом (реакции фазы G5).
-fn text_bubble(text: &str, from: f64, secs: f64) -> Bubble {
+fn text_bubble(text: &str, px: f32, from: f64, secs: f64) -> Bubble {
     Bubble {
-        frame: text::bubble_frame(text, BUBBLE_PX),
+        frame: text::bubble_frame(text, px),
         from,
         until: from + secs,
     }
@@ -864,9 +858,9 @@ fn noise(t: f64) -> f64 {
     x - x.floor()
 }
 
-fn hello_bubble(from: f64, secs: f64) -> Bubble {
+fn hello_bubble(px: f32, from: f64, secs: f64) -> Bubble {
     Bubble {
-        frame: text::bubble_frame(&fl!("bubble-hello"), BUBBLE_PX),
+        frame: text::bubble_frame(&fl!("bubble-hello"), px),
         from,
         until: from + secs,
     }
@@ -1056,8 +1050,12 @@ struct DaemonApp {
     journal_dir: PathBuf,
     /// Конфиг синка (фаза E); перечитывается `ctl reload`.
     sync_cfg: SyncConfig,
-    /// Игровые режимы (фаза H6): режим войны. Перечитывается `ctl reload`.
+    /// Игровые режимы (фаза H): война и транспорт. Перечитывается `ctl reload`.
     game: driftling_core::GameConfig,
+    /// Мир вещей: что заводится само (фазы H1-H4).
+    world_cfg: driftling_core::WorldConfig,
+    /// Уживчивость: вежливость и чувствительные реакции.
+    comfort: driftling_core::ComfortConfig,
     /// Кадры мобов под текущий размер питомца.
     mob_art: BTreeMap<&'static str, Frame>,
     /// Когда каждый моб исчезнет сам (id -> момент времени приложения).
@@ -1275,6 +1273,8 @@ impl DaemonApp {
             folder_seen,
             physics: PhysicsConfig::default(),
             game: driftling_core::GameConfig::default(),
+            world_cfg: driftling_core::WorldConfig::default(),
+            comfort: driftling_core::ComfortConfig::default(),
             mob_art: BTreeMap::new(),
             mob_life: BTreeMap::new(),
             mob_check_at: MOB_CHECK_SECS,
@@ -1450,7 +1450,9 @@ impl DaemonApp {
         let resp = self.care(EventKind::Fed { treat });
         if resp == Response::Ok && self.pet_visible_reactive() {
             self.wake_pet_for_action();
-            self.ensure_prop(PropKind::Bowl);
+            if self.world_cfg.auto_bowl {
+                self.ensure_prop(PropKind::Bowl);
+            }
             // Дойти — дело; сама еда показывается оверлеем по приходе.
             match self.walk_to_prop(PropKind::Bowl, ErrandKind::Eat, 0.0) {
                 // Пошёл к миске — есть будет по приходе (finish_errand).
@@ -1496,7 +1498,9 @@ impl DaemonApp {
             // Лежанка (H2): первый сон по команде заводит её, дальше
             // питомец идёт спать в неё, а не на голый пол.
             if self.pet_visible_reactive() {
-                self.ensure_prop(PropKind::Bed);
+                if self.world_cfg.auto_bed {
+                    self.ensure_prop(PropKind::Bed);
+                }
                 if self.walk_to_prop(PropKind::Bed, ErrandKind::Nap, 0.0) {
                     log::info!("сон: питомец идёт в лежанку");
                     return resp;
@@ -1694,7 +1698,11 @@ impl DaemonApp {
                 from: now,
                 until: now + HATCH_SECS,
             });
-            self.bubble = Some(hello_bubble(now + HATCH_SECS, HELLO_HATCH_SECS));
+            self.bubble = Some(hello_bubble(
+                self.bubble_px(),
+                now + HATCH_SECS,
+                HELLO_HATCH_SECS,
+            ));
         }
     }
 
@@ -1729,6 +1737,7 @@ impl DaemonApp {
             pet_center: center,
             pet_size,
             baked: (-1.0, [0; 3]),
+            px: MENU_PX * self.comfort.text_scale.clamp(0.6, 3.0),
         };
         menu.rebake(now, self.menu_stats());
         self.menu = Some(menu);
@@ -1954,7 +1963,12 @@ impl DaemonApp {
     /// Домик (H3): на третьи сутки жизни у питомца появляется свой угол.
     /// Проверяется редко и один раз ставится в ближайший угол экрана.
     fn maybe_place_house(&mut self) {
-        if self.prop_of(PropKind::House).is_some() || self.world.is_none() {
+        // Выключенный домик не отстраивается заново: иначе убранный
+        // человеком домик возвращался бы при ближайшей свёртке журнала.
+        if !self.world_cfg.auto_house
+            || self.prop_of(PropKind::House).is_some()
+            || self.world.is_none()
+        {
             return;
         }
         let born = self.derived.born_ms;
@@ -1962,7 +1976,7 @@ impl DaemonApp {
             return;
         }
         let days = wall_now_ms().saturating_sub(born) as f64 / 86_400_000.0;
-        if days < HOUSE_AGE_DAYS {
+        if days < self.world_cfg.house_age_days as f64 {
             return;
         }
         let Some(world) = &self.world else {
@@ -2080,8 +2094,11 @@ impl DaemonApp {
         if now < self.home_check_at || self.props.is_empty() {
             return;
         }
-        self.home_check_at = now + HOUSE_IDLE_SECS;
-        let calm = self.menu.is_none()
+        let home_every =
+            self.surprise_interval(self.world_cfg.house_visit_every_mins as f64 * 60.0);
+        self.home_check_at = now + home_every;
+        let calm = self.spontaneous()
+            && self.menu.is_none()
             && self.overlay.is_none()
             && self.errand.is_none()
             && now - self.last_touch >= HOUSE_IDLE_SECS;
@@ -2097,7 +2114,7 @@ impl DaemonApp {
             let mut errand = Errand::new(ErrandKind::Enter, door_x, 0.0);
             errand.prop = Some(id);
             self.errand = Some(errand);
-            self.home_check_at = now + HOUSE_IDLE_SECS + stay;
+            self.home_check_at = now + home_every + stay;
             log::info!("домик: питомец пошёл домой посидеть ({stay:.0} с)");
         }
     }
@@ -2129,8 +2146,9 @@ impl DaemonApp {
             return Response::Error(fl!("daemon-output-not-ready"));
         };
         let kind = kind.unwrap_or_else(|| {
-            let i = (noise(now * 13.7).abs() * PropKind::MOBS.len() as f64) as usize;
-            PropKind::MOBS[i.min(PropKind::MOBS.len() - 1)]
+            let pool = Self::allowed(&self.game.mob_kinds, &PropKind::MOBS);
+            let i = (noise(now * 13.7).abs() * pool.len() as f64) as usize;
+            pool[i.min(pool.len() - 1)]
         });
         let Some(mob) = kind.mob() else {
             return Response::Error(fl!("daemon-pet-busy"));
@@ -2167,9 +2185,10 @@ impl DaemonApp {
     fn mob_tick(&mut self, now: f64, dt: f32) {
         // Изредка — новый гость, если режим войны включён.
         if now >= self.mob_check_at {
-            self.mob_check_at = now + MOB_CHECK_SECS;
+            self.mob_check_at =
+                now + self.surprise_interval(self.game.mob_every_mins as f64 * 60.0);
             let none_yet = !self.props.iter().any(|p| p.kind.mob().is_some());
-            if self.game.war_mode && none_yet && noise(now * 4.1) > 0.3 {
+            if self.game.war_mode && self.spontaneous() && none_yet && noise(now * 4.1) > 0.3 {
                 let _ = self.spawn_mob(None, now);
             }
         }
@@ -2235,7 +2254,7 @@ impl DaemonApp {
             log::info!("война: гость {id:x} ушёл");
         }
         // Пылевой комок сорит на ходу.
-        if noise(now * 17.0) > 0.9 {
+        if self.world_cfg.litter && noise(now * 17.0) > 0.9 {
             let dusty: Vec<Vec2> = self
                 .props
                 .iter()
@@ -2263,8 +2282,9 @@ impl DaemonApp {
         };
         // Случайный вид: транспорт — сюрприз, а не пункт прайс-листа.
         let kind = kind.unwrap_or_else(|| {
-            let i = (noise(now * 11.3).abs() * PropKind::VEHICLES.len() as f64) as usize;
-            PropKind::VEHICLES[i.min(PropKind::VEHICLES.len() - 1)]
+            let pool = Self::allowed(&self.game.ride_kinds, &PropKind::VEHICLES);
+            let i = (noise(now * 11.3).abs() * pool.len() as f64) as usize;
+            pool[i.min(pool.len() - 1)]
         });
         let size = self.sprites.size as f32;
         let width = (size * kind.class().size_scale) as u32;
@@ -2346,8 +2366,11 @@ impl DaemonApp {
     fn ride_tick(&mut self, now: f64, dt: f32) {
         // Изредка транспорт приезжает сам — как сюрприз, не по расписанию.
         if self.riding.is_none() && now >= self.ride_check_at {
-            self.ride_check_at = now + RIDE_CHECK_SECS;
-            let calm = self.menu.is_none()
+            self.ride_check_at =
+                now + self.surprise_interval(self.game.ride_every_mins as f64 * 60.0);
+            let calm = self.game.rides
+                && self.spontaneous()
+                && self.menu.is_none()
                 && self.errand.is_none()
                 && self.overlay.is_none()
                 && self.indoors.is_none()
@@ -2654,7 +2677,7 @@ impl DaemonApp {
         if !calm || !self.pet_afoot() {
             return;
         }
-        let left_alone = now - self.last_touch >= CHORE_IDLE_SECS;
+        let left_alone = now - self.last_touch >= self.world_cfg.chore_delay_secs as f64;
         let queasy = self.pet.as_ref().is_some_and(|p| p.queasy());
         // Уборка: только когда его оставили в покое и уже не мутит.
         if let (true, false, Some(puddle)) = (left_alone, queasy, self.puddle.as_ref()) {
@@ -2769,7 +2792,12 @@ impl DaemonApp {
                     }
                 }
                 self.happy_until = Some(now + HAPPY_PLAY_SECS);
-                self.bubble = Some(text_bubble(&fl!("bubble-scared-off"), now, 0.9));
+                self.bubble = Some(text_bubble(
+                    &fl!("bubble-scared-off"),
+                    self.bubble_px(),
+                    now,
+                    0.9,
+                ));
                 // В журнал ухода стычки не пишутся — только настроение.
                 let _ = self.append_event(EventKind::Played);
                 log::info!("война: гость выдворен");
@@ -2795,7 +2823,12 @@ impl DaemonApp {
                 self.fetch_home = None;
                 self.ball_still_since = None;
                 self.happy_until = Some(now + HAPPY_PLAY_SECS);
-                self.bubble = Some(text_bubble(&fl!("bubble-fetch"), now, 0.9));
+                self.bubble = Some(text_bubble(
+                    &fl!("bubble-fetch"),
+                    self.bubble_px(),
+                    now,
+                    0.9,
+                ));
                 // Принесённый мяч — настоящая игра, она идёт в журнал.
                 let _ = self.append_event(EventKind::Played);
                 log::info!("игра: мяч принесён");
@@ -3332,6 +3365,17 @@ impl DaemonApp {
             }
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
+            Request::GetConfig => self.get_config(),
+            Request::SetConfig { patch } => self.set_config(patch),
+            Request::World => self.world_info(),
+            Request::Toy { show } => self.toy(show, now),
+            Request::StopRide => {
+                self.end_ride(now);
+                Response::Ok
+            }
+            Request::PlaceProp { kind } => self.place_prop(&kind),
+            Request::TakeProp { kind } => self.take_prop(&kind),
+            Request::DismissWithWave => self.dismiss_with_wave(now),
             Request::Quit => {
                 log::info!("quit: завершаем демон по IPC");
                 // Долгий сон не пропадает при штатном выходе — Slept в журнал.
@@ -3368,24 +3412,272 @@ impl DaemonApp {
     /// смена каталога журналов переоткрывает хранилище.
     fn reload(&mut self) -> Response {
         match Config::load() {
-            Ok(cfg) => {
-                log::info!("reload: настройки приложения перечитаны");
-                self.physics = cfg.physics;
-                self.game = cfg.game;
-                self.apply_pet_config();
-                self.apply_sync_config(cfg.sync);
-                Response::Ok
+            Ok(cfg) => self.apply_config(cfg, None),
+            Err(e) => Response::Error(fl!("daemon-config-unreadable", error = e)),
+        }
+    }
+
+    /// Применить конфиг целиком и честно доложить, что вышло. `changed` —
+    /// секции, которые правил клиент (при перечитке файла — None, тогда
+    /// применившимися считаются все).
+    fn apply_config(&mut self, cfg: Config, changed: Option<Vec<String>>) -> Response {
+        let physics_changed = self.physics != cfg.physics;
+        self.physics = cfg.physics;
+        self.apply_game_config(cfg.game, cfg.world, cfg.comfort);
+        self.apply_pet_config();
+        let (needs_restart, warnings) = self.apply_sync_config(cfg.sync);
+        let applied = changed.unwrap_or_else(|| {
+            let mut all = vec![
+                "game".into(),
+                "world".into(),
+                "comfort".into(),
+                "sync".into(),
+            ];
+            if physics_changed {
+                all.push("physics".into());
+            }
+            all
+        });
+        log::info!(
+            "конфиг применён: {}{}",
+            applied.join(", "),
+            if needs_restart.is_empty() {
+                String::new()
+            } else {
+                format!(" (требует перезапуска: {})", needs_restart.join(", "))
+            }
+        );
+        Response::Reloaded {
+            applied,
+            needs_restart,
+            warnings,
+        }
+    }
+
+    /// Настройки глазами демона. Токен наружу не отдаётся никогда — только
+    /// факт «задан»: окно показывает бейдж, а не секрет.
+    fn get_config(&self) -> Response {
+        match Config::load() {
+            Ok(mut cfg) => {
+                let token_set = !cfg.sync.token.is_empty();
+                cfg.sync.token.clear();
+                Response::Config {
+                    config: cfg,
+                    path: driftling_core::config::path().display().to_string(),
+                    token_set,
+                }
             }
             Err(e) => Response::Error(fl!("daemon-config-unreadable", error = e)),
         }
     }
 
+    /// Записать патч в config.toml и применить его на лету.
+    fn set_config(&mut self, patch: driftling_core::ConfigPatch) -> Response {
+        let mut cfg = match Config::load() {
+            Ok(c) => c,
+            Err(e) => return Response::Error(fl!("daemon-config-unreadable", error = e)),
+        };
+        let applied = patch.apply_to(&mut cfg);
+        if let Err(e) = cfg.save() {
+            return Response::Error(fl!("daemon-config-unwritable", error = e));
+        }
+        self.apply_config(cfg, Some(applied))
+    }
+
+    /// Картина мира для окна настроек. Свёртку журнала здесь НЕ трогаем:
+    /// окно опрашивает мир раз в секунду, а fold по всему журналу — самая
+    /// дорогая операция демона (ТЗ §5).
+    fn world_info(&self) -> Response {
+        let props = self
+            .props
+            .iter()
+            .map(|p| driftling_ipc::PropInfo {
+                id: p.id,
+                kind: p.kind.as_str().to_string(),
+                x: p.pos.x,
+                y: p.pos.y,
+                size: p.size,
+                state: match p.state {
+                    PropState::Rest => "rest",
+                    PropState::Falling => "falling",
+                    PropState::Held => "held",
+                    PropState::Carried => "carried",
+                    PropState::Ridden => "ridden",
+                }
+                .to_string(),
+                persistent: p.kind.class().persist,
+                mob: p.kind.mob().is_some(),
+            })
+            .collect();
+        Response::World {
+            screen: self
+                .world
+                .as_ref()
+                .map(|w| (w.screen.x, w.screen.y, w.screen.w, w.screen.h)),
+            ground_y: self.world.as_ref().map(|w| w.ground_y()),
+            fullscreen_hidden: self.fullscreen_hidden,
+            ride: self.riding.as_ref().map(|r| r.kind.as_str().to_string()),
+            props,
+        }
+    }
+
+    /// Разобрать машинное имя вида вещи (из окна настроек или ctl).
+    fn parse_prop_kind(name: &str) -> Option<PropKind> {
+        let all = [
+            PropKind::Mop,
+            PropKind::Bowl,
+            PropKind::Bed,
+            PropKind::Ball,
+            PropKind::House,
+        ];
+        all.into_iter()
+            .chain(PropKind::VEHICLES)
+            .chain(PropKind::MOBS)
+            .find(|k| k.as_str() == name)
+    }
+
+    /// Поставить вещь в мир по просьбе человека.
+    fn place_prop(&mut self, name: &str) -> Response {
+        let Some(kind) = Self::parse_prop_kind(name) else {
+            return Response::Error(fl!("daemon-unknown-prop", value = name.to_string()));
+        };
+        if kind == PropKind::Ball {
+            return self.toy(Some(true), 0.0);
+        }
+        if !kind.class().persist {
+            return Response::Error(fl!("daemon-unknown-prop", value = name.to_string()));
+        }
+        if self.prop_of(kind).is_none() && !self.ensure_prop(kind) {
+            return Response::Error(fl!("daemon-output-not-ready"));
+        }
+        match self.prop_of(kind) {
+            Some(p) => Response::Prop(driftling_ipc::PropInfo {
+                id: p.id,
+                kind: p.kind.as_str().to_string(),
+                x: p.pos.x,
+                y: p.pos.y,
+                size: p.size,
+                state: "rest".into(),
+                persistent: true,
+                mob: false,
+            }),
+            None => Response::Error(fl!("daemon-output-not-ready")),
+        }
+    }
+
+    /// Убрать вещь из мира: постоянную — событием журнала, временную —
+    /// прямо со сцены.
+    fn take_prop(&mut self, name: &str) -> Response {
+        let Some(kind) = Self::parse_prop_kind(name) else {
+            return Response::Error(fl!("daemon-unknown-prop", value = name.to_string()));
+        };
+        let Some(prop) = self.prop_of(kind) else {
+            return Response::Error(fl!("daemon-prop-not-found", value = name.to_string()));
+        };
+        let id = prop.id;
+        if kind.class().persist {
+            if let Err(e) = self.append_event(EventKind::PropTaken { id }) {
+                return Response::Error(e);
+            }
+            self.sync_props();
+        } else {
+            self.props.retain(|p| p.id != id);
+        }
+        self.drop_errand_if(|e| e.prop == Some(id));
+        log::info!("вещи: {} убрана по просьбе человека", kind.as_str());
+        Response::Ok
+    }
+
+    /// Мяч: показать, убрать или переключить.
+    fn toy(&mut self, show: Option<bool>, now: f64) -> Response {
+        let have = self.prop_of(PropKind::Ball).is_some();
+        match show {
+            Some(true) if have => Response::Ok,
+            Some(false) if !have => Response::Ok,
+            _ => self.toggle_ball(now),
+        }
+    }
+
+    /// Принять игровые секции конфига. Списки видов проверяются здесь:
+    /// незнакомое имя — предупреждение в лог, а не отказ работать (конфиг
+    /// правят руками, и опечатка не должна ронять питомца).
+    fn apply_game_config(
+        &mut self,
+        game: driftling_core::GameConfig,
+        world: driftling_core::WorldConfig,
+        comfort: driftling_core::ComfortConfig,
+    ) {
+        let known = |list: &[String], all: &[PropKind], what: &str| {
+            for name in list {
+                if !all.iter().any(|k| k.as_str() == name) {
+                    log::warn!("конфиг: неизвестный {what} «{name}» — пропущен");
+                }
+            }
+        };
+        known(&game.ride_kinds, &PropKind::VEHICLES, "транспорт");
+        known(&game.mob_kinds, &PropKind::MOBS, "гость");
+        let was_war = self.game.war_mode;
+        self.game = game;
+        self.world_cfg = world;
+        self.comfort = comfort;
+        self.apply_pet_config();
+        if self.game.war_mode != was_war || self.game.war_mode {
+            log::info!(
+                "режим войны {}",
+                if self.game.war_mode {
+                    "включён: к питомцу будут заходить незваные гости"
+                } else {
+                    "выключен"
+                }
+            );
+        }
+        if self.comfort.quiet {
+            log::info!("тихий час: питомец ничего не затевает сам");
+        }
+    }
+
+    /// Кегль подписей у питомца: пузыри и меню растут вместе (настройка
+    /// `[comfort] text_scale` — единственная ручка читаемости на HiDPI).
+    fn bubble_px(&self) -> f32 {
+        BUBBLE_PX * self.comfort.text_scale.clamp(0.6, 3.0)
+    }
+
+    /// Виды, из которых демон выбирает сам: список из конфига, а пустой
+    /// список означает «все» — так конфиг читается естественно.
+    fn allowed(list: &[String], all: &[PropKind]) -> Vec<PropKind> {
+        let picked: Vec<PropKind> = all
+            .iter()
+            .copied()
+            .filter(|k| list.iter().any(|n| n == k.as_str()))
+            .collect();
+        if picked.is_empty() {
+            all.to_vec()
+        } else {
+            picked
+        }
+    }
+
+    /// Самодеятельность разрешена: тихий час её выключает целиком, а
+    /// множитель сюрпризов — постепенно.
+    fn spontaneous(&self) -> bool {
+        !self.comfort.quiet && self.comfort.surprises > 0.0
+    }
+
+    /// Интервал «само собой» с учётом множителя сюрпризов: реже сюрпризы —
+    /// длиннее пауза между проверками.
+    fn surprise_interval(&self, base_secs: f64) -> f64 {
+        let k = self.comfort.surprises.clamp(0.05, 4.0) as f64;
+        base_secs / k
+    }
+
     /// Применить физику из конфига к живому питомцу (после reload).
     fn apply_pet_config(&mut self) {
-        let cfg = self
+        let mut cfg = self
             .derived
             .attributes
             .behavior_config_for(self.derived.stage, self.physics.height_m());
+        // Настройка человека кладётся ПОВЕРХ выведенного из характеристик.
+        cfg.motion_sickness = self.comfort.motion_sickness;
         let size = self.sprites.size as f32;
         if let Some(pet) = &mut self.pet {
             pet.apply_config(cfg, size);
@@ -3396,13 +3688,15 @@ impl DaemonApp {
     /// дропом ручки; смена каталога журналов переоткрывает хранилище
     /// (свой файл догоняет каталог, см. adopt_own_journal) — кроме
     /// деградации без записи, там менять каталог опасно (память ≠ диск).
-    fn apply_sync_config(&mut self, cfg: SyncConfig) {
+    fn apply_sync_config(&mut self, cfg: SyncConfig) -> (Vec<String>, Vec<String>) {
+        let (mut needs_restart, mut warnings) = (Vec::new(), Vec::new());
         if cfg == self.sync_cfg {
             log::debug!("reload: [sync] без изменений");
-            return;
+            return (needs_restart, warnings);
         }
         for w in cfg.warnings() {
             log::warn!("конфиг синка: {w}");
+            warnings.push(w);
         }
         self.sync = None; // дроп cmd_tx: воркер увидит и завершится
         let new_dir = resolve_journal_dir(&self.data_dir, &cfg);
@@ -3425,6 +3719,7 @@ impl DaemonApp {
                 self.refold();
             } else {
                 log::warn!("reload: журнал в деградации (память без записи) — каталог не меняю");
+                needs_restart.push("sync.folder".into());
             }
         }
         self.sync_cfg = cfg;
@@ -3445,6 +3740,7 @@ impl DaemonApp {
         // Lease-скрытие принадлежит старому режиму.
         self.lease_hidden = false;
         log::info!("reload: синк в режиме {}", self.sync_cfg.mode.as_str());
+        (needs_restart, warnings)
     }
 
     /// Пробросить событие указателя в питомца. Для платформы событие всегда
@@ -3483,7 +3779,12 @@ impl DaemonApp {
                 self.press_since = None;
                 // Сильный бросок — визг восторга (3 м/с и выше).
                 if thrown_speed >= 3.0 {
-                    self.bubble = Some(text_bubble(&fl!("bubble-wheee"), now, 0.9));
+                    self.bubble = Some(text_bubble(
+                        &fl!("bubble-wheee"),
+                        self.bubble_px(),
+                        now,
+                        0.9,
+                    ));
                 }
             }
             _ => {}
@@ -3509,13 +3810,23 @@ impl DaemonApp {
         if recent3 >= SULK_CLICKS && self.sulk_return_at.is_none() {
             log::info!("реакция: совсем достали — обиделся, убегает на {SULK_SECS:.0} с");
             self.click_times.clear();
-            self.bubble = Some(text_bubble(&fl!("bubble-annoyed"), now, 0.8));
+            self.bubble = Some(text_bubble(
+                &fl!("bubble-annoyed"),
+                self.bubble_px(),
+                now,
+                0.8,
+            ));
             self.sulk_off(now);
             return;
         }
         if recent2 >= ANNOYED_CLICKS {
             self.happy_until = None;
-            self.bubble = Some(text_bubble(&fl!("bubble-annoyed"), now, 0.9));
+            self.bubble = Some(text_bubble(
+                &fl!("bubble-annoyed"),
+                self.bubble_px(),
+                now,
+                0.9,
+            ));
             // Отворачивается один раз за серию (окно скользит, и порог
             // держался бы на каждом клике — питомец крутился бы туда-сюда).
             if self.annoyed_until.is_none_or(|t| now >= t) {
@@ -3586,7 +3897,7 @@ impl DaemonApp {
             from: now,
             until: now + BYE_WAVE_SECS,
         });
-        self.bubble = Some(text_bubble(&fl!("bubble-bye"), now, 1.4));
+        self.bubble = Some(text_bubble(&fl!("bubble-bye"), self.bubble_px(), now, 1.4));
         self.bye_run_at = Some((now + BYE_WAVE_SECS, dir));
         self.dismiss_after_run = true;
         Response::Ok
@@ -3603,7 +3914,12 @@ impl DaemonApp {
                 .is_some_and(|p| p.state != PetState::Dragged);
         if holding && now - self.last_heart >= HEART_EVERY_SECS {
             self.last_heart = now;
-            self.bubble = Some(text_bubble(&fl!("bubble-heart"), now, 0.7));
+            self.bubble = Some(text_bubble(
+                &fl!("bubble-heart"),
+                self.bubble_px(),
+                now,
+                0.7,
+            ));
             self.happy_until = Some(now + 1.0);
             if !self.hold_rewarded {
                 self.hold_rewarded = true;
@@ -3619,8 +3935,15 @@ impl DaemonApp {
                 from: now,
                 until: now + VOMIT_SECS,
             });
-            self.bubble = Some(text_bubble(&fl!("bubble-yuck"), now + 0.4, 1.4));
-            if let Some(pet) = &self.pet {
+            self.bubble = Some(text_bubble(
+                &fl!("bubble-yuck"),
+                self.bubble_px(),
+                now + 0.4,
+                1.4,
+            ));
+            // Лужи выключены — тошнит «всухую»: уже стоящая лужа доживает
+            // свой срок и домывается, иначе она осталась бы навсегда.
+            if let (Some(pet), true) = (&self.pet, self.world_cfg.puddles) {
                 let b = pet.bounds();
                 let w = (b.w * 0.6) as u32;
                 let frame = driftling_core::effects::puddle_frame(w, QUEASY_GREEN);
@@ -3645,7 +3968,12 @@ impl DaemonApp {
             if now >= until {
                 self.hiccup_until = None;
             } else if now >= self.hiccup_next {
-                self.bubble = Some(text_bubble(&fl!("bubble-hiccup"), now, 0.6));
+                self.bubble = Some(text_bubble(
+                    &fl!("bubble-hiccup"),
+                    self.bubble_px(),
+                    now,
+                    0.6,
+                ));
                 self.hiccup_next = now + 2.4 + 2.2 * noise(now);
             }
         }
@@ -3672,8 +4000,10 @@ impl DaemonApp {
 
         // Чих: редкий, только в покое на полу и без других эффектов.
         if now >= self.sneeze_check_at {
-            self.sneeze_check_at = now + 30.0;
-            let calm = self.overlay.is_none()
+            self.sneeze_check_at = now + self.surprise_interval(30.0);
+            let calm = self.world_cfg.sneezes
+                && self.spontaneous()
+                && self.overlay.is_none()
                 && self.bubble.is_none()
                 && self.presence_anim.is_none()
                 && self
@@ -3686,7 +4016,12 @@ impl DaemonApp {
                     from: now,
                     until: now + 0.45,
                 });
-                self.bubble = Some(text_bubble(&fl!("bubble-sneeze"), now + 0.2, 1.0));
+                self.bubble = Some(text_bubble(
+                    &fl!("bubble-sneeze"),
+                    self.bubble_px(),
+                    now + 0.2,
+                    1.0,
+                ));
             }
         }
 
@@ -3729,7 +4064,12 @@ impl DaemonApp {
                 "реакция: у питомца день рождения ({} лет)",
                 (days / 365.25) as i64
             );
-            self.bubble = Some(text_bubble(&fl!("bubble-birthday"), now + 0.5, 4.0));
+            self.bubble = Some(text_bubble(
+                &fl!("bubble-birthday"),
+                self.bubble_px(),
+                now + 0.5,
+                4.0,
+            ));
             self.happy_until = Some(now + 3600.0);
         }
     }
@@ -3872,14 +4212,14 @@ impl DaemonApp {
         // FULLSCREEN_GRACE, прежде чем питомец уйдёт. Иначе мелькание
         // (окно на секунду переходит в fullscreen и обратно) дёргает его с
         // экрана по десять раз за час — «питомец периодически пропадает».
+        let fullscreen = fullscreen && self.comfort.hide_on_fullscreen;
         match (fullscreen, self.fullscreen_since) {
             (true, None) => self.fullscreen_since = Some(now),
             (false, _) => self.fullscreen_since = None,
             _ => {}
         }
-        let hide = self
-            .fullscreen_since
-            .is_some_and(|t| now - t >= FULLSCREEN_GRACE);
+        let grace = self.comfort.fullscreen_grace_secs.max(0.05) as f64;
+        let hide = self.fullscreen_since.is_some_and(|t| now - t >= grace);
         if hide != self.fullscreen_hidden {
             self.fullscreen_hidden = hide;
             if hide {
@@ -4055,7 +4395,7 @@ impl App for DaemonApp {
                 let mut sprites = Vec::with_capacity(8);
                 // Тень на опоре под питомцем: чем выше он над ней, тем
                 // тень бледнее и меньше (фаза G6).
-                if !self.shadow.argb.is_empty() && pet_visible {
+                if !self.shadow.argb.is_empty() && pet_visible && self.world_cfg.shadow {
                     let feet = pet.bounds().bottom();
                     let support = physics::support_below(world, pet.pos.x, feet - 1.0);
                     let height = (support - feet).max(0.0);
@@ -4111,7 +4451,7 @@ impl App for DaemonApp {
                         continue;
                     };
                     let b = prop.bounds();
-                    if !self.shadow.argb.is_empty() {
+                    if !self.shadow.argb.is_empty() && self.world_cfg.shadow {
                         let support = physics::support_below(world, prop.pos.x, b.bottom() - 1.0);
                         let height = (support - b.bottom()).max(0.0);
                         if height < SHADOW_FADE_PX {
@@ -4359,7 +4699,7 @@ impl App for DaemonApp {
                     // Приветствие при старте (B5) — для уже вылупившихся:
                     // яйцо поздоровается после вылупления (B6).
                     if greeted && self.derived.stage != Stage::Egg {
-                        self.bubble = Some(hello_bubble(now, HELLO_START_SECS));
+                        self.bubble = Some(hello_bubble(self.bubble_px(), now, HELLO_START_SECS));
                         // Здоровается лапкой (фаза G6).
                         self.overlay = Some(Overlay {
                             look: ActionLook::Waving,
@@ -4479,6 +4819,17 @@ mod tests {
     use driftling_core::behavior::PetState;
 
     /// Уникальный каталог данных на тест — DI вместо env-мутаций (ТД-26).
+    /// Выдержка вежливости «как из коробки» — теперь это дефолт конфига,
+    /// а не константа кода.
+    fn grace_secs() -> f64 {
+        driftling_core::ComfortConfig::default().fullscreen_grace_secs as f64
+    }
+
+    /// Пауза перед уборкой «как из коробки».
+    fn chore_delay() -> f64 {
+        driftling_core::WorldConfig::default().chore_delay_secs as f64
+    }
+
     fn tmp_dir(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("driftling-daemon-{tag}-{}", std::process::id()));
@@ -4934,7 +5285,7 @@ mod tests {
         assert!(app.errand.is_none(), "при живом хозяине уборки нет");
 
         // Оставили в покое: дошёл и вытер.
-        app.last_touch = now - CHORE_IDLE_SECS - 1.0;
+        app.last_touch = now - chore_delay() - 1.0;
         settle(&mut app, &mut now, 1.0);
         assert!(app.errand.is_some(), "взялся за швабру");
         let start_x = app.pet.as_ref().unwrap().pos.x;
@@ -4963,7 +5314,7 @@ mod tests {
             frame: driftling_core::effects::puddle_frame(40, QUEASY_GREEN),
             until: now + 60.0,
         });
-        app.last_touch = now - CHORE_IDLE_SECS - 1.0;
+        app.last_touch = now - chore_delay() - 1.0;
         settle(&mut app, &mut now, 1.0);
         assert!(app.errand.is_some());
 
@@ -5424,6 +5775,319 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // --- Протокол v5: конфиг и мир через IPC ---------------------------------
+
+    /// Демон отдаёт настройки без токена и принимает патч по секциям:
+    /// правка одной галочки не затирает ни токен, ни соседние секции.
+    #[test]
+    fn config_round_trip_keeps_token_and_other_sections() {
+        let (mut app, tx, dir) = adult_app("ipc-config");
+        geometry(&mut app);
+        let cfg_dir = dir.join("xdg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // SAFETY: тест однопоточный по конфигу, каталог свой.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &cfg_dir) };
+
+        // Кладём конфиг с токеном и нестандартной физикой.
+        let mut seed = Config::default();
+        seed.sync.token = "секрет".into();
+        seed.physics.pet_height_cm = 42.0;
+        seed.save().unwrap();
+
+        let reply = send(&tx, Request::GetConfig);
+        app.tick(0.1);
+        let (config, token_set) = match reply.recv().unwrap() {
+            Response::Config {
+                config, token_set, ..
+            } => (config, token_set),
+            other => panic!("ожидали Config, получили {other:?}"),
+        };
+        assert!(token_set, "флаг «токен задан» есть");
+        assert!(config.sync.token.is_empty(), "сам токен наружу не уходит");
+        assert_eq!(config.physics.pet_height_cm, 42.0);
+
+        // Патчим только [game] — токен и физика обязаны уцелеть.
+        let patch = driftling_core::ConfigPatch {
+            game: Some(driftling_core::GameConfig {
+                war_mode: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reply = send(&tx, Request::SetConfig { patch });
+        app.tick(0.2);
+        match reply.recv().unwrap() {
+            Response::Reloaded { applied, .. } => {
+                assert_eq!(applied, vec!["game".to_string()], "изменилась одна секция")
+            }
+            other => panic!("ожидали Reloaded, получили {other:?}"),
+        }
+        assert!(app.game.war_mode, "применилось на лету");
+        let on_disk = Config::load().unwrap();
+        assert_eq!(on_disk.sync.token, "секрет", "токен не затёрт маской");
+        assert_eq!(on_disk.physics.pet_height_cm, 42.0, "чужая секция цела");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Картина мира отвечает и до появления экрана, и с вещами на нём.
+    #[test]
+    fn world_request_describes_the_scene() {
+        let (mut app, tx, dir) = adult_app("ipc-world");
+        // До геометрии экрана нет — но ответ есть, и это не ноль-прямоугольник.
+        let reply = send(&tx, Request::World);
+        app.tick(0.05);
+        match reply.recv().unwrap() {
+            Response::World { screen, props, .. } => {
+                assert!(screen.is_none(), "экран ещё не известен");
+                assert!(props.is_empty());
+            }
+            other => panic!("ожидали World, получили {other:?}"),
+        }
+
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.toggle_ball(now);
+        settle(&mut app, &mut now, 1.0);
+        let reply = send(&tx, Request::World);
+        now += 0.05;
+        app.tick(now);
+        match reply.recv().unwrap() {
+            Response::World { screen, props, .. } => {
+                assert!(screen.is_some(), "экран известен");
+                let ball = props.iter().find(|p| p.kind == "ball").expect("мяч в мире");
+                assert!(!ball.persistent, "мяч временный");
+                assert!(!ball.mob);
+            }
+            other => panic!("ожидали World, получили {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Вещь можно поставить и убрать по IPC, а мусор в имени — понятная
+    /// ошибка вместо паники.
+    #[test]
+    fn place_and_take_prop_over_ipc() {
+        let (mut app, tx, dir) = adult_app("ipc-prop");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+
+        let reply = send(
+            &tx,
+            Request::PlaceProp {
+                kind: "house".into(),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert!(matches!(reply.recv().unwrap(), Response::Prop(_)));
+        assert!(app.prop_of(PropKind::House).is_some(), "домик поставлен");
+
+        let reply = send(
+            &tx,
+            Request::TakeProp {
+                kind: "house".into(),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(app.prop_of(PropKind::House).is_none(), "домик убран");
+        assert!(
+            journal_kinds(&dir)
+                .iter()
+                .any(|k| matches!(k, EventKind::PropTaken { .. })),
+            "уход вещи записан в журнал"
+        );
+
+        let reply = send(
+            &tx,
+            Request::TakeProp {
+                kind: "звездолёт".into(),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert!(matches!(reply.recv().unwrap(), Response::Error(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Мяч и высадка из транспорта — явные команды, идемпотентные.
+    #[test]
+    fn toy_and_stop_ride_are_idempotent() {
+        let (mut app, tx, dir) = adult_app("ipc-toy");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+
+        for _ in 0..2 {
+            let reply = send(&tx, Request::Toy { show: Some(true) });
+            now += 0.05;
+            app.tick(now);
+            assert_eq!(reply.recv().unwrap(), Response::Ok);
+            assert!(app.prop_of(PropKind::Ball).is_some(), "мяч на экране");
+        }
+        let reply = send(&tx, Request::Toy { show: Some(false) });
+        now += 0.05;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(app.prop_of(PropKind::Ball).is_none(), "мяч убран");
+
+        // Высадка без поездки не ошибка.
+        let reply = send(&tx, Request::StopRide);
+        now += 0.05;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Настройки мира: ручки реально держат демона ------------------------
+
+    /// Выключенный домик не отстраивается заново — иначе убранный человеком
+    /// домик возвращался бы при ближайшей свёртке журнала.
+    #[test]
+    fn house_switch_stops_the_house_from_coming_back() {
+        let (mut app, _tx, dir) = adult_app("cfg-house");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.derived.born_ms = wall_now_ms() - 9 * 86_400_000;
+
+        app.world_cfg.auto_house = false;
+        app.maybe_place_house();
+        assert!(app.prop_of(PropKind::House).is_none(), "домик выключен");
+
+        app.world_cfg.auto_house = true;
+        app.maybe_place_house();
+        assert!(
+            app.prop_of(PropKind::House).is_some(),
+            "включили — построил"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Тихий час гасит всю самодеятельность разом, даже при включённой войне.
+    #[test]
+    fn quiet_mode_silences_every_spontaneous_event() {
+        let (mut app, _tx, dir) = adult_app("cfg-quiet");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.game.war_mode = true;
+        app.comfort.quiet = true;
+        app.mob_check_at = now;
+        app.ride_check_at = now;
+        settle(&mut app, &mut now, 2.0);
+        assert!(
+            !app.props.iter().any(|p| p.kind.mob().is_some()),
+            "в тихий час гостей нет"
+        );
+        assert!(app.riding.is_none(), "и транспорт сам не приезжает");
+
+        // Выключили тихий час — гости снова заходят.
+        app.comfort.quiet = false;
+        app.mob_check_at = now;
+        let mut came = false;
+        for _ in 0..600 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app.props.iter().any(|p| p.kind.mob().is_some()) {
+                came = true;
+                break;
+            }
+            if now > 60.0 {
+                break;
+            }
+            app.mob_check_at = app.mob_check_at.min(now);
+        }
+        assert!(came, "без тихого часа гость приходит");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Список видов сужает случайный выбор, а пустой список означает «все».
+    #[test]
+    fn kind_lists_filter_random_choice() {
+        let only_bike = DaemonApp::allowed(&["bike".to_string()], &PropKind::VEHICLES);
+        assert_eq!(only_bike, vec![PropKind::Bike]);
+        let all = DaemonApp::allowed(&[], &PropKind::VEHICLES);
+        assert_eq!(all.len(), PropKind::VEHICLES.len());
+        // Мусор в конфиге не оставляет питомца без транспорта вовсе.
+        let junk = DaemonApp::allowed(&["телепорт".to_string()], &PropKind::VEHICLES);
+        assert_eq!(junk.len(), PropKind::VEHICLES.len(), "мусор = все");
+    }
+
+    /// Выключенная вежливость оставляет питомца на экране поверх видео,
+    /// а выдержка берётся из конфига, а не из константы.
+    #[test]
+    fn fullscreen_politeness_is_switchable() {
+        let (mut app, sense, _tx, dir) = sense_app("cfg-polite");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.comfort.hide_on_fullscreen = false;
+        sense.set(Some(world_snap(&[], None, true)));
+        now += 0.1;
+        app.tick(now);
+        now += 3.0;
+        app.tick(now);
+        assert!(!app.fullscreen_hidden, "вежливость выключена — не прячется");
+
+        app.comfort.hide_on_fullscreen = true;
+        app.comfort.fullscreen_grace_secs = 2.0;
+        now += 0.1;
+        app.tick(now);
+        now += 1.0;
+        app.tick(now);
+        assert!(!app.fullscreen_hidden, "выдержка 2 с ещё не вышла");
+        now += 1.5;
+        app.tick(now);
+        assert!(app.fullscreen_hidden, "после выдержки спрятался");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Выключенное укачивание не копит тошноту, сколько ни тряси.
+    #[test]
+    fn motion_sickness_can_be_switched_off() {
+        let (mut app, _tx, dir) = adult_app("cfg-sick");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.comfort.motion_sickness = false;
+        app.apply_pet_config();
+
+        // Трясём: 40 разворотов на скорости, которой хватило бы с запасом.
+        let p = app.pet.as_ref().unwrap().pos;
+        app.event(Event::PointerPress(p), now);
+        for i in 0..40 {
+            now += 0.02;
+            let dx = if i % 2 == 0 { 240.0 } else { -240.0 };
+            app.event(Event::PointerMotion(Vec2::new(p.x + dx, p.y)), now);
+        }
+        app.event(Event::PointerRelease(p), now);
+        assert_eq!(
+            app.pet.as_ref().unwrap().nausea(),
+            0.0,
+            "укачивание выключено — тошноты нет"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Множитель сюрпризов растягивает интервалы, а ноль их гасит.
+    #[test]
+    fn surprises_multiplier_stretches_intervals() {
+        let (mut app, _tx, dir) = adult_app("cfg-surprise");
+        geometry(&mut app);
+        assert_eq!(app.surprise_interval(600.0), 600.0);
+        app.comfort.surprises = 2.0;
+        assert_eq!(app.surprise_interval(600.0), 300.0, "чаще");
+        app.comfort.surprises = 0.5;
+        assert_eq!(app.surprise_interval(600.0), 1200.0, "реже");
+        app.comfort.surprises = 0.0;
+        assert!(!app.spontaneous(), "ноль = только явные действия");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- H3: домик ----------------------------------------------------------
 
     /// Домик появляется на третьи сутки жизни и встаёт в угол экрана —
@@ -5481,7 +6145,7 @@ mod tests {
         sense.set(Some(world_snap(&[], None, true)));
         now += 0.1;
         app.tick(now); // первый тик только замечает окно
-        now += FULLSCREEN_GRACE + 0.2;
+        now += grace_secs() + 0.2;
         app.tick(now);
         assert!(app.fullscreen_hidden);
         assert!(app.indoors.is_some(), "спрятался в домик");
@@ -6649,7 +7313,7 @@ mod tests {
         now += 0.1;
         app.tick(now);
         assert!(!app.fullscreen_hidden, "короткая вспышка игнорируется");
-        now += FULLSCREEN_GRACE + 0.2;
+        now += grace_secs() + 0.2;
         let counts = {
             let scene = app.tick(now);
             (scene.sprites.len(), scene.input_rects.len())
@@ -6690,7 +7354,7 @@ mod tests {
             app.fullscreen_since.is_some(),
             "без троттлинга снапшот подхвачен"
         );
-        now += FULLSCREEN_GRACE + 0.2;
+        now += grace_secs() + 0.2;
         app.tick(now);
         assert!(app.fullscreen_hidden, "и после выдержки питомец спрятан");
         let _ = std::fs::remove_dir_all(&dir);

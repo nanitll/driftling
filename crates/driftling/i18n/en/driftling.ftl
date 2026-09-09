@@ -16,6 +16,10 @@ cli-about-ride = Take the pet for a ride (random vehicle if omitted)
 cli-about-ride-kind = Vehicle: skate, bike, moped, car, copter, plane
 cli-about-mob = Send in an uninvited guest (war mode)
 cli-about-mob-kind = Which one: dustball, roach, bug
+cli-about-config = Show settings as the daemon sees them
+cli-about-world = What is in the pet world right now
+cli-about-toy = Get the ball out (--off to put it away)
+cli-about-toy-off = Put the ball away
 daemon-unknown-vehicle = Unknown vehicle "{ $value }". Available: { $known }
 cli-about-sleep = Put the pet to sleep
 cli-about-rename = Rename the pet
@@ -28,6 +32,18 @@ cli-about-doctor = Diagnostics: environment, socket, files, autostart (works wit
 
 # --- ctl output ---
 ctl-ok = ok
+ctl-reloaded = Applied: { $applied }
+ctl-nothing = nothing changed
+ctl-needs-restart = Needs a daemon restart: { $items }
+ctl-warning = Warning: { $text }
+ctl-config-path = Settings file: { $path }
+ctl-config-token-set = Sync token is set (not shown)
+ctl-world-screen = Screen: { $area }, ground { $ground }
+ctl-world-no-screen = Screen is not known yet
+ctl-world-hidden = Pet is hidden: fullscreen window
+ctl-world-ride = Riding: { $kind }
+ctl-world-empty = The world is empty so far
+ctl-world-prop = { $kind }: { $state } at ({ $x }, { $y })
 ctl-status = pets: { $pets }, state: { $state }, uptime: { $uptime }s
 ctl-petinfo = { $name } ({ $stage }): { $state }, uptime { $uptime }s
 ctl-petinfo-stats = satiety { $satiety } · energy { $energy } · mood { $mood } · health { $health }
@@ -115,6 +131,9 @@ daemon-journal-append-failed = the care event was not written to the journal: { 
 daemon-rename-empty = the name must not be empty
 daemon-pet-busy = The pet is busy right now
 daemon-config-unreadable = config.toml could not be read: { $error }
+daemon-config-unwritable = Could not write settings: { $error }
+daemon-unknown-prop = Unknown thing "{ $value }"
+daemon-prop-not-found = There is no "{ $value }" in the world right now
 
 # --- tray (B7) ---
 tray-tooltip = Driftling

@@ -325,6 +325,9 @@ impl Pet {
         let Some((t0, p0)) = self.last_motion.replace((now, p)) else {
             return;
         };
+        if !self.cfg.motion_sickness {
+            return; // человек выключил укачивание — трясти можно сколько угодно
+        }
         let dt = now - t0;
         if dt <= 1e-4 {
             return;

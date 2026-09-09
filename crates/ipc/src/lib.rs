@@ -25,11 +25,31 @@ use std::time::Duration;
 /// добавлены статы и стадия роста.
 /// v3: пользовательский цвет питомца — Recolor, в PetInfo добавлен color.
 /// v4 (фаза E): SyncStatus — статус синхронизации для ctl и настроек.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5 (фаза H): мир вещей — Ride/Mob/Toy/StopRide/PlaceProp/TakeProp,
+/// картина мира (World), конфиг через демона (GetConfig/SetConfig) и
+/// честный ответ на Reload (Reloaded вместо голого Ok).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Сколько сервер ждёт строку запроса от подключившегося клиента,
 /// прежде чем молча бросить соединение (ТД-12: защита от зависших клиентов).
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Вещь на экране глазами окна настроек: машинные имена, локализует UI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PropInfo {
+    pub id: u64,
+    /// Машинное имя вида ([`driftling_core::PropKind::as_str`]).
+    pub kind: String,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+    /// Состояние: rest | falling | held | carried | ridden.
+    pub state: String,
+    /// Живёт в журнале (переживает рестарт и синкается).
+    pub persistent: bool,
+    /// Незваный гость (режим войны), а не вещь быта.
+    pub mob: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Request {
@@ -66,6 +86,33 @@ pub enum Request {
     /// ТОЛЬКО дебаг-панель (ТЗ §3.3): напрямую задать характеристики.
     /// Демон клампит значения, применяет к живому питомцу и персистит.
     SetAttributes(PetAttributes),
+    /// Прочитать настройки глазами демона: окно не читает config.toml само
+    /// и не может разойтись с тем, что реально применено. Токен синка не
+    /// отдаётся никогда — только флаг «задан».
+    GetConfig,
+    /// Записать настройки патчем по секциям и применить их на лету.
+    SetConfig {
+        patch: driftling_core::ConfigPatch,
+    },
+    /// Картина мира для окна настроек: что сейчас на экране.
+    World,
+    /// Достать/убрать мяч (то же, что кнопка «Мяч» в меню). None —
+    /// переключить.
+    Toy {
+        show: Option<bool>,
+    },
+    /// Высадить питомца из транспорта (идемпотентно).
+    StopRide,
+    /// Поставить вещь в мир (постоянная — событием журнала).
+    PlaceProp {
+        kind: String,
+    },
+    /// Убрать вещь из мира.
+    TakeProp {
+        kind: String,
+    },
+    /// Убрать питомца с экрана по-человечески: помашет и убежит за край.
+    DismissWithWave,
     /// Перечитать config.toml (настройки приложения). Демон перечитывает
     /// и секцию [sync] — воркер синка переconfигурируется на лету (фаза E).
     Reload,
@@ -78,6 +125,36 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Response {
     Ok,
+    /// Ответ на Reload/SetConfig: что применилось на лету, что потребует
+    /// перезапуска и о чём стоит знать. Строки машинные — локализует UI.
+    /// Голый Ok здесь врал: смена каталога журналов в деградации записи
+    /// молча не применялась, а клиент рапортовал успех.
+    Reloaded {
+        applied: Vec<String>,
+        needs_restart: Vec<String>,
+        warnings: Vec<String>,
+    },
+    /// Настройки глазами демона (ответ на GetConfig).
+    Config {
+        config: driftling_core::Config,
+        /// Путь к файлу — окно показывает его и умеет открыть.
+        path: String,
+        /// Токен синка задан (сам токен наружу не отдаётся).
+        token_set: bool,
+    },
+    /// Картина мира (ответ на World).
+    World {
+        /// Рабочая область: None — экран ещё не известен (нет геометрии).
+        screen: Option<(f32, f32, f32, f32)>,
+        ground_y: Option<f32>,
+        /// Питомец спрятан вежливостью к полноэкранному окну.
+        fullscreen_hidden: bool,
+        /// Питомец сейчас катается на этом транспорте.
+        ride: Option<String>,
+        props: Vec<PropInfo>,
+    },
+    /// Поставленная вещь (ответ на PlaceProp).
+    Prop(PropInfo),
     Status {
         pets: u32,
         state: String,

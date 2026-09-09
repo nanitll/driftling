@@ -15,6 +15,10 @@ cli-about-ride = Прокатить питомца (без вида — случ
 cli-about-ride-kind = Вид транспорта: skate, bike, moped, car, copter, plane
 cli-about-mob = Запустить незваного гостя (режим войны)
 cli-about-mob-kind = Кто именно: dustball, roach, bug
+cli-about-config = Показать настройки глазами демона
+cli-about-world = Что сейчас в мире питомца
+cli-about-toy = Достать мяч (--off — убрать)
+cli-about-toy-off = Убрать мяч
 daemon-unknown-vehicle = Неизвестный транспорт «{ $value }». Есть: { $known }
 cli-about-sleep = Уложить питомца спать
 cli-about-rename = Переименовать питомца
@@ -27,6 +31,18 @@ cli-about-doctor = Диагностика: окружение, сокет, фа�
 
 # --- Вывод ctl ---
 ctl-ok = ок
+ctl-reloaded = Применено: { $applied }
+ctl-nothing = ничего не изменилось
+ctl-needs-restart = Требует перезапуска демона: { $items }
+ctl-warning = Предупреждение: { $text }
+ctl-config-path = Файл настроек: { $path }
+ctl-config-token-set = Токен синхронизации задан (не показывается)
+ctl-world-screen = Экран: { $area }, пол { $ground }
+ctl-world-no-screen = Экран ещё не известен
+ctl-world-hidden = Питомец спрятан: полноэкранное окно
+ctl-world-ride = Катается на: { $kind }
+ctl-world-empty = В мире пока пусто
+ctl-world-prop = { $kind }: { $state } в ({ $x }, { $y })
 ctl-status = питомцев: { $pets }, состояние: { $state }, аптайм: { $uptime }s
 ctl-petinfo = { $name } ({ $stage }): { $state }, аптайм { $uptime }s
 ctl-petinfo-stats = сытость { $satiety } · энергия { $energy } · настроение { $mood } · здоровье { $health }
@@ -116,6 +132,9 @@ daemon-journal-append-failed = событие ухода не записано �
 daemon-rename-empty = имя не может быть пустым
 daemon-pet-busy = Питомец сейчас занят
 daemon-config-unreadable = config.toml не прочитан: { $error }
+daemon-config-unwritable = Настройки не записались: { $error }
+daemon-unknown-prop = Неизвестная вещь «{ $value }»
+daemon-prop-not-found = Вещи «{ $value }» сейчас нет в мире
 
 # --- Трей (B7) ---
 tray-tooltip = Дрифтлинг

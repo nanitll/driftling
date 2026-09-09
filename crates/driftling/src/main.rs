@@ -57,6 +57,18 @@ enum CtlAction {
         #[arg(help = fl!("cli-about-ride-kind"))]
         kind: Option<String>,
     },
+    // Показать настройки глазами демона.
+    #[command(about = fl!("cli-about-config"))]
+    Config,
+    // Что сейчас на экране: вещи, транспорт, вежливость.
+    #[command(about = fl!("cli-about-world"))]
+    World,
+    // Достать или убрать мяч.
+    #[command(about = fl!("cli-about-toy"))]
+    Toy {
+        #[arg(long, help = fl!("cli-about-toy-off"))]
+        off: bool,
+    },
     // Запустить незваного гостя (режим войны).
     #[command(about = fl!("cli-about-mob"))]
     Mob {
@@ -137,6 +149,11 @@ fn main() -> Result<()> {
                 CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
                 CtlAction::Ride { kind } => driftling_ipc::Request::Ride { kind },
                 CtlAction::Mob { kind } => driftling_ipc::Request::Mob { kind },
+                CtlAction::Config => driftling_ipc::Request::GetConfig,
+                CtlAction::World => driftling_ipc::Request::World,
+                CtlAction::Toy { off } => driftling_ipc::Request::Toy {
+                    show: off.then_some(false),
+                },
                 CtlAction::Rename { name } => driftling_ipc::Request::Rename(name),
                 CtlAction::Recolor { color } => match parse_hex_color(&color) {
                     Some(argb) => driftling_ipc::Request::Recolor(argb),
@@ -151,6 +168,100 @@ fn main() -> Result<()> {
             };
             match driftling_ipc::call(&req)? {
                 driftling_ipc::Response::Ok => println!("{}", fl!("ctl-ok")),
+                // Честный ответ на reload: что применилось прямо сейчас, что
+                // ждёт перезапуска и о чём демон предупреждает.
+                driftling_ipc::Response::Reloaded {
+                    applied,
+                    needs_restart,
+                    warnings,
+                } => {
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-reloaded",
+                            applied = if applied.is_empty() {
+                                fl!("ctl-nothing")
+                            } else {
+                                applied.join(", ")
+                            }
+                        )
+                    );
+                    if !needs_restart.is_empty() {
+                        println!(
+                            "{}",
+                            fl!("ctl-needs-restart", items = needs_restart.join(", "))
+                        );
+                    }
+                    for w in warnings {
+                        println!("{}", fl!("ctl-warning", text = w));
+                    }
+                }
+                driftling_ipc::Response::Config {
+                    config,
+                    path,
+                    token_set,
+                } => {
+                    println!("{}", fl!("ctl-config-path", path = path));
+                    println!(
+                        "{}",
+                        toml::to_string_pretty(&config).unwrap_or_else(|e| e.to_string())
+                    );
+                    if token_set {
+                        println!("{}", fl!("ctl-config-token-set"));
+                    }
+                }
+                driftling_ipc::Response::World {
+                    screen,
+                    ground_y,
+                    fullscreen_hidden,
+                    ride,
+                    props,
+                } => {
+                    match screen {
+                        Some((x, y, w, h)) => println!(
+                            "{}",
+                            fl!(
+                                "ctl-world-screen",
+                                area = format!("{w:.0}x{h:.0} @ ({x:.0},{y:.0})"),
+                                ground = format!("{:.0}", ground_y.unwrap_or(0.0))
+                            )
+                        ),
+                        None => println!("{}", fl!("ctl-world-no-screen")),
+                    }
+                    if fullscreen_hidden {
+                        println!("{}", fl!("ctl-world-hidden"));
+                    }
+                    if let Some(kind) = ride {
+                        println!("{}", fl!("ctl-world-ride", kind = kind));
+                    }
+                    if props.is_empty() {
+                        println!("{}", fl!("ctl-world-empty"));
+                    }
+                    for p in props {
+                        println!(
+                            "{}",
+                            fl!(
+                                "ctl-world-prop",
+                                kind = p.kind,
+                                state = p.state,
+                                x = format!("{:.0}", p.x),
+                                y = format!("{:.0}", p.y)
+                            )
+                        );
+                    }
+                }
+                driftling_ipc::Response::Prop(p) => {
+                    println!(
+                        "{}",
+                        fl!(
+                            "ctl-world-prop",
+                            kind = p.kind,
+                            state = p.state,
+                            x = format!("{:.0}", p.x),
+                            y = format!("{:.0}", p.y)
+                        )
+                    );
+                }
                 driftling_ipc::Response::Status {
                     pets,
                     state,

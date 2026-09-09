@@ -1094,6 +1094,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "systemd-journal-logger",
+ "toml 0.8.23",
 ]
 
 [[package]]
