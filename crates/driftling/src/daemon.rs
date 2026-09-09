@@ -146,6 +146,14 @@ const MOP_SECS: f64 = 3.2;
 /// Скорость похода за делом, px/с (быстрее прогулочной — он при деле).
 const CHORE_WALK_SPEED: f32 = 90.0;
 
+/// Как часто демон думает, не запустить ли на экран моба (режим войны).
+const MOB_CHECK_SECS: f64 = 600.0;
+/// Скорость погони за мобом.
+const CHASE_SPEED: f32 = 190.0;
+/// Насколько близко надо подойти, чтобы моб считался пойманным (в размерах
+/// питомца).
+const CATCH_AT: f32 = 0.5;
+
 /// Как часто (в секундах покоя) питомцу может САМОМУ приехать транспорт.
 const RIDE_CHECK_SECS: f64 = 900.0;
 /// Скорость подхода к транспорту.
@@ -322,13 +330,14 @@ pub fn run() -> Result<()> {
     }
     // Синк (фаза E): секция [sync] config.toml; битый конфиг не роняет
     // демона — просто работаем без синка (и говорим об этом).
-    let (sync_cfg, physics_cfg) = match Config::load() {
-        Ok(cfg) => (cfg.sync, cfg.physics),
+    let (sync_cfg, physics_cfg, game_cfg) = match Config::load() {
+        Ok(cfg) => (cfg.sync, cfg.physics, cfg.game),
         Err(e) => {
             log::warn!("config.toml не прочитан ({e}) — синк выключен");
             (
                 driftling_core::SyncConfig::default(),
                 PhysicsConfig::default(),
+                driftling_core::GameConfig::default(),
             )
         }
     };
@@ -344,6 +353,10 @@ pub fn run() -> Result<()> {
         sync_cfg,
     );
     app.physics = physics_cfg;
+    app.game = game_cfg;
+    if app.game.war_mode {
+        log::info!("режим войны включён: к питомцу будут заходить незваные гости");
+    }
     // Разовая нормализация характеристик из эпохи ручного config.toml
     // (фаза G): 400 px/s и непоседливость 100 — это не характер, а баг.
     app.tame_attributes();
@@ -1017,6 +1030,14 @@ struct DaemonApp {
     journal_dir: PathBuf,
     /// Конфиг синка (фаза E); перечитывается `ctl reload`.
     sync_cfg: SyncConfig,
+    /// Игровые режимы (фаза H6): режим войны. Перечитывается `ctl reload`.
+    game: driftling_core::GameConfig,
+    /// Кадры мобов под текущий размер питомца.
+    mob_art: BTreeMap<&'static str, Frame>,
+    /// Когда каждый моб исчезнет сам (id -> момент времени приложения).
+    mob_life: BTreeMap<u64, f64>,
+    /// Следующая проверка «не запустить ли гостя».
+    mob_check_at: f64,
     /// Физика мира (фаза G3): рост питомца «в жизни» задаёт масштаб, из
     /// которого выводятся настоящие 9.81 м/с² и вес. Перечитывается
     /// `ctl reload`.
@@ -1218,6 +1239,10 @@ impl DaemonApp {
             folder_poll_at: None,
             folder_seen,
             physics: PhysicsConfig::default(),
+            game: driftling_core::GameConfig::default(),
+            mob_art: BTreeMap::new(),
+            mob_life: BTreeMap::new(),
+            mob_check_at: MOB_CHECK_SECS,
             folder_poll: FOLDER_POLL,
             folder_merged_at: None,
             sig_exit: Arc::new(AtomicBool::new(false)),
@@ -2030,7 +2055,7 @@ impl DaemonApp {
         }
     }
 
-    /// Кадр вещи: быт — из [`PropArt`], транспорт — из своего кэша.
+    /// Кадр вещи: быт — из [`PropArt`], транспорт и мобы — из своих кэшей.
     fn prop_frame(&self, kind: PropKind) -> Option<&Frame> {
         if kind.vehicle().is_some() {
             return self
@@ -2038,7 +2063,142 @@ impl DaemonApp {
                 .get(kind.as_str())
                 .filter(|f| !f.argb.is_empty());
         }
+        if kind.mob().is_some() {
+            return self
+                .mob_art
+                .get(kind.as_str())
+                .filter(|f| !f.argb.is_empty());
+        }
         self.prop_art.frame(kind)
+    }
+
+    // ---- Режим войны (фаза H6, по умолчанию выключен) ----
+
+    /// Запустить на экран незваного гостя. Работает и с выключенным
+    /// режимом войны, если гостя позвали руками (`ctl mob`) — это воля
+    /// человека, а не самодеятельность демона.
+    fn spawn_mob(&mut self, kind: Option<PropKind>, now: f64) -> Response {
+        let Some(world) = &self.world else {
+            return Response::Error(fl!("daemon-output-not-ready"));
+        };
+        let kind = kind.unwrap_or_else(|| {
+            let i = (noise(now * 13.7).abs() * PropKind::MOBS.len() as f64) as usize;
+            PropKind::MOBS[i.min(PropKind::MOBS.len() - 1)]
+        });
+        let Some(mob) = kind.mob() else {
+            return Response::Error(fl!("daemon-pet-busy"));
+        };
+        let size = self.sprites.size as f32;
+        let width = (size * kind.class().size_scale) as u32;
+        self.mob_art.entry(kind.as_str()).or_insert_with(|| {
+            driftling_core::effects::mob_frame(kind, width, palette::darken(self.sprite_color, 0.7))
+        });
+        // Гость приходит от края экрана: он именно ЗАШЁЛ, а не возник.
+        let from_left = noise(now * 3.3) > 0.0;
+        let x = if from_left {
+            world.screen.x + width as f32 / 2.0
+        } else {
+            world.screen.right() - width as f32 / 2.0
+        };
+        // Жук-баг садится на кромку окна, если она есть.
+        let y = if mob.on_ledge {
+            physics::support_below(world, x, world.screen.y + 1.0)
+        } else {
+            world.ground_y()
+        };
+        let id = self.next_prop_id;
+        self.next_prop_id += 1;
+        let life =
+            mob.life_secs.0 + (mob.life_secs.1 - mob.life_secs.0) * noise(now * 9.1).abs() as f32;
+        self.props.push(Prop::new(id, kind, Vec2::new(x, y), size));
+        self.mob_life.insert(id, now + life as f64);
+        log::info!("война: на экран зашёл {} ({life:.0} с)", kind.as_str());
+        Response::Ok
+    }
+
+    /// Жизнь гостей: ходят, удирают от питомца, уходят сами.
+    fn mob_tick(&mut self, now: f64, dt: f32) {
+        // Изредка — новый гость, если режим войны включён.
+        if now >= self.mob_check_at {
+            self.mob_check_at = now + MOB_CHECK_SECS;
+            let none_yet = !self.props.iter().any(|p| p.kind.mob().is_some());
+            if self.game.war_mode && none_yet && noise(now * 4.1) > 0.3 {
+                let _ = self.spawn_mob(None, now);
+            }
+        }
+        if self.mob_life.is_empty() {
+            return;
+        }
+        let pet_x = self.pet.as_ref().map(|p| p.pos.x);
+        let size = self.sprites.size as f32;
+        let Some(world) = &self.world else {
+            return;
+        };
+        let (left, right) = (world.screen.x, world.screen.right());
+        let mut gone: Vec<(u64, Vec2)> = Vec::new();
+        for prop in self.props.iter_mut() {
+            let Some(mob) = prop.kind.mob() else {
+                continue;
+            };
+            let Some(&until) = self.mob_life.get(&prop.id) else {
+                continue;
+            };
+            let half = prop.size / 2.0;
+            // Удирает, когда питомец близко; иначе слоняется в свою сторону.
+            let flee = pet_x.filter(|x| (x - prop.pos.x).abs() < size * mob.flee_at);
+            let dir = match flee {
+                Some(x) => (prop.pos.x - x).signum(),
+                None => {
+                    if prop.vel.x == 0.0 {
+                        // Первый шаг: идёт от того края, откуда пришёл.
+                        if prop.pos.x - left < right - prop.pos.x {
+                            1.0
+                        } else {
+                            -1.0
+                        }
+                    } else {
+                        prop.vel.x.signum()
+                    }
+                }
+            };
+            let boost = if flee.is_some() { mob.flee_boost } else { 1.0 };
+            let speed = CHORE_WALK_SPEED * mob.speed_x * boost;
+            prop.vel.x = dir * speed;
+            prop.pos.x += dir * speed * dt;
+            // Дошёл до края или пожил своё — уходит.
+            let out = prop.pos.x <= left + half * 0.2 || prop.pos.x >= right - half * 0.2;
+            if now >= until || (out && flee.is_some()) {
+                gone.push((prop.id, prop.pos));
+                continue;
+            }
+            // От края разворачивается, если не удирает.
+            if prop.pos.x < left + half {
+                prop.pos.x = left + half;
+                prop.vel.x = speed;
+            } else if prop.pos.x > right - half {
+                prop.pos.x = right - half;
+                prop.vel.x = -speed;
+            }
+        }
+        for (id, at) in gone {
+            self.props.retain(|p| p.id != id);
+            self.mob_life.remove(&id);
+            self.drop_errand_if(|e| e.prop == Some(id));
+            self.spawn_puffs(at, 2, 0.7, now);
+            log::info!("война: гость {id:x} ушёл");
+        }
+        // Пылевой комок сорит на ходу.
+        if noise(now * 17.0) > 0.9 {
+            let dusty: Vec<Vec2> = self
+                .props
+                .iter()
+                .filter(|p| p.kind == PropKind::DustBall)
+                .map(|p| p.pos)
+                .collect();
+            for at in dusty {
+                self.spawn_puffs(at, 1, 0.4, now);
+            }
+        }
     }
 
     /// Подать транспорт (меню «Прокатиться», `ctl ride`). Повторный вызов
@@ -2155,12 +2315,7 @@ impl DaemonApp {
         let (Some(world), Some(v)) = (&self.world, ride.kind.vehicle()) else {
             return;
         };
-        let cfg = self
-            .pet
-            .as_ref()
-            .map(|p| p.config().clone())
-            .unwrap_or_default();
-        let speed = cfg.body.mps_to_px(v.speed_mps);
+        let speed = CHORE_WALK_SPEED * v.speed_x;
         let done = now >= ride.until;
         // Воздушный транспорт набирает высоту и перед высадкой садится.
         let cruise = world.screen.h * (RIDE_ALT.0 + (RIDE_ALT.1 - RIDE_ALT.0) * 0.5);
@@ -2370,10 +2525,31 @@ impl DaemonApp {
             return;
         };
         let speed = match errand.kind {
+            ErrandKind::Chase => CHASE_SPEED,
             ErrandKind::Ride => RIDE_WALK_SPEED,
             ErrandKind::Fetch | ErrandKind::Carry => FETCH_SPEED,
             _ => CHORE_WALK_SPEED,
         };
+        // Цель погони движется: гость удирает, и дело едет за ним. Поймать
+        // достаточно «примерно»: гнаться до пиксельной точности питомец
+        // будет вечно, гость-то удирает.
+        if errand.kind == ErrandKind::Chase {
+            let pet_x = self.pet.as_ref().map_or(0.0, |p| p.pos.x);
+            match errand
+                .prop
+                .and_then(|id| self.props.iter().find(|p| p.id == id))
+            {
+                Some(mob) => {
+                    let caught = (mob.pos.x - pet_x).abs() <= self.sprites.size as f32 * CATCH_AT;
+                    if caught {
+                        self.finish_errand(errand, now);
+                        return;
+                    }
+                    errand.target_x = mob.pos.x;
+                }
+                None => return,
+            }
+        }
         let Some(pet) = &mut self.pet else {
             return;
         };
@@ -2415,7 +2591,11 @@ impl DaemonApp {
             ErrandKind::Fetch | ErrandKind::Carry => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
-            ErrandKind::Ride | ErrandKind::Enter | ErrandKind::Eat | ErrandKind::Nap => errand
+            ErrandKind::Chase
+            | ErrandKind::Ride
+            | ErrandKind::Enter
+            | ErrandKind::Eat
+            | ErrandKind::Nap => errand
                 .prop
                 .is_none_or(|id| !self.props.iter().any(|p| p.id == id)),
         }
@@ -2434,6 +2614,21 @@ impl DaemonApp {
             let target_x = puddle.origin.x + puddle.frame.w as f32 / 2.0;
             log::info!("дела: питомец идёт убирать за собой");
             self.errand = Some(Errand::new(ErrandKind::Mop, target_x, MOP_SECS as f32));
+            return;
+        }
+        // Незваный гость: за ним питомец бросается сразу — это его дом.
+        if let Some(mob) = self
+            .props
+            .iter()
+            .filter(|p| p.kind.mob().is_some())
+            .min_by(|a, b| {
+                let d = |p: &Prop| (p.pos.x - self.pet.as_ref().map_or(0.0, |q| q.pos.x)).abs();
+                d(a).total_cmp(&d(b))
+            })
+        {
+            let (id, x) = (mob.id, mob.pos.x);
+            log::debug!("война: питомец погнался за гостем {id:x}");
+            self.errand = Some(Errand::new(ErrandKind::Chase, x, 0.0).about(id));
             return;
         }
         // Мяч: за ним бегут сразу, как он успокоится, — это игра, ждать
@@ -2516,6 +2711,21 @@ impl DaemonApp {
                     }
                     _ => {}
                 }
+            }
+            // Догнал гостя — тот удирает с экрана, а питомец доволен.
+            ErrandKind::Chase => {
+                if let Some(id) = errand.prop {
+                    if let Some(at) = self.props.iter().find(|p| p.id == id).map(|p| p.pos) {
+                        self.props.retain(|p| p.id != id);
+                        self.mob_life.remove(&id);
+                        self.spawn_puffs(at, 4, 1.1, now);
+                    }
+                }
+                self.happy_until = Some(now + HAPPY_PLAY_SECS);
+                self.bubble = Some(text_bubble(&fl!("bubble-scared-off"), now, 0.9));
+                // В журнал ухода стычки не пишутся — только настроение.
+                let _ = self.append_event(EventKind::Played);
+                log::info!("война: гость выдворен");
             }
             // Дошёл до транспорта — садится.
             ErrandKind::Ride => {
@@ -3012,6 +3222,27 @@ impl DaemonApp {
             Request::Feed { treat } => self.feed(treat, now),
             Request::Play => self.play(now),
             Request::PutToSleep => self.put_to_sleep(now),
+            Request::Mob { kind } => {
+                let kind = match kind {
+                    None => None,
+                    Some(name) => match PropKind::MOBS
+                        .iter()
+                        .find(|k| k.as_str() == name.to_lowercase())
+                    {
+                        Some(k) => Some(*k),
+                        None => {
+                            let all: Vec<&str> =
+                                PropKind::MOBS.iter().map(|k| k.as_str()).collect();
+                            return Response::Error(fl!(
+                                "daemon-unknown-vehicle",
+                                value = name,
+                                known = all.join(", ")
+                            ));
+                        }
+                    },
+                };
+                self.spawn_mob(kind, now)
+            }
             Request::Ride { kind } => {
                 let kind = match kind {
                     None => None,
@@ -3093,6 +3324,7 @@ impl DaemonApp {
             Ok(cfg) => {
                 log::info!("reload: настройки приложения перечитаны");
                 self.physics = cfg.physics;
+                self.game = cfg.game;
                 self.apply_pet_config();
                 self.apply_sync_config(cfg.sync);
                 Response::Ok
@@ -3700,6 +3932,8 @@ impl App for DaemonApp {
         }
         // Поездка (H5): транспорт едет сам и везёт питомца.
         self.ride_tick(now, dt);
+        // Режим войны (H6): гости ходят и удирают.
+        self.mob_tick(now, dt);
         // Домашняя жизнь (H3): уйти домой, выйти из домика.
         self.house_tick(now);
 
@@ -4847,6 +5081,120 @@ mod tests {
             pet.pos.y,
             world.ground_y()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- H6: режим войны ----------------------------------------------------
+
+    /// Гость ходит по экрану, питомец гонится и выдворяет его; в журнал
+    /// уходит только настроение (Played), стычка сама по себе — не история.
+    #[test]
+    fn the_pet_chases_a_mob_off_the_screen() {
+        let (mut app, _tx, dir) = adult_app("war-chase");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        assert_eq!(app.spawn_mob(Some(PropKind::DustBall), now), Response::Ok);
+        let mob = app
+            .prop_of(PropKind::DustBall)
+            .expect("гость пришёл")
+            .clone();
+        // Пришёл от края экрана, а не возник посреди.
+        let screen = app.world.as_ref().unwrap().screen;
+        let to_edge = (mob.pos.x - screen.x).min(screen.right() - mob.pos.x);
+        assert!(to_edge <= mob.size, "гость зашёл с края: {to_edge:.0}");
+
+        // Питомец бросается в погоню.
+        let mut chased = false;
+        for _ in 0..300 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app
+                .errand
+                .as_ref()
+                .is_some_and(|e| e.kind == ErrandKind::Chase)
+            {
+                chased = true;
+                break;
+            }
+        }
+        assert!(chased, "питомец погнался за гостем");
+
+        // Догоняет и выдворяет.
+        for _ in 0..3600 {
+            now += 1.0 / 60.0;
+            app.tick(now);
+            if app.prop_of(PropKind::DustBall).is_none() {
+                break;
+            }
+        }
+        assert!(app.prop_of(PropKind::DustBall).is_none(), "гость выдворен");
+        assert!(app.mob_life.is_empty(), "жизнь гостя убрана из учёта");
+        let kinds = journal_kinds(&dir);
+        assert!(
+            kinds.iter().any(|k| matches!(k, EventKind::Played)),
+            "настроение записано"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Режим войны по умолчанию выключен: сам демон гостей не пускает.
+    /// Позванный руками гость приходит в любом режиме — это воля человека.
+    #[test]
+    fn war_mode_is_off_by_default() {
+        let (mut app, tx, dir) = adult_app("war-off");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        assert!(!app.game.war_mode, "по умолчанию выключен");
+
+        // Проверка «не пустить ли гостя» проходит, но никто не приходит.
+        app.mob_check_at = now;
+        settle(&mut app, &mut now, 1.0);
+        assert!(
+            !app.props.iter().any(|p| p.kind.mob().is_some()),
+            "с выключенным режимом гостей нет"
+        );
+
+        // А по команде — приходит.
+        let reply = send(
+            &tx,
+            Request::Mob {
+                kind: Some("roach".into()),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert_eq!(reply.recv().unwrap(), Response::Ok);
+        assert!(app.prop_of(PropKind::Roach).is_some(), "таракан пришёл");
+
+        // Неизвестный гость — понятная ошибка.
+        let reply = send(
+            &tx,
+            Request::Mob {
+                kind: Some("годзилла".into()),
+            },
+        );
+        now += 0.05;
+        app.tick(now);
+        assert!(matches!(reply.recv().unwrap(), Response::Error(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Гость уходит сам, когда пожил своё, — даже если питомец занят.
+    #[test]
+    fn a_mob_leaves_on_its_own() {
+        let (mut app, _tx, dir) = adult_app("war-life");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.spawn_mob(Some(PropKind::Bug), now);
+        let id = app.prop_of(PropKind::Bug).unwrap().id;
+        // Питомца нет на сцене — гонять некому, но гость всё равно уйдёт.
+        app.pet = None;
+        app.mob_life.insert(id, now + 1.0);
+        settle(&mut app, &mut now, 2.0);
+        assert!(app.prop_of(PropKind::Bug).is_none(), "гость ушёл сам");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

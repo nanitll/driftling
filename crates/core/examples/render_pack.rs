@@ -478,7 +478,31 @@ fn rides(pack: &Pack, out: &Path) {
         }
     }
     c.save(&out.join("rides.png"));
-    println!("пруф транспорта записан в {}", out.display());
+
+    // Незваные гости (H6): каждый со своим силуэтом рядом с питомцем.
+    use driftling_core::effects::mob_frame;
+    let mut m = Canvas::new(560, 200, DARK_BG);
+    let ground = 150.0f32;
+    m.blit(&idle[0], 30, (ground - PET as f32) as u32);
+    for (i, kind) in PropKind::MOBS.iter().enumerate() {
+        let width = (PET as f32 * kind.class().size_scale) as u32;
+        let frame = mob_frame(*kind, width, darken(color, 0.7));
+        let x = 200.0 + i as f32 * 120.0;
+        let prop = Prop::new(1, *kind, Vec2::new(x, ground), PET as f32);
+        let b = prop.bounds();
+        m.blit_deformed(
+            &frame,
+            Vec2::new(b.x, b.y),
+            Deform {
+                scale_x: b.w / frame.w as f32,
+                scale_y: b.h / frame.h as f32,
+                ..Deform::NONE
+            },
+            1.0,
+        );
+    }
+    m.save(&out.join("mobs.png"));
+    println!("пруф транспорта и гостей записан в {}", out.display());
 }
 
 fn radial(pack: &Pack, out: &Path) {

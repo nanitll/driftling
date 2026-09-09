@@ -413,6 +413,102 @@ pub fn vehicle_frame(kind: crate::prop::PropKind, w: u32, body: u32, accent: u32
     frame
 }
 
+/// Незваный гость (фаза H6): вид сбоку, смотрит вправо. Мобы нарочно
+/// мелкие и не страшные — это зрелище, а не бой.
+pub fn mob_frame(kind: crate::prop::PropKind, w: u32, tint: u32) -> Frame {
+    use crate::prop::PropKind as K;
+    let class = kind.class();
+    let w = w.max(8);
+    let h = ((w as f32 * class.aspect) as u32).max(6);
+    let mut frame = blank(w, h);
+    let (fw, fh) = (w as f32, h as f32);
+    let dark = crate::palette::darken(tint, 0.55);
+    let light = crate::palette::lighten(tint, 1.35);
+    match kind {
+        K::DustBall => {
+            // Клубок пыли: рыхлый шар из нескольких кружков.
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.5, fh * 0.55),
+                fh * 0.42,
+                tint,
+                0.9,
+            );
+            for (dx, dy, r) in [
+                (0.26f32, 0.36f32, 0.22f32),
+                (0.74, 0.42, 0.2),
+                (0.44, 0.82, 0.24),
+                (0.68, 0.76, 0.18),
+            ] {
+                disc(
+                    &mut frame,
+                    Vec2::new(fw * dx, fh * dy),
+                    fh * r,
+                    if dy > 0.6 { dark } else { light },
+                    0.85,
+                );
+            }
+        }
+        K::Roach => {
+            // Таракан: овал, усы и лапки.
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.45, fh * 0.55),
+                fh * 0.42,
+                dark,
+                1.0,
+            );
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.75, fh * 0.5),
+                fh * 0.26,
+                dark,
+                1.0,
+            );
+            for (x0, x1, y) in [(0.72f32, 0.98f32, 0.16f32), (0.72, 0.96, 0.34)] {
+                for x in ((fw * x0) as u32)..=((fw * x1) as u32).min(w - 1) {
+                    put(&mut frame, x, (fh * y) as u32, dark, 0.9);
+                }
+            }
+            for x in [0.24f32, 0.44, 0.62] {
+                for y in ((fh * 0.82) as u32)..h {
+                    put(&mut frame, (fw * x) as u32, y, dark, 0.9);
+                }
+            }
+        }
+        K::Bug => {
+            // Жук-баг: круглое тельце, спинка со швом и глазки-точки.
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.5, fh * 0.55),
+                fh * 0.44,
+                tint,
+                1.0,
+            );
+            for y in ((fh * 0.16) as u32)..h {
+                put(&mut frame, (fw * 0.5) as u32, y, dark, 0.8);
+            }
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.3, fh * 0.34),
+                fh * 0.1,
+                dark,
+                1.0,
+            );
+            disc(
+                &mut frame,
+                Vec2::new(fw * 0.7, fh * 0.34),
+                fh * 0.1,
+                dark,
+                1.0,
+            );
+            let _ = light;
+        }
+        _ => {}
+    }
+    frame
+}
+
 fn blank(w: u32, h: u32) -> Frame {
     Frame {
         w,

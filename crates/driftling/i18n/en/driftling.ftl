@@ -14,6 +14,8 @@ cli-about-feed-treat = Give a treat instead (mood up; overuse hurts health)
 cli-about-play = Play with the pet
 cli-about-ride = Take the pet for a ride (random vehicle if omitted)
 cli-about-ride-kind = Vehicle: skate, bike, moped, car, copter, plane
+cli-about-mob = Send in an uninvited guest (war mode)
+cli-about-mob-kind = Which one: dustball, roach, bug
 daemon-unknown-vehicle = Unknown vehicle "{ $value }". Available: { $known }
 cli-about-sleep = Put the pet to sleep
 cli-about-rename = Rename the pet
@@ -141,6 +143,7 @@ bubble-bye = Bye!
 bubble-birthday = Happy birthday!
 bubble-wheee = Wheee!
 bubble-fetch = Fetch!
+bubble-scared-off = Shoo!
 bubble-yuck = Blergh…
 
 # --- pet ---

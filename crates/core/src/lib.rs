@@ -36,7 +36,7 @@ pub mod text;
 pub use attributes::{PetAttributes, PetRecord};
 pub use behavior::{BehaviorConfig, IdleAction, PetState};
 pub use body::Body;
-pub use config::{Config, PhysicsConfig, SyncConfig, SyncMode};
+pub use config::{Config, GameConfig, PhysicsConfig, SyncConfig, SyncMode};
 pub use geometry::{Rect, Vec2};
 pub use growth::Stage;
 #[cfg(not(target_arch = "wasm32"))]

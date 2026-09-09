@@ -16,6 +16,25 @@ pub struct Config {
     pub sync: SyncConfig,
     /// Физика мира (фаза G3).
     pub physics: PhysicsConfig,
+    /// Игровые режимы (фаза H6).
+    pub game: GameConfig,
+}
+
+/// Секция `[game]`: необязательные развлечения, выключенные по умолчанию.
+///
+/// ```toml
+/// [game]
+/// war_mode = true    # к питомцу изредка заходят незваные гости
+/// ```
+///
+/// Режим войны — зрелище, а не бой: питомец гоняет мобов по экрану, никто
+/// никому не наносит урона, здоровье не трогается, и в журнал ухода эти
+/// стычки не попадают (см. `docs/WORLD.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GameConfig {
+    /// Пускать ли мобов на экран.
+    pub war_mode: bool,
 }
 
 /// Секция `[physics]`: единственная ручка — насколько питомец большой

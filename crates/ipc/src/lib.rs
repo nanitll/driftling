@@ -47,6 +47,11 @@ pub enum Request {
     Play,
     /// Уложить спать.
     PutToSleep,
+    /// Запустить на экран незваного гостя (фаза H6, режим войны).
+    /// `kind` — dustball, roach, bug; None — случайный.
+    Mob {
+        kind: Option<String>,
+    },
     /// Прокатить питомца (фаза H5). `kind` — вид транспорта (skate, bike,
     /// moped, car, copter, plane); None — случайный. Повторный вызов во
     /// время поездки высаживает питомца.

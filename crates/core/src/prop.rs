@@ -49,6 +49,30 @@ pub enum PropKind {
     Copter,
     /// Самолёт: полёт по дуге через весь экран.
     Plane,
+    /// Пылевой комок: катается по полу и сорит (режим войны, H6).
+    DustBall,
+    /// Таракан: быстро бегает и удирает.
+    Roach,
+    /// Жук-баг: сидит на кромке окна и «портит» её.
+    Bug,
+}
+
+/// Профиль моба (фаза H6): чем незваный гость занят на экране.
+///
+/// Мобы — зрелище, а не бой: они не наносят урона, живут минуты и никогда
+/// не попадают в журнал ухода.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mob {
+    /// Скорость хода как кратность делового шага питомца.
+    pub speed_x: f32,
+    /// Сколько живёт на экране, сек (от и до).
+    pub life_secs: (f32, f32),
+    /// Убегает, когда питомец подошёл ближе этого (в размерах питомца).
+    pub flee_at: f32,
+    /// Насколько быстрее ходит, когда удирает.
+    pub flee_boost: f32,
+    /// Сидит на кромке окна, а не бегает по полу.
+    pub on_ledge: bool,
 }
 
 /// Профиль транспорта (фаза H5): чем он отличается от остальных.
@@ -56,8 +80,11 @@ pub enum PropKind {
 /// а не способ быстрее двигаться по экрану.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vehicle {
-    /// Скорость хода, м/с «в жизни» (переводится через [`crate::body`]).
-    pub speed_mps: f32,
+    /// Скорость хода как кратность ДЕЛОВОГО шага питомца (того, которым он
+    /// идёт к миске). В «настоящих» м/с транспорт получался бы в разы
+    /// быстрее всего, что питомец делает на экране, — и смотрелся бы не
+    /// зрелищем, а телепортацией.
+    pub speed_x: f32,
     /// Летает (иначе катится по полу).
     pub air: bool,
     /// Сколько катается, сек (от и до).
@@ -146,6 +173,25 @@ impl PropKind {
             },
             // Транспорт: не хранится в журнале (это событие, а не быт),
             // мышью не таскается — питомец сам на него садится.
+            // Мобы: лёгкие, мышью не ловятся, в журнале их нет.
+            PropKind::DustBall | PropKind::Roach | PropKind::Bug => PropClass {
+                anchor: Surface::Floor,
+                size_scale: match self {
+                    PropKind::DustBall => 0.5,
+                    PropKind::Roach => 0.42,
+                    _ => 0.34,
+                },
+                aspect: match self {
+                    PropKind::Roach => 0.6,
+                    _ => 0.85,
+                },
+                density_scale: 0.2,
+                draggable: false,
+                solid: false,
+                persist: false,
+                restitution: 0.2,
+                throwable: false,
+            },
             PropKind::Skate
             | PropKind::Bike
             | PropKind::Moped
@@ -193,11 +239,16 @@ impl PropKind {
     /// Профиль транспорта; None — это не транспорт.
     pub fn vehicle(self) -> Option<Vehicle> {
         let v = match self {
-            PropKind::Mop | PropKind::Bowl | PropKind::Bed | PropKind::Ball | PropKind::House => {
-                return None
-            }
+            PropKind::Mop
+            | PropKind::Bowl
+            | PropKind::Bed
+            | PropKind::Ball
+            | PropKind::House
+            | PropKind::DustBall
+            | PropKind::Roach
+            | PropKind::Bug => return None,
             PropKind::Skate => Vehicle {
-                speed_mps: 1.6,
+                speed_x: 1.6,
                 air: false,
                 ride_secs: (14.0, 24.0),
                 seat: 0.22,
@@ -205,7 +256,7 @@ impl PropKind {
                 rider_behind: false,
             },
             PropKind::Bike => Vehicle {
-                speed_mps: 2.2,
+                speed_x: 2.0,
                 air: false,
                 ride_secs: (16.0, 28.0),
                 seat: 0.36,
@@ -213,7 +264,7 @@ impl PropKind {
                 rider_behind: false,
             },
             PropKind::Moped => Vehicle {
-                speed_mps: 3.2,
+                speed_x: 3.0,
                 air: false,
                 ride_secs: (16.0, 26.0),
                 seat: 0.42,
@@ -221,7 +272,7 @@ impl PropKind {
                 rider_behind: false,
             },
             PropKind::Car => Vehicle {
-                speed_mps: 2.8,
+                speed_x: 2.4,
                 air: false,
                 ride_secs: (18.0, 30.0),
                 seat: 0.86,
@@ -229,7 +280,7 @@ impl PropKind {
                 rider_behind: true,
             },
             PropKind::Copter => Vehicle {
-                speed_mps: 2.4,
+                speed_x: 2.0,
                 air: true,
                 ride_secs: (20.0, 34.0),
                 seat: 0.62,
@@ -237,7 +288,7 @@ impl PropKind {
                 rider_behind: false,
             },
             PropKind::Plane => Vehicle {
-                speed_mps: 4.5,
+                speed_x: 3.5,
                 air: true,
                 ride_secs: (14.0, 22.0),
                 seat: 0.58,
@@ -247,6 +298,37 @@ impl PropKind {
         };
         Some(v)
     }
+
+    /// Профиль моба; None — это не моб.
+    pub fn mob(self) -> Option<Mob> {
+        match self {
+            PropKind::DustBall => Some(Mob {
+                speed_x: 0.5,
+                life_secs: (60.0, 150.0),
+                flee_at: 1.2,
+                flee_boost: 1.4,
+                on_ledge: false,
+            }),
+            PropKind::Roach => Some(Mob {
+                speed_x: 1.3,
+                life_secs: (40.0, 90.0),
+                flee_at: 2.2,
+                flee_boost: 1.6,
+                on_ledge: false,
+            }),
+            PropKind::Bug => Some(Mob {
+                speed_x: 0.4,
+                life_secs: (50.0, 120.0),
+                flee_at: 1.6,
+                flee_boost: 1.5,
+                on_ledge: true,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Все виды мобов.
+    pub const MOBS: [PropKind; 3] = [PropKind::DustBall, PropKind::Roach, PropKind::Bug];
 
     /// Все виды транспорта — по этому списку он и выбирается случайно.
     pub const VEHICLES: [PropKind; 6] = [
@@ -272,6 +354,9 @@ impl PropKind {
             PropKind::Car => "car",
             PropKind::Copter => "copter",
             PropKind::Plane => "plane",
+            PropKind::DustBall => "dustball",
+            PropKind::Roach => "roach",
+            PropKind::Bug => "bug",
         }
     }
 }

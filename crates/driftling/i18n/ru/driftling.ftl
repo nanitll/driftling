@@ -13,6 +13,8 @@ cli-about-feed-treat = Дать вкусняшку (настроение выш�
 cli-about-play = Поиграть с питомцем
 cli-about-ride = Прокатить питомца (без вида — случайный транспорт)
 cli-about-ride-kind = Вид транспорта: skate, bike, moped, car, copter, plane
+cli-about-mob = Запустить незваного гостя (режим войны)
+cli-about-mob-kind = Кто именно: dustball, roach, bug
 daemon-unknown-vehicle = Неизвестный транспорт «{ $value }». Есть: { $known }
 cli-about-sleep = Уложить питомца спать
 cli-about-rename = Переименовать питомца
@@ -142,6 +144,7 @@ bubble-bye = Пока!
 bubble-birthday = С днём рождения!
 bubble-wheee = Уиии!
 bubble-fetch = Держи!
+bubble-scared-off = Кыш!
 bubble-yuck = Бэ-э…
 
 # --- Питомец ---
