@@ -162,6 +162,11 @@ pub struct Pet {
 /// а не кликом (ТД-24), логические пиксели.
 const DRAG_THRESHOLD: f32 = 4.0;
 
+/// Подшаг интегрирования пружин тела, сек (фаза G6). Тик приложения бывает
+/// и раз в секунду (сон) — пружину такой шаг разносит, подшаг держит её
+/// устойчивой независимо от темпа.
+const BODY_STEP: f32 = 1.0 / 120.0;
+
 impl Pet {
     pub fn new(pos: Vec2, size: f32, cfg: BehaviorConfig, seed: u64) -> Self {
         let mut rng = fastrand::Rng::with_seed(seed);
@@ -512,12 +517,27 @@ impl Pet {
         if dt <= 0.0 {
             return;
         }
-        // Пружина формы.
+        // Пружины интегрируются ПОДШАГАМИ: в покое тик идёт 5 Гц, во сне —
+        // 1 Гц, и явный шаг такой длины пружину разносит (ω²Δt² ≫ 1) —
+        // питомец начинал безостановочно «качать мышцы». Подшаг держит
+        // ω²Δt² ≪ 1 при любом темпе тика.
         let rest = self.rest_shape();
-        let cfg = &self.cfg;
-        self.squash_vel +=
-            ((rest - self.squash) * cfg.squash_spring - self.squash_vel * cfg.squash_damping) * dt;
-        self.squash = (self.squash + self.squash_vel * dt).clamp(0.6, 1.5);
+        let (k, c) = (self.cfg.squash_spring, self.cfg.squash_damping);
+        let mut left = dt;
+        while left > 0.0 {
+            let step = left.min(BODY_STEP);
+            left -= step;
+            self.squash_vel += ((rest - self.squash) * k - self.squash_vel * c) * step;
+            self.squash = (self.squash + self.squash_vel * step).clamp(0.6, 1.5);
+        }
+        // Мёртвая зона: около покоя форма защёлкивается ровно в единицу,
+        // иначе целочисленный масштаб пиксельного спрайта дрожит.
+        if (self.squash - rest).abs() < self.cfg.squash_deadzone
+            && self.squash_vel.abs() < self.cfg.squash_deadzone * 8.0
+        {
+            self.squash = rest;
+            self.squash_vel = 0.0;
+        }
 
         // Ускорение тела по горизонтали — из фактического перемещения:
         // так одинаково ловятся и шаг, и бросок, и рывок мышью.
@@ -531,12 +551,27 @@ impl Pet {
             // На ходу питомец слегка наклоняется вперёд.
             target += self.facing.sign() * self.size * 0.03;
         }
-        self.lean_vel +=
-            ((target - self.lean) * cfg.lean_spring - self.lean_vel * cfg.lean_damping) * dt;
-        self.lean = (self.lean + self.lean_vel * dt).clamp(-limit * 1.5, limit * 1.5);
+        let (lk, lc) = (self.cfg.lean_spring, self.cfg.lean_damping);
+        let mut left = dt;
+        while left > 0.0 {
+            let step = left.min(BODY_STEP);
+            left -= step;
+            self.lean_vel += ((target - self.lean) * lk - self.lean_vel * lc) * step;
+            self.lean = (self.lean + self.lean_vel * step).clamp(-limit * 1.5, limit * 1.5);
+        }
+        // У покоя завал тоже защёлкивается, чтобы верхушка не подрагивала.
+        if (self.lean - target).abs() < 0.5 && self.lean_vel.abs() < 4.0 {
+            self.lean = target;
+            self.lean_vel = 0.0;
+        }
     }
 
     /// Форма, к которой тянется пружина в текущем состоянии.
+    ///
+    /// Непрерывной «игры мышцами» тут нет намеренно: у пиксельного спрайта
+    /// масштаб целочисленный, и постоянная дрожь на полпроцента читается
+    /// как кипящая картинка. Деформация — на СОБЫТИЯ (удар, прыжок, полёт),
+    /// в остальное время тело ровное.
     fn rest_shape(&self) -> f32 {
         match self.state {
             // В полёте тело вытягивается тем сильнее, чем быстрее летит.
@@ -550,17 +585,9 @@ impl Pet {
             }
             // В руке слегка обвисает.
             PetState::Dragged => 1.0 + self.cfg.stretch_in_air * 0.25,
-            // Шаг: лёгкое покачивание в такт (походка 6 кадров/с = 3 шага).
-            PetState::Walk => 1.0 - 0.02 * (self.state_time * 3.0 * core::f32::consts::TAU).sin(),
-            PetState::Climb => {
-                1.0 - 0.015
-                    * (self.state_time * self.cfg.climb_pull_hz * core::f32::consts::TAU).sin()
-            }
-            // Покой и сон: дыхание, во сне медленнее и глубже.
-            PetState::Sleep => 1.0 + self.cfg.breath_depth * 1.4 * (self.state_time * 1.4).sin(),
-            PetState::Idle => 1.0 + self.cfg.breath_depth * (self.state_time * 2.4).sin(),
-            PetState::Landing => 0.93,
-            PetState::Roll => 1.0,
+            // Всё остальное — ровная форма: качку даёт только пружина
+            // после удара или толчка, и она затухает.
+            _ => 1.0,
         }
     }
 
@@ -1934,8 +1961,9 @@ mod tests {
         assert!(p.squash() > 1.02, "в падении вытянут: {}", p.squash());
         assert!(p.deform().scale_x < 1.0, "по горизонтали уже");
 
+        // Долетаем до пола и смотрим глубину сминания (падать ещё ~0.4 с).
         let mut min_squash = 1.0f32;
-        for _ in 0..40 {
+        for _ in 0..90 {
             p.tick(&w, 1.0 / 120.0);
             min_squash = min_squash.min(p.squash());
         }
@@ -1951,25 +1979,53 @@ mod tests {
         );
     }
 
-    /// В покое тело дышит: форма всё время слегка гуляет вокруг единицы.
+    /// В покое тело РОВНОЕ и не дрожит — при любом темпе тика.
+    ///
+    /// Регрессия: пружину формы интегрировали явным шагом, а в покое тик
+    /// идёт 5 Гц (во сне 1 Гц) — ω²Δt² ≫ 1, пружина расходилась до упоров,
+    /// и питомец «бесконечно флексил». Подшаг и мёртвая зона это чинят.
     #[test]
-    fn idle_body_breathes() {
+    fn idle_body_is_still_at_any_tick_rate() {
+        let w = world();
+        for dt in [1.0 / 60.0, 1.0 / 5.0, 1.0] {
+            let mut p = pet();
+            p.pos.y = w.ground_y();
+            p.vel = Vec2::default();
+            p.state = PetState::Idle;
+            p.state_time = 0.0;
+            p.state_left = 10_000.0;
+            p.squash = 1.0;
+            p.squash_vel = 0.0;
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            for _ in 0..200 {
+                p.tick(&w, dt);
+                lo = lo.min(p.squash());
+                hi = hi.max(p.squash());
+            }
+            assert_eq!((lo, hi), (1.0, 1.0), "покой дрожит при dt={dt}");
+            assert!(p.deform().is_identity(), "деформация в покое лишняя");
+        }
+    }
+
+    /// Ходьба и сон тоже не качают тело: деформация — только на события.
+    #[test]
+    fn walking_and_sleeping_do_not_pulse() {
         let w = world();
         let mut p = pet();
-        for _ in 0..600 {
-            p.tick(&w, 1.0 / 60.0);
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
+        p.pos = Vec2::new(600.0, w.ground_y());
+        for state in [PetState::Walk, PetState::Sleep] {
+            p.state = state;
+            p.state_time = 0.0;
+            p.state_left = 10_000.0;
+            p.squash = 1.0;
+            p.squash_vel = 0.0;
+            for _ in 0..240 {
+                p.tick(&w, 1.0 / 30.0);
+                assert_eq!(p.squash(), 1.0, "{state:?} качает тело");
+            }
         }
-        p.state = PetState::Idle;
-        p.state_time = 0.0;
-        p.state_left = 1000.0;
-        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
-        for _ in 0..300 {
-            p.tick(&w, 1.0 / 60.0);
-            lo = lo.min(p.squash());
-            hi = hi.max(p.squash());
-        }
-        assert!(hi - lo > 0.004, "дыхания не видно: {lo}..{hi}");
-        assert!(hi - lo < 0.12, "дыхание не должно быть тряской: {lo}..{hi}");
     }
 
     /// Резкий рывок в руке заваливает верхушку (инерция хохолка), и завал
