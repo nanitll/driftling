@@ -3087,7 +3087,7 @@ mod tests {
             x += 3.0;
             app.event(Event::PointerMotion(Vec2::new(x, y)), now);
         }
-        for i in 0..60 {
+        for i in 0..90 {
             now += 1.0 / 60.0;
             let dx = if i % 2 == 0 { 140.0 } else { -140.0 };
             app.event(Event::PointerMotion(Vec2::new(x + dx, y)), now);

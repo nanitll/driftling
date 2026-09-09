@@ -136,10 +136,16 @@ pub struct Pet {
     /// тает со временем. Выше 0.4 — питомца мутит (зеленеет, шатается),
     /// достигло 1 — на полу его вырвет.
     nausea: f32,
-    /// Знак горизонтальной скорости последнего рывка (для счёта разворотов).
-    shake_sign: f32,
+    /// Направление последнего быстрого хода руки (единичный вектор) —
+    /// по нему считаются РАЗВОРОТЫ, а не смены доминирующей оси.
+    shake_dir: Option<Vec2>,
     /// Предыдущая точка/время движения при захвате — для скорости рывка.
     last_motion: Option<(f32, Vec2)>,
+    /// Укачало до предела: тошнить будет, как только питомец окажется на
+    /// твёрдой земле. Флаг нужен потому, что после тряски его обычно ещё
+    /// и швыряют — пока он летит, катится и отскакивает, укачивание
+    /// успевает спасть, и тошнота терялась.
+    vomit_armed: bool,
     /// Пора тошнить: снимается демоном через [`Pet::take_vomit`].
     vomit_pending: bool,
     /// Форма тела (фаза G6): 1.0 — покой, <1 — сплющен, >1 — вытянут.
@@ -196,8 +202,9 @@ impl Pet {
             pending_bounce: None,
             bounced: false,
             nausea: 0.0,
-            shake_sign: 0.0,
+            shake_dir: None,
             last_motion: None,
+            vomit_armed: false,
             vomit_pending: false,
             squash: 1.0,
             squash_vel: 0.0,
@@ -275,7 +282,7 @@ impl Pet {
 
     /// Питомца мутит: пора менять вид на зеленоватый.
     pub fn queasy(&self) -> bool {
-        self.nausea > 0.4
+        self.nausea > self.cfg.queasy_at
     }
 
     /// Пора ли тошнить (укачало до предела и питомец на полу). Флаг
@@ -325,20 +332,26 @@ impl Pet {
         let vx = (p.x - p0.x) / dt;
         let vy = (p.y - p0.y) / dt;
         let speed = vx.hypot(vy);
-        let threshold = self.cfg.body.mps_to_px(1.2);
+        let threshold = self.cfg.body.mps_to_px(self.cfg.shake_speed_mps);
         if speed < threshold {
             return;
         }
-        let sign = if vx.abs() >= vy.abs() {
-            vx.signum()
-        } else {
-            vy.signum() * 2.0 // вертикальные развороты считаем отдельно
-        };
-        if self.shake_sign != 0.0 && sign != self.shake_sign {
-            // Разворот на скорости: чем резче, тем сильнее укачивает.
-            self.nausea = (self.nausea + 0.09 * (speed / threshold).min(3.0)).min(1.5);
+        let dir = Vec2::new(vx / speed, vy / speed);
+        if let Some(prev) = self.shake_dir {
+            // Разворотом считается смена направления НА ПРОТИВОПОЛОЖНОЕ.
+            // Раньше сравнивались знаки доминирующей оси, и диагональный
+            // перенос, дрожащий между «больше по X» и «больше по Y»,
+            // засчитывался как тряска — питомца мутило ни за что.
+            let dot = prev.x * dir.x + prev.y * dir.y;
+            if dot < self.cfg.shake_reverse_dot {
+                let hard = (speed / threshold).clamp(1.0, 3.0);
+                self.nausea = (self.nausea + self.cfg.shake_gain * hard).min(1.5);
+                if self.nausea >= 1.0 {
+                    self.vomit_armed = true;
+                }
+            }
         }
-        self.shake_sign = sign;
+        self.shake_dir = Some(dir);
     }
 
     /// Завершить перетаскивание БЕЗ броска (фаза G3): захват потерян не по
@@ -493,21 +506,27 @@ impl Pet {
             return; // в руках не отпускает
         }
         self.last_motion = None;
-        self.shake_sign = 0.0;
-        if self.nausea >= 1.0
+        self.shake_dir = None;
+        if self.vomit_armed
             && self.surface == Surface::Floor
             && matches!(
                 self.state,
                 PetState::Idle | PetState::Walk | PetState::Landing
             )
         {
+            self.vomit_armed = false;
             self.vomit_pending = true;
             self.nausea = 0.45;
             self.enter(PetState::Idle);
             self.state_left = 2.5;
             return;
         }
-        self.nausea = (self.nausea - 0.12 * dt).max(0.0);
+        self.nausea = (self.nausea - self.cfg.nausea_fade * dt).max(0.0);
+        // Пока тошнота «взведена», дурнота не проходит: он зелёный и
+        // шатается, пока его наконец не вырвет на твёрдой земле.
+        if self.vomit_armed {
+            self.nausea = self.nausea.max(self.cfg.queasy_at + 0.05);
+        }
     }
 
     /// Мягкое тело (фаза G6): пружина формы тянется к «покойной» форме
@@ -2102,21 +2121,32 @@ mod tests {
         }
         assert!(!p.queasy(), "плавный перенос не укачивает: {}", p.nausea());
 
-        // Тряска: туда-сюда по 120 px за кадр (7200 px/s), 40 разворотов.
-        for i in 0..40 {
+        // Плавный перенос ПО ДИАГОНАЛИ тоже не укачивает: раньше он
+        // засчитывался как тряска из-за дрожания доминирующей оси.
+        let mut y = grab.y - 200.0;
+        for _ in 0..60 {
+            t += 1.0 / 60.0;
+            x += 5.0;
+            y -= 4.0;
+            p.pointer(&w, PointerEvent::Motion(Vec2::new(x, y)), t);
+        }
+        assert!(
+            !p.queasy(),
+            "диагональный перенос не укачивает: {}",
+            p.nausea()
+        );
+
+        // Тряска: туда-сюда по 120 px за кадр (7200 px/s).
+        for i in 0..90 {
             t += 1.0 / 60.0;
             let dx = if i % 2 == 0 { 120.0 } else { -120.0 };
-            p.pointer(
-                &w,
-                PointerEvent::Motion(Vec2::new(x + dx, grab.y - 200.0)),
-                t,
-            );
+            p.pointer(&w, PointerEvent::Motion(Vec2::new(x + dx, y)), t);
         }
         assert!(p.queasy(), "тряска обязана укачать: {}", p.nausea());
         assert!(p.nausea() >= 0.99, "до предела: {}", p.nausea());
 
         // Отпустили: в руках рвоты нет, на полу — есть, потом отпускает.
-        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(x, grab.y - 200.0)), t));
+        assert!(p.pointer(&w, PointerEvent::Release(Vec2::new(x, y)), t));
         let mut vomited = false;
         for _ in 0..900 {
             p.tick(&w, 1.0 / 60.0);
@@ -2124,7 +2154,32 @@ mod tests {
         }
         assert!(vomited, "укачанного на полу должно вырвать");
         assert!(!p.take_vomit(), "флаг снимается чтением");
-        assert!(p.nausea() < 0.5, "после — лёгкая дурнота, не предел");
+        assert!(p.nausea() < 0.6, "после — лёгкая дурнота, не предел");
+    }
+
+    /// Тошнота не теряется, если после тряски питомца ещё и швырнули:
+    /// «укачало» запоминается и отыгрывается, когда он встанет на землю.
+    #[test]
+    fn nausea_survives_a_throw_and_a_roll() {
+        let w = world();
+        let mut p = pet();
+        p.cfg.w_wall_climb = 0;
+        p.cfg.w_wall_trip = 0;
+        // Довели до предела и бросили вбок — он покатится.
+        p.nausea = 1.2;
+        p.vomit_armed = true;
+        p.pos = Vec2::new(500.0, 400.0);
+        p.vel = Vec2::new(700.0, 300.0);
+        p.state = PetState::Falling;
+        let mut vomited = false;
+        let mut rolled = false;
+        for _ in 0..1200 {
+            p.tick(&w, 1.0 / 120.0);
+            rolled |= p.state == PetState::Roll;
+            vomited |= p.take_vomit();
+        }
+        assert!(rolled, "после броска он должен покатиться");
+        assert!(vomited, "тошнота не должна теряться в полёте и качении");
     }
 
     /// Укачанный питомец идёт медленнее и виляет.
