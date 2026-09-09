@@ -98,7 +98,11 @@ pub fn mop_frame(h: u32, handle: u32, head: u32) -> Frame {
         let (x0, x1) = ((stick_x - half) as i32, (stick_x + half) as i32);
         for x in x0.max(0)..=x1.min(w as i32 - 1) {
             // Пряди: через одну чуть темнее — видно, что это мочалка.
-            let shade = if (x as u32 + y).is_multiple_of(3) { 0.75 } else { 1.0 };
+            let shade = if (x as u32 + y).is_multiple_of(3) {
+                0.75
+            } else {
+                1.0
+            };
             put(&mut frame, x as u32, y, head, shade);
         }
     }

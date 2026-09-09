@@ -185,9 +185,30 @@ fn blit(
             }
             let off = ((cy as u32 * cw + cx as u32) * 4) as usize;
             // ARGB8888 little-endian: байты B, G, R, A.
-            canvas[off..off + 4].copy_from_slice(&px.to_le_bytes());
+            if px >> 24 == 0xff {
+                canvas[off..off + 4].copy_from_slice(&px.to_le_bytes());
+            } else {
+                // Полупрозрачный пиксель НАКЛАДЫВАЕТСЯ на уже нарисованное
+                // (src-over для premultiplied), а не заменяет его: раньше
+                // копирование пробивало питомца насквозь — сквозь зелень
+                // укачивания и облачка пыли просвечивал рабочий стол.
+                let dst =
+                    u32::from_le_bytes(canvas[off..off + 4].try_into().expect("4 байта пикселя"));
+                canvas[off..off + 4].copy_from_slice(&over(px, dst).to_le_bytes());
+            }
         }
     }
+}
+
+/// Наложить premultiplied-источник на приёмник: `dst = src + dst·(1−α)`.
+fn over(src: u32, dst: u32) -> u32 {
+    let inv = 255 - ((src >> 24) & 0xff);
+    let ch = |sh: u32| -> u32 {
+        let s = (src >> sh) & 0xff;
+        let d = (dst >> sh) & 0xff;
+        (s + (d * inv + 127) / 255).min(255)
+    };
+    (ch(24) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// Умножить premultiplied-пиксель на прозрачность: и альфа, и каналы.
@@ -362,6 +383,42 @@ mod tests {
         assert_eq!(pixel(&canvas, 4, 0, 0), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 4, 1, 0), 0xff_11_00_00);
         assert_eq!(pixel(&canvas, 4, 2, 0), 0xff_00_22_00);
+    }
+
+    /// Полупрозрачный слой НАКЛАДЫВАЕТСЯ на непрозрачный, а не пробивает
+    /// его: иначе питомец под зеленью укачивания просвечивал насквозь.
+    #[test]
+    fn blit_blends_translucent_over_opaque() {
+        let f = frame_2x2();
+        let mut canvas = vec![0u8; 2 * 2 * 4];
+        // Сначала непрозрачный слой.
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            Deform::NONE,
+            1.0,
+            1,
+        );
+        // Поверх — тот же кадр наполовину прозрачным.
+        blit(
+            &mut canvas,
+            (2, 2),
+            &f,
+            (0, 0),
+            Orient::IDENTITY,
+            Deform::NONE,
+            0.5,
+            1,
+        );
+        let px = pixel(&canvas, 2, 0, 0);
+        assert_eq!(
+            px >> 24,
+            0xff,
+            "пиксель обязан остаться непрозрачным: {px:08x}"
+        );
     }
 
     /// Прозрачность гасит premultiplied-пиксель целиком: и каналы, и альфу.

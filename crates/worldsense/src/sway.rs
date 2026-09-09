@@ -222,6 +222,7 @@ fn build_snapshot(root: &Node) -> WorldSnapshot {
         // областей по выходам тут нет — демон обойдётся workspace_bottom.
         screen_areas: Vec::new(),
         fullscreen_active,
+        fullscreen_by: None,
     }
 }
 

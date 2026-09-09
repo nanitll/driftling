@@ -129,6 +129,10 @@ const BYE_WAVE_SECS: f64 = 0.9;
 const SHADOW_FADE_PX: f32 = 420.0;
 /// Прозрачность тени, когда питомец стоит на опоре.
 const SHADOW_ALPHA: f32 = 0.85;
+/// Сколько полноэкранное окно должно продержаться, прежде чем питомец
+/// уйдёт с экрана: короткие вспышки вежливость игнорирует.
+const FULLSCREEN_GRACE: f64 = 0.9;
+
 /// Сколько живёт облачко пыли, сек.
 const PUFF_LIFE: f64 = 0.5;
 /// Лужа тает последние секунды жизни, а не исчезает мгновенно.
@@ -885,6 +889,9 @@ struct DaemonApp {
     /// Вежливость (D5): на экране полноэкранное окно — сцена прячется
     /// (пустые спрайты и input region), симуляция тикает дальше.
     fullscreen_hidden: bool,
+    /// С какого момента (время приложения) держится полноэкранное окно —
+    /// выдержка против мельтешения; None — полноэкранных окон нет.
+    fullscreen_since: Option<f64>,
     /// Взводится по IPC Quit; бэкенд проверяет через wants_exit.
     exit: bool,
     /// Старт демона — для uptime в Status.
@@ -1057,6 +1064,7 @@ impl DaemonApp {
             last_sense_poll: None,
             sense_poll_idle: SENSE_POLL_IDLE,
             fullscreen_hidden: false,
+            fullscreen_since: None,
             exit: false,
             started: Instant::now(),
             last_now: None,
@@ -2434,7 +2442,7 @@ impl DaemonApp {
     /// Троттлинг: активный питомец (Falling/Walk/Dragged) и скрытый режим
     /// (ждём ухода fullscreen) — каждый тик; спокойный — раз в
     /// `sense_poll_idle` (закрытое окно уронит питомца с опозданием ≤2 с).
-    fn poll_worldsense(&mut self) {
+    fn poll_worldsense(&mut self, now: f64) {
         let Some(sense) = self.sense.as_mut() else {
             return;
         };
@@ -2497,6 +2505,12 @@ impl DaemonApp {
                 } else {
                     None
                 };
+                if s.fullscreen_active && self.fullscreen_since.is_none() {
+                    log::debug!(
+                        "вежливость: полноэкранное окно ({})",
+                        s.fullscreen_by.as_deref().unwrap_or("?")
+                    );
+                }
                 (screen, platforms, ground, s.fullscreen_active)
             }
             None => (self.output_rect, Vec::new(), None, false),
@@ -2552,9 +2566,21 @@ impl DaemonApp {
             }
         }
 
-        if fullscreen != self.fullscreen_hidden {
-            self.fullscreen_hidden = fullscreen;
-            if fullscreen {
+        // Вежливость с выдержкой: полноэкранное окно должно продержаться
+        // FULLSCREEN_GRACE, прежде чем питомец уйдёт. Иначе мелькание
+        // (окно на секунду переходит в fullscreen и обратно) дёргает его с
+        // экрана по десять раз за час — «питомец периодически пропадает».
+        match (fullscreen, self.fullscreen_since) {
+            (true, None) => self.fullscreen_since = Some(now),
+            (false, _) => self.fullscreen_since = None,
+            _ => {}
+        }
+        let hide = self
+            .fullscreen_since
+            .is_some_and(|t| now - t >= FULLSCREEN_GRACE);
+        if hide != self.fullscreen_hidden {
+            self.fullscreen_hidden = hide;
+            if hide {
                 log::info!("вежливость (D5): полноэкранное окно — питомец прячется");
                 // Меню без сцены осталось бы висеть невидимо-некликабельным.
                 self.menu = None;
@@ -2601,7 +2627,7 @@ impl App for DaemonApp {
 
         // Рельеф из worldsense (фаза D) — до симуляции: физика кадра
         // ходит по свежим кромкам, world_changed роняет потерявших опору.
-        self.poll_worldsense();
+        self.poll_worldsense(now);
 
         // dt с прошлого тика; кламп согласован с Pet::tick (ТД-3: при
         // адаптивном темпе Drowsy тики приходят ~раз в секунду).
@@ -4424,6 +4450,7 @@ mod tests {
             workspace_bottom: bottom,
             screen_areas: Vec::new(),
             fullscreen_active: fullscreen,
+            fullscreen_by: None,
         }
     }
 
@@ -4551,7 +4578,11 @@ mod tests {
         assert!(app.menu.is_some());
 
         sense.set(Some(world_snap(&[], None, true)));
+        // Вежливость с выдержкой: мгновенная вспышка питомца не прогоняет.
         now += 0.1;
+        app.tick(now);
+        assert!(!app.fullscreen_hidden, "короткая вспышка игнорируется");
+        now += FULLSCREEN_GRACE + 0.2;
         let counts = {
             let scene = app.tick(now);
             (scene.sprites.len(), scene.input_rects.len())
@@ -4588,7 +4619,13 @@ mod tests {
         app.sense_poll_idle = Duration::ZERO;
         now += 1.0 / 60.0;
         app.tick(now);
-        assert!(app.fullscreen_hidden, "без троттлинга снапшот подхвачен");
+        assert!(
+            app.fullscreen_since.is_some(),
+            "без троттлинга снапшот подхвачен"
+        );
+        now += FULLSCREEN_GRACE + 0.2;
+        app.tick(now);
+        assert!(app.fullscreen_hidden, "и после выдержки питомец спрятан");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

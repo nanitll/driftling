@@ -60,6 +60,9 @@ pub struct WorldSnapshot {
     pub screen_areas: Vec<ScreenArea>,
     /// Есть полноэкранное окно: питомцу пора прятаться (вежливость, D5).
     pub fullscreen_active: bool,
+    /// Класс окна, из-за которого включилась вежливость — только для лога:
+    /// без него «питомец опять пропал» невозможно объяснить.
+    pub fullscreen_by: Option<String>,
 }
 
 impl WorldSnapshot {

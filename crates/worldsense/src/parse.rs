@@ -109,6 +109,11 @@ pub(crate) fn filter(raw: &RawSnapshot) -> WorldSnapshot {
         // Флагу скрипта доверяем, но на всякий случай дублируем по окнам.
         fullscreen_active: raw.any_fullscreen
             || raw.windows.iter().any(|w| w.fullscreen && !w.minimized),
+        fullscreen_by: raw
+            .windows
+            .iter()
+            .find(|w| w.fullscreen && !w.minimized)
+            .map(|w| w.cls.clone()),
     }
 }
 

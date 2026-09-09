@@ -177,6 +177,7 @@ fn build_snapshot(clients_json: &str, monitors_json: &str) -> Option<WorldSnapsh
         // по выходам нет, демон возьмёт workspace_bottom.
         screen_areas: Vec::new(),
         fullscreen_active,
+        fullscreen_by: None,
     })
 }
 
