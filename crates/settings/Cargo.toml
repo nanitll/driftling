@@ -17,6 +17,9 @@ anyhow = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
+# Настройки самого окна (settings-ui.toml) — тот же toml, что у ядра.
+serde = { workspace = true }
+toml = { workspace = true }
 eframe = "0.36"
 i18n-embed = { workspace = true }
 i18n-embed-fl = { workspace = true }

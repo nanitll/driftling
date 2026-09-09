@@ -123,13 +123,13 @@ pub struct GameConfig {
     /// Пускать ли гостей на экран (режим войны).
     pub war_mode: bool,
     /// Как часто демон думает, не позвать ли гостя, мин.
-    pub mob_every_mins: f32,
+    pub mob_every_mins: f64,
     /// Какие гости допущены (машинные имена); пусто — все.
     pub mob_kinds: Vec<String>,
     /// Приезжает ли транспорт сам.
     pub rides: bool,
     /// Как часто демон думает подать транспорт, мин.
-    pub ride_every_mins: f32,
+    pub ride_every_mins: f64,
     /// Какой транспорт допущен (машинные имена); пусто — весь.
     pub ride_kinds: Vec<String>,
 }
@@ -171,13 +171,13 @@ pub struct WorldConfig {
     /// Домик появляется сам по возрасту.
     pub auto_house: bool,
     /// С какого возраста появляется домик, суток.
-    pub house_age_days: f32,
+    pub house_age_days: f64,
     /// Как часто питомец думает зайти домой посидеть, мин.
-    pub house_visit_every_mins: f32,
+    pub house_visit_every_mins: f64,
     /// Оставляет ли тошнота лужу (и есть ли что убирать шваброй).
     pub puddles: bool,
     /// Сколько питомца не трогают, прежде чем он берётся за уборку, сек.
-    pub chore_delay_secs: f32,
+    pub chore_delay_secs: f64,
     /// Появляются ли лужи и мусор — и есть ли что убирать шваброй.
     pub litter: bool,
     /// Чихает ли питомец в покое.
@@ -222,7 +222,7 @@ pub struct ComfortConfig {
     /// Прятаться при полноэкранном окне (вежливость D5).
     pub hide_on_fullscreen: bool,
     /// Сколько окно должно продержаться, прежде чем питомец уйдёт, сек.
-    pub fullscreen_grace_secs: f32,
+    pub fullscreen_grace_secs: f64,
     /// Укачивает ли питомца от тряски мышью.
     pub motion_sickness: bool,
     /// Тихий час: никакой самодеятельности.
@@ -230,9 +230,9 @@ pub struct ComfortConfig {
     /// Множитель частоты случайных событий: 0 — только явные действия.
     /// Множит ИНТЕРВАЛЫ между проверками (секунды), а не веса поведения из
     /// ста — иначе сон или прогулка стали бы недостижимы.
-    pub surprises: f32,
+    pub surprises: f64,
     /// Размер подписей у питомца: пузыри и меню (0.8..2.0).
-    pub text_scale: f32,
+    pub text_scale: f64,
 }
 
 impl Default for ComfortConfig {
@@ -264,7 +264,7 @@ impl Default for ComfortConfig {
 #[serde(default)]
 pub struct PhysicsConfig {
     /// Рост взрослого питомца в сантиметрах.
-    pub pet_height_cm: f32,
+    pub pet_height_cm: f64,
 }
 
 impl Default for PhysicsConfig {
@@ -278,7 +278,7 @@ impl Default for PhysicsConfig {
 impl PhysicsConfig {
     /// Рост в метрах, с защитой от нулей и абсурда в файле.
     pub fn height_m(&self) -> f32 {
-        (self.pet_height_cm / 100.0).clamp(0.03, 3.0)
+        (self.pet_height_cm as f32 / 100.0).clamp(0.03, 3.0)
     }
 }
 
@@ -444,7 +444,13 @@ mod fs {
     impl Config {
         /// Прочитать конфиг; нет файла — дефолт, битый файл — ошибка текстом.
         pub fn load() -> Result<Config, String> {
-            match std::fs::read_to_string(path()) {
+            Config::load_at(&path())
+        }
+
+        /// То же, но из конкретного файла: тестам не нужно подменять
+        /// переменные окружения процесса (а с ними — гонки между тестами).
+        pub fn load_at(p: &std::path::Path) -> Result<Config, String> {
+            match std::fs::read_to_string(p) {
                 Ok(text) => toml::from_str(&text).map_err(|e| e.to_string()),
                 Err(_) => Ok(Config::default()),
             }
@@ -452,14 +458,18 @@ mod fs {
 
         /// Атомарная запись: во временный файл + rename.
         pub fn save(&self) -> Result<(), String> {
-            let p = path();
+            self.save_at(&path())
+        }
+
+        /// Запись в конкретный файл.
+        pub fn save_at(&self, p: &std::path::Path) -> Result<(), String> {
             if let Some(dir) = p.parent() {
                 std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             }
             let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
             let tmp = p.with_extension("toml.tmp");
             std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+            std::fs::rename(&tmp, p).map_err(|e| e.to_string())
         }
     }
 }

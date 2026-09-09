@@ -1767,7 +1767,7 @@ impl DaemonApp {
             pet_center: center,
             pet_size,
             baked: (-1.0, [0; 3], 0),
-            px: MENU_PX * self.comfort.text_scale.clamp(0.6, 3.0),
+            px: MENU_PX * self.comfort.text_scale.clamp(0.6, 3.0) as f32,
         };
         menu.rebake(now, self.menu_stats());
         self.menu = Some(menu);
@@ -2066,7 +2066,7 @@ impl DaemonApp {
             return;
         }
         let days = wall_now_ms().saturating_sub(born) as f64 / 86_400_000.0;
-        if days < self.world_cfg.house_age_days as f64 {
+        if days < self.world_cfg.house_age_days {
             return;
         }
         let Some(world) = &self.world else {
@@ -2184,8 +2184,7 @@ impl DaemonApp {
         if now < self.home_check_at || self.props.is_empty() {
             return;
         }
-        let home_every =
-            self.surprise_interval(self.world_cfg.house_visit_every_mins as f64 * 60.0);
+        let home_every = self.surprise_interval(self.world_cfg.house_visit_every_mins * 60.0);
         self.home_check_at = now + home_every;
         let calm = self.spontaneous()
             && self.menu.is_none()
@@ -2275,8 +2274,7 @@ impl DaemonApp {
     fn mob_tick(&mut self, now: f64, dt: f32) {
         // Изредка — новый гость, если режим войны включён.
         if now >= self.mob_check_at {
-            self.mob_check_at =
-                now + self.surprise_interval(self.game.mob_every_mins as f64 * 60.0);
+            self.mob_check_at = now + self.surprise_interval(self.game.mob_every_mins * 60.0);
             let none_yet = !self.props.iter().any(|p| p.kind.mob().is_some());
             if self.game.war_mode && self.spontaneous() && none_yet && noise(now * 4.1) > 0.3 {
                 let _ = self.spawn_mob(None, now);
@@ -2456,8 +2454,7 @@ impl DaemonApp {
     fn ride_tick(&mut self, now: f64, dt: f32) {
         // Изредка транспорт приезжает сам — как сюрприз, не по расписанию.
         if self.riding.is_none() && now >= self.ride_check_at {
-            self.ride_check_at =
-                now + self.surprise_interval(self.game.ride_every_mins as f64 * 60.0);
+            self.ride_check_at = now + self.surprise_interval(self.game.ride_every_mins * 60.0);
             let calm = self.game.rides
                 && self.spontaneous()
                 && self.menu.is_none()
@@ -2767,7 +2764,7 @@ impl DaemonApp {
         if !calm || !self.pet_afoot() {
             return;
         }
-        let left_alone = now - self.last_touch >= self.world_cfg.chore_delay_secs as f64;
+        let left_alone = now - self.last_touch >= self.world_cfg.chore_delay_secs;
         let queasy = self.pet.as_ref().is_some_and(|p| p.queasy());
         // Уборка: только когда его оставили в покое и уже не мутит.
         if let (true, false, Some(puddle)) = (left_alone, queasy, self.puddle.as_ref()) {
@@ -3504,7 +3501,7 @@ impl DaemonApp {
             Request::SetAttributes(attrs) => self.set_attributes(attrs),
             Request::Reload => self.reload(),
             Request::GetConfig => self.get_config(),
-            Request::SetConfig { patch } => self.set_config(patch),
+            Request::SetConfig { patch } => self.set_config(*patch),
             Request::World => self.world_info(),
             Request::Toy { show } => self.toy(show, now),
             Request::StopRide => {
@@ -3777,7 +3774,7 @@ impl DaemonApp {
     /// Кегль подписей у питомца: пузыри и меню растут вместе (настройка
     /// `[comfort] text_scale` — единственная ручка читаемости на HiDPI).
     fn bubble_px(&self) -> f32 {
-        BUBBLE_PX * self.comfort.text_scale.clamp(0.6, 3.0)
+        BUBBLE_PX * self.comfort.text_scale.clamp(0.6, 3.0) as f32
     }
 
     /// Виды, из которых демон выбирает сам: список из конфига, а пустой
@@ -3804,7 +3801,7 @@ impl DaemonApp {
     /// Интервал «само собой» с учётом множителя сюрпризов: реже сюрпризы —
     /// длиннее пауза между проверками.
     fn surprise_interval(&self, base_secs: f64) -> f64 {
-        let k = self.comfort.surprises.clamp(0.05, 4.0) as f64;
+        let k = self.comfort.surprises.clamp(0.05, 4.0);
         base_secs / k
     }
 
@@ -4356,7 +4353,7 @@ impl DaemonApp {
             (false, _) => self.fullscreen_since = None,
             _ => {}
         }
-        let grace = self.comfort.fullscreen_grace_secs.max(0.05) as f64;
+        let grace = self.comfort.fullscreen_grace_secs.max(0.05);
         let hide = self.fullscreen_since.is_some_and(|t| now - t >= grace);
         if hide != self.fullscreen_hidden {
             self.fullscreen_hidden = hide;
@@ -4960,12 +4957,12 @@ mod tests {
     /// Выдержка вежливости «как из коробки» — теперь это дефолт конфига,
     /// а не константа кода.
     fn grace_secs() -> f64 {
-        driftling_core::ComfortConfig::default().fullscreen_grace_secs as f64
+        driftling_core::ComfortConfig::default().fullscreen_grace_secs
     }
 
     /// Пауза перед уборкой «как из коробки».
     fn chore_delay() -> f64 {
-        driftling_core::WorldConfig::default().chore_delay_secs as f64
+        driftling_core::WorldConfig::default().chore_delay_secs
     }
 
     fn tmp_dir(tag: &str) -> PathBuf {
@@ -5952,7 +5949,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let reply = send(&tx, Request::SetConfig { patch });
+        let reply = send(
+            &tx,
+            Request::SetConfig {
+                patch: Box::new(patch),
+            },
+        );
         app.tick(0.2);
         match reply.recv().unwrap() {
             Response::Reloaded { applied, .. } => {

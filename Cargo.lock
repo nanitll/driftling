@@ -1168,7 +1168,9 @@ dependencies = [
  "i18n-embed-fl",
  "log",
  "rust-embed",
+ "serde",
  "serde_json",
+ "toml 0.8.23",
 ]
 
 [[package]]

@@ -48,3 +48,32 @@ macro_rules! fl {
     };
 }
 pub(crate) use fl;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ключи файла локали: строки вида `ключ = значение` верхнего уровня.
+    fn keys(file: &str) -> std::collections::BTreeSet<String> {
+        let asset = Localizations::get(file).expect("ассет локали вшит в бинарь");
+        let text = String::from_utf8_lossy(&asset.data);
+        text.lines()
+            .filter(|l| !l.starts_with([' ', '#', '.', '*', '[']))
+            .filter_map(|l| l.split_once(" = "))
+            .map(|(k, _)| k.trim().to_string())
+            .collect()
+    }
+
+    /// Паритет локалей: у каждого ключа из en есть русская строка. Fluent
+    /// молча подставляет английскую, и «почти переведённое» окно замечаешь
+    /// только на скриншоте от пользователя.
+    #[test]
+    fn ru_translates_every_en_key() {
+        let en = keys("en/driftling.ftl");
+        let ru = keys("ru/driftling.ftl");
+        let missing: Vec<&String> = en.difference(&ru).collect();
+        assert!(missing.is_empty(), "нет русских строк для: {missing:?}");
+        let extra: Vec<&String> = ru.difference(&en).collect();
+        assert!(extra.is_empty(), "лишние русские строки: {extra:?}");
+    }
+}
