@@ -960,13 +960,17 @@ fn stage_sprites(base: u32, stage: Stage, color: u32) -> SpriteSet {
 /// Запустить окно настроек не блокируясь (пункт меню «Настройки»).
 /// Та же стратегия поиска бинаря, что в tray.rs/main.rs: рядом с собой,
 /// затем в PATH; ребёнка дожидается отдельный поток (не плодим зомби).
-fn spawn_settings_detached() {
+fn spawn_settings_detached(page: Option<&str>) {
     let sibling = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("driftling-settings")))
         .filter(|p| p.exists());
     let program = sibling.unwrap_or_else(|| "driftling-settings".into());
-    match std::process::Command::new(&program).spawn() {
+    let mut cmd = std::process::Command::new(&program);
+    if let Some(page) = page {
+        cmd.args(["--page", page]);
+    }
+    match cmd.spawn() {
         Ok(mut child) => {
             log::info!("меню: настройки запущены ({program:?}, pid {})", child.id());
             std::thread::spawn(move || {
@@ -3059,7 +3063,11 @@ impl DaemonApp {
             MenuAction::Ride => self.summon_ride(None, now),
             MenuAction::Sleep => self.put_to_sleep(now),
             MenuAction::Settings => {
-                spawn_settings_detached();
+                // Не поместилось внешнее кольцо (узкий сектор у стены) —
+                // открываем окно сразу на «Мире», где живут те же
+                // переключатели: кнопка не должна вести в никуда.
+                let page = (split == MENU_INNER.len()).then_some("world");
+                spawn_settings_detached(page);
                 Response::Ok
             }
             MenuAction::Dismiss => self.dismiss_with_wave(now),

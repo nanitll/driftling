@@ -70,8 +70,9 @@ pub(crate) fn loader_for(lang: &str) -> FluentLanguageLoader {
 mod tests {
     use super::*;
 
-    /// Ключи файла локали: строки вида `ключ = значение` верхнего уровня.
-    fn keys(file: &str) -> std::collections::BTreeSet<String> {
+    /// Ключи файла локали по порядку: строки вида `ключ = значение`
+    /// верхнего уровня.
+    fn key_list(file: &str) -> Vec<String> {
         let asset = Localizations::get(file).expect("ассет локали вшит в бинарь");
         let text = String::from_utf8_lossy(&asset.data);
         text.lines()
@@ -79,6 +80,23 @@ mod tests {
             .filter_map(|l| l.split_once(" = "))
             .map(|(k, _)| k.trim().to_string())
             .collect()
+    }
+
+    fn keys(file: &str) -> std::collections::BTreeSet<String> {
+        key_list(file).into_iter().collect()
+    }
+
+    /// Повторный ключ Fluent принимает молча для кода, но ругается в лог
+    /// при каждом старте — и побеждает последнее определение, а не то,
+    /// которое читаешь глазами в файле.
+    #[test]
+    fn no_duplicate_keys() {
+        for lang in ["en", "ru"] {
+            let list = key_list(&format!("{lang}/driftling-settings.ftl"));
+            let mut seen = std::collections::BTreeSet::new();
+            let dups: Vec<&String> = list.iter().filter(|k| !seen.insert((*k).clone())).collect();
+            assert!(dups.is_empty(), "дубли в {lang}: {dups:?}");
+        }
     }
 
     /// Паритет локалей: у каждого ключа из en есть русская строка. Fluent
