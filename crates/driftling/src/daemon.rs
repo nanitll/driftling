@@ -195,6 +195,18 @@ const PROP_PLACE_GAP: f32 = 1.7;
 const PROP_NEAR_PX: f32 = 26.0;
 /// Скорость бега за мячом: игра живее хозяйственного шага.
 const FETCH_SPEED: f32 = 165.0;
+/// Пауза между переходами на соседний монитор, сек: без неё питомец
+/// ходил бы туда-обратно через границу без остановки.
+const HOP_COOLDOWN_SECS: f64 = 20.0;
+
+/// Сколько поданный транспорт ждёт седока, прежде чем уехать сам, сек.
+/// Без этого не дождавшаяся машина оставалась на экране навсегда: стояла,
+/// не двигалась, мышью не ловилась — и следующая подача добавляла ещё одну.
+const RIDE_WAIT_SECS: f64 = 25.0;
+/// Сколько временных вещей (транспорт, гости, мяч) допустимо на экране
+/// разом: правило «не больше пяти предметов» из docs/WORLD.md.
+const MAX_TEMP_PROPS: usize = 4;
+
 /// Пауза, чтобы мяч успокоился, прежде чем питомец за ним побежит.
 const FETCH_SETTLE_SECS: f64 = 0.4;
 /// Сколько питомец возится с мячом, прежде чем взять его в лапки.
@@ -993,6 +1005,10 @@ enum PresenceAnim {
     RunOff { dir: f32 },
     /// Бег от края внутрь до `target_x`, дальше — обычное поведение.
     RunIn { dir: f32, target_x: f32 },
+    /// Переход на соседний монитор: питомец добегает до края, и когда
+    /// скрывается — демон просит платформу переехать на выход `to`.
+    /// Появление с другой стороны доделает RunIn после новой геометрии.
+    HopOff { dir: f32, to: usize },
 }
 
 /// Подписи чужих журнальных файлов для горячей перечитки режима «папки»:
@@ -1176,6 +1192,8 @@ struct DaemonApp {
     ride_art: BTreeMap<&'static str, Frame>,
     /// Следующая проверка «не подать ли транспорт самому».
     ride_check_at: f64,
+    /// Поданный транспорт, на который питомец ещё не сел: (id, крайний срок).
+    ride_wait: Option<(u64, f64)>,
     /// Воркер синка (mode = server); None — off/folder. Дроп ручки
     /// завершает поток воркера.
     sync: Option<SyncHandle>,
@@ -1186,6 +1204,19 @@ struct DaemonApp {
     presence_anim: Option<PresenceAnim>,
     /// Троттлинг lease-claim от пользовательских взаимодействий.
     last_claim: Option<Instant>,
+
+    // ---- Мультимонитор (фаза I) ----
+    /// Выходы слева направо в глобальных координатах (от платформы).
+    outputs: Vec<Rect>,
+    /// Индекс выхода, на котором сейчас живёт оверлей.
+    output_idx: usize,
+    /// Просьба к платформе переехать на выход; забирается раз в кадр.
+    output_request: Option<usize>,
+    /// С какой стороны питомец войдёт после переезда (+1 — слева направо).
+    hop_enter: Option<f32>,
+    /// Не раньше этого момента можно снова уходить на соседний монитор:
+    /// без паузы питомец бегал бы между мониторами без остановки.
+    hop_ready_at: f64,
     /// Режим «папки»: последняя проверка чужих файлов и их подписи.
     folder_poll_at: Option<Instant>,
     folder_seen: FolderSeen,
@@ -1296,6 +1327,11 @@ impl DaemonApp {
             lease_hidden: false,
             presence_anim: None,
             last_claim: None,
+            outputs: Vec::new(),
+            output_idx: 0,
+            output_request: None,
+            hop_enter: None,
+            hop_ready_at: 0.0,
             folder_poll_at: None,
             folder_seen,
             physics: PhysicsConfig::default(),
@@ -1359,6 +1395,7 @@ impl DaemonApp {
             riding: None,
             ride_art: BTreeMap::new(),
             ride_check_at: RIDE_CHECK_SECS,
+            ride_wait: None,
         }
     }
 
@@ -2270,6 +2307,7 @@ impl DaemonApp {
             mob.life_secs.0 + (mob.life_secs.1 - mob.life_secs.0) * noise(now * 9.1).abs() as f32;
         self.props.push(Prop::new(id, kind, Vec2::new(x, y), size));
         self.mob_life.insert(id, now + life as f64);
+        self.trim_temp_props();
         log::info!("война: на экран зашёл {} ({life:.0} с)", kind.as_str());
         Response::Ok
     }
@@ -2366,6 +2404,9 @@ impl DaemonApp {
             self.end_ride(now);
             return Response::Ok;
         }
+        // Спящего будим, а не отказываем: «прокатиться» из меню при
+        // дремлющем питомце — это просьба его разбудить, а не ошибка.
+        self.wake_pet_for_action();
         if !self.pet_afoot() || self.indoors.is_some() {
             return Response::Error(fl!("daemon-pet-busy"));
         }
@@ -2400,12 +2441,18 @@ impl DaemonApp {
         );
         let id = self.next_prop_id;
         self.next_prop_id += 1;
+        let ground = world.ground_y();
+        // Ждущая машина на экране может быть только одна: прошлая, на
+        // которую не сели, уезжает прямо сейчас.
+        self.clear_idle_vehicles(0.0);
         self.props
-            .push(Prop::new(id, kind, Vec2::new(x, world.ground_y()), size));
+            .push(Prop::new(id, kind, Vec2::new(x, ground), size));
+        self.trim_temp_props();
         self.drop_errand();
         let mut errand = Errand::new(ErrandKind::Ride, x, 0.0);
         errand.prop = Some(id);
         self.errand = Some(errand);
+        self.ride_wait = Some((id, 0.0));
         log::info!("транспорт: питомцу подан {}", kind.as_str());
         Response::Ok
     }
@@ -2420,6 +2467,7 @@ impl DaemonApp {
             return;
         };
         prop.state = PropState::Ridden;
+        self.ride_wait = None;
         let secs = v.ride_secs.0 + (v.ride_secs.1 - v.ride_secs.0) * noise(now * 5.3).abs() as f32;
         let dir = self.pet.as_ref().map_or(1.0, |p| p.facing.sign());
         self.riding = Some(Ride {
@@ -2454,6 +2502,50 @@ impl DaemonApp {
         log::info!("транспорт: {} уехал", ride.kind.as_str());
     }
 
+    /// Убрать транспорт, на котором никто не едет: подача, до которой не
+    /// дошли, не должна оставаться на экране мебелью.
+    fn clear_idle_vehicles(&mut self, now: f64) {
+        let idle: Vec<(u64, Vec2)> = self
+            .props
+            .iter()
+            .filter(|p| p.kind.vehicle().is_some() && p.state != PropState::Ridden)
+            .map(|p| (p.id, p.pos))
+            .collect();
+        for (id, at) in idle {
+            self.props.retain(|p| p.id != id);
+            self.drop_errand_if(|e| e.prop == Some(id));
+            if now > 0.0 {
+                self.spawn_puffs(at, 2, 0.8, now);
+            }
+            log::info!("транспорт: {id:x} уехал, не дождавшись седока");
+        }
+        self.ride_wait = None;
+    }
+
+    /// Держать число ВРЕМЕННЫХ вещей в рамках: постоянные (миска, лежанка,
+    /// домик) не трогаем, они принадлежат питомцу.
+    fn trim_temp_props(&mut self) {
+        loop {
+            let temp: Vec<u64> = self
+                .props
+                .iter()
+                .filter(|p| !p.kind.class().persist && p.state != PropState::Ridden)
+                .map(|p| p.id)
+                .collect();
+            if temp.len() <= MAX_TEMP_PROPS {
+                return;
+            }
+            // Самая старая временная вещь — с наименьшим id (счётчик растёт).
+            let Some(oldest) = temp.into_iter().min() else {
+                return;
+            };
+            self.props.retain(|p| p.id != oldest);
+            self.mob_life.remove(&oldest);
+            self.drop_errand_if(|e| e.prop == Some(oldest));
+            log::info!("вещи: убрана лишняя временная вещь {oldest:x}");
+        }
+    }
+
     /// Ход поездки: транспорт едет сам, питомец сидит в седле.
     fn ride_tick(&mut self, now: f64, dt: f32) {
         // Изредка транспорт приезжает сам — как сюрприз, не по расписанию.
@@ -2468,6 +2560,28 @@ impl DaemonApp {
                 && now - self.last_touch >= 60.0;
             if calm && self.pet_afoot() && noise(now * 2.7) > 0.55 {
                 let _ = self.summon_ride(None, now);
+            }
+        }
+        // Машина подана, но питомец ещё не сел.
+        if self.riding.is_none() {
+            match self.ride_wait {
+                Some((id, 0.0)) => self.ride_wait = Some((id, now + RIDE_WAIT_SECS)),
+                Some((id, until)) if now >= until => {
+                    let _ = id;
+                    self.clear_idle_vehicles(now);
+                }
+                // Дело сорвалось (питомца унесли, отвлекли) — пробуем снова,
+                // пока машина ждёт: иначе она простоит зря и уедет.
+                Some((id, _)) if self.errand.is_none() && self.pet_afoot() => {
+                    if let Some(x) = self.props.iter().find(|p| p.id == id).map(|p| p.pos.x) {
+                        let mut errand = Errand::new(ErrandKind::Ride, x, 0.0);
+                        errand.prop = Some(id);
+                        self.errand = Some(errand);
+                    } else {
+                        self.ride_wait = None;
+                    }
+                }
+                _ => {}
             }
         }
         let Some(ride) = &mut self.riding else {
@@ -3111,6 +3225,8 @@ impl DaemonApp {
             pet.set_grounded_only(self.derived.stage == Stage::Egg);
             pet.set_sleep_scale(sleep_scale_for(self.derived.stats.energy));
             self.pet = Some(pet);
+            // Новый питомец должен знать, где стена, а где соседний экран.
+            self.sync_open_edges();
             log::info!("summon: питомец появился в ({:.0}, {:.0})", pos.x, pos.y);
             self.birthday_check(now);
         }
@@ -3314,6 +3430,26 @@ impl DaemonApp {
                     }
                 }
             }
+            // Уход на соседний монитор: добежал до края и скрылся — просим
+            // платформу переехать. Питомца НЕ снимаем: он не убежал с
+            // экрана, он просто идёт в соседнюю комнату.
+            PresenceAnim::HopOff { dir, to } => {
+                pet.facing = if dir < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                };
+                pet.pos.x += dir * PRESENCE_RUN_SPEED * dt;
+                let b = pet.bounds();
+                if b.right() < world.screen.x || b.x > world.screen.right() {
+                    self.presence_anim = None;
+                    self.output_request = Some(to);
+                    // Войдёт с противоположной стороны, продолжая движение.
+                    self.hop_enter = Some(dir);
+                    self.menu = None;
+                    log::info!("мониторы: питомец ушёл за край, переезжаем на #{to}");
+                }
+            }
             PresenceAnim::RunIn { dir, target_x } => {
                 pet.facing = if dir < 0.0 {
                     Direction::Left
@@ -3330,6 +3466,95 @@ impl DaemonApp {
                     self.presence_anim = None;
                     log::info!("присутствие: питомец прибежал");
                 }
+            }
+        }
+    }
+
+    /// Сказать питомцу, за какими краями экрана продолжается рабочий стол:
+    /// там он не лезет на стену, а уходит на соседний монитор.
+    fn sync_open_edges(&mut self) {
+        let (left, right) = (
+            self.neighbour_output(-1.0).is_some(),
+            self.neighbour_output(1.0).is_some(),
+        );
+        if let Some(pet) = &mut self.pet {
+            pet.set_open_edges(left, right);
+        }
+    }
+
+    /// Сосед по направлению `dir` (-1 влево, +1 вправо): ближайший выход,
+    /// который лежит с этой стороны от текущего. Мониторы бывают разной
+    /// высоты и со сдвигом, поэтому сравниваем по горизонтали.
+    fn neighbour_output(&self, dir: f32) -> Option<usize> {
+        let cur = self.outputs.get(self.output_idx)?;
+        self.outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| {
+                *i != self.output_idx && if dir < 0.0 { r.x < cur.x } else { r.x > cur.x }
+            })
+            // Ближайший по горизонтали — через один монитор не прыгаем.
+            .min_by(|a, b| {
+                let d = |r: &Rect| (r.x - cur.x).abs();
+                d(a.1).total_cmp(&d(b.1))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Питомец дошёл до края и на той стороне есть монитор — уходим туда.
+    /// Возвращает false, если идти некуда (тогда он просто развернётся).
+    fn start_screen_hop(&mut self, dir: f32, now: f64) -> bool {
+        if now < self.hop_ready_at || self.presence_anim.is_some() || self.riding.is_some() {
+            return false;
+        }
+        if self.indoors.is_some() || self.grab.is_some() {
+            return false;
+        }
+        let Some(to) = self.neighbour_output(dir) else {
+            return false;
+        };
+        if self
+            .pet
+            .as_ref()
+            .is_none_or(|p| p.state == PetState::Dragged)
+        {
+            return false;
+        }
+        self.drop_errand();
+        self.presence_anim = Some(PresenceAnim::HopOff { dir, to });
+        log::info!(
+            "мониторы: питомец пошёл на соседний экран ({})",
+            if dir < 0.0 {
+                "влево"
+            } else {
+                "вправо"
+            }
+        );
+        true
+    }
+
+    /// Питомец упёрся в край экрана — не пора ли уйти на соседний монитор.
+    ///
+    /// Сигнал приходит из самого питомца (`take_edge_bump`): к моменту
+    /// нашей проверки он уже развернулся и по позиции с направлением не
+    /// восстановить, куда именно он шёл.
+    fn screen_hop_tick(&mut self, now: f64) {
+        let bump = self.pet.as_mut().and_then(|p| p.take_edge_bump());
+        let Some(dir) = bump else {
+            return;
+        };
+        if self.outputs.len() < 2 || self.errand.is_some() {
+            return;
+        }
+        if self.start_screen_hop(dir, now) {
+            // Разворот у стены отменяем: он идёт дальше, просто на соседний
+            // экран.
+            if let Some(pet) = &mut self.pet {
+                pet.facing = if dir < 0.0 {
+                    Direction::Left
+                } else {
+                    Direction::Right
+                };
             }
         }
     }
@@ -4470,6 +4695,8 @@ impl App for DaemonApp {
         self.profile_parts.1 += t_props.elapsed();
         // Домашняя жизнь (H3): уйти домой, выйти из домика.
         self.house_tick(now);
+        // Мультимонитор (I): дошёл до края — ушёл на соседний экран.
+        self.screen_hop_tick(now);
 
         // Бюджет (ТЗ §5): считаем стоимость симуляции и раз в минуту
         // печатаем её в debug. Сцена собирается ниже и в счёт не идёт —
@@ -4823,6 +5050,7 @@ impl App for DaemonApp {
                     origin.y
                 );
                 let first = self.world.is_none();
+                let hop = self.hop_enter.take();
                 self.screen_origin = origin;
                 let screen = Rect::new(0.0, 0.0, width, height);
                 self.output_rect = screen;
@@ -4835,6 +5063,24 @@ impl App for DaemonApp {
                 // Вещи из журнала знают своё место только теперь, когда
                 // известен экран (после рестарта — и своё существование).
                 self.sync_props();
+                // Переезд с соседнего монитора: питомец входит с той
+                // стороны, куда шёл, и продолжает путь.
+                if let (Some(dir), Some(pet)) = (hop, &mut self.pet) {
+                    let half = self.sprites.size as f32 / 2.0;
+                    let (from_x, target_x) = if dir > 0.0 {
+                        (screen.x - half, screen.x + half + 8.0)
+                    } else {
+                        (screen.right() + half, screen.right() - half - 8.0)
+                    };
+                    pet.pos.x = from_x;
+                    pet.pos.y = screen.bottom();
+                    pet.detach_to_floor();
+                    self.presence_anim = Some(PresenceAnim::RunIn { dir, target_x });
+                    self.sync_open_edges();
+                    // Пауза, чтобы он не бегал между мониторами без остановки.
+                    self.hop_ready_at = now + HOP_COOLDOWN_SECS;
+                    log::info!("мониторы: питомец пришёл на новый экран");
+                }
                 // Демон стартует с питомцем на экране — но только если его
                 // не убирали до рестарта (ТД-17: dismissed в журнале).
                 if first && self.derived.summoned {
@@ -4912,6 +5158,17 @@ impl App for DaemonApp {
                 }
                 true
             }
+            // Карта мониторов (фаза I): по ней питомец знает, есть ли куда
+            // уходить с края экрана.
+            Event::Outputs { rects, current } => {
+                if self.outputs != rects {
+                    log::info!("мониторы: {} шт.", rects.len());
+                }
+                self.outputs = rects;
+                self.output_idx = current;
+                self.sync_open_edges();
+                true
+            }
             Event::OutputLost => {
                 // Бэкенд пересоздаст слой сам; состояние питомца целиком в
                 // журнале — терять нечего, просто ждём.
@@ -4926,6 +5183,10 @@ impl App for DaemonApp {
 
     fn wants_exit(&self) -> bool {
         self.exit
+    }
+
+    fn take_output_request(&mut self) -> Option<usize> {
+        self.output_request.take()
     }
 
     /// Темп для адаптивного таймера бэкенда (ТД-3): спрашиваем у питомца;
@@ -5915,6 +6176,152 @@ mod tests {
         assert_eq!(reply.recv().unwrap(), Response::Ok);
         assert!(app.riding.is_none(), "повторная команда высаживает");
         assert!(app.props.is_empty(), "скейт уехал");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Мультимонитор: питомец ходит между экранами -------------------------
+
+    /// Два монитора рядом: дошёл до правого края — ушёл на правый экран и
+    /// вошёл слева, продолжая идти в ту же сторону.
+    #[test]
+    fn pet_walks_to_the_neighbour_screen_and_enters_from_the_other_side() {
+        let (mut app, _tx, dir) = adult_app("hop");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        // Карта мониторов: слева наш (0..1920), справа соседний.
+        app.event(
+            Event::Outputs {
+                rects: vec![
+                    Rect::new(0.0, 0.0, 1920.0, 1080.0),
+                    Rect::new(1920.0, 0.0, 1920.0, 1080.0),
+                ],
+                current: 0,
+            },
+            now,
+        );
+
+        // Ставим питомца у правого края и отправляем идти вправо. Лазанье
+        // по стенам выключаем: тест про переход между экранами, а не про
+        // рулетку «полезет или развернётся».
+        {
+            let size = app.sprites.size as f32;
+            let world = app.world.as_ref().unwrap().screen;
+            let pet = app.pet.as_mut().unwrap();
+            let mut cfg = pet.config().clone();
+            cfg.w_wall_climb = 0;
+            cfg.w_wall_trip = 0;
+            pet.apply_config(cfg, size);
+            pet.pos.x = world.right() - 10.0;
+            pet.facing = Direction::Right;
+            pet.state = PetState::Walk;
+            pet.state_left = f32::INFINITY;
+        }
+        now += 1.0 / 60.0;
+        app.tick(now);
+        assert!(
+            matches!(app.presence_anim, Some(PresenceAnim::HopOff { .. })),
+            "у края начался переход: {:?}",
+            app.presence_anim
+        );
+
+        // Добегает за край и просит платформу переехать.
+        settle(&mut app, &mut now, 2.0);
+        assert_eq!(app.take_output_request(), Some(1), "просит соседний выход");
+        assert!(app.pet.is_some(), "питомец не снят — он в пути");
+
+        // Платформа переехала: новая геометрия соседнего монитора.
+        app.event(
+            Event::OutputGeometry {
+                width: 1920.0,
+                height: 1080.0,
+                origin: Vec2::new(1920.0, 0.0),
+            },
+            now,
+        );
+        let pet = app.pet.as_ref().unwrap();
+        assert!(pet.pos.x < 0.0, "входит из-за левого края: {}", pet.pos.x);
+        assert_eq!(pet.facing, Direction::Right, "идёт в ту же сторону");
+        assert!(matches!(
+            app.presence_anim,
+            Some(PresenceAnim::RunIn { .. })
+        ));
+
+        // Добегает внутрь и живёт обычной жизнью.
+        settle(&mut app, &mut now, 2.0);
+        assert!(app.presence_anim.is_none(), "пробежка кончилась");
+        let pet = app.pet.as_ref().unwrap();
+        assert!(pet.pos.x > 0.0 && pet.pos.x < 200.0, "вошёл: {}", pet.pos.x);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Одинокий монитор: у края питомец просто разворачивается, никаких
+    /// переездов и просьб к платформе.
+    #[test]
+    fn single_screen_pet_never_asks_to_move() {
+        let (mut app, _tx, dir) = adult_app("hop-single");
+        geometry(&mut app);
+        let mut now = 0.0;
+        settle(&mut app, &mut now, 2.5);
+        app.event(
+            Event::Outputs {
+                rects: vec![Rect::new(0.0, 0.0, 1920.0, 1080.0)],
+                current: 0,
+            },
+            now,
+        );
+        {
+            let world = app.world.as_ref().unwrap().screen;
+            let pet = app.pet.as_mut().unwrap();
+            pet.pos.x = world.right() - 5.0;
+            pet.facing = Direction::Right;
+            pet.state = PetState::Walk;
+        }
+        settle(&mut app, &mut now, 1.0);
+        assert!(app.presence_anim.is_none(), "переходить некуда");
+        assert_eq!(app.take_output_request(), None);
+        assert!(app.pet.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Сосед ищется по направлению и берётся ближайший: через монитор не
+    /// прыгаем даже если он «тоже справа».
+    #[test]
+    fn neighbour_is_the_nearest_one_in_that_direction() {
+        let (mut app, _tx, dir) = adult_app("hop-neighbour");
+        geometry(&mut app);
+        app.outputs = vec![
+            Rect::new(-1920.0, 0.0, 1920.0, 1080.0),
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            Rect::new(1920.0, 0.0, 1280.0, 1024.0),
+            Rect::new(3200.0, 0.0, 1280.0, 1024.0),
+        ];
+        app.output_idx = 1;
+        assert_eq!(app.neighbour_output(1.0), Some(2), "ближайший справа");
+        assert_eq!(app.neighbour_output(-1.0), Some(0), "ближайший слева");
+        app.output_idx = 0;
+        assert_eq!(app.neighbour_output(-1.0), None, "слева края нет");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// После перехода действует пауза: питомец не мечется между мониторами.
+    #[test]
+    fn hop_has_a_cooldown() {
+        let (mut app, _tx, dir) = adult_app("hop-cooldown");
+        geometry(&mut app);
+        let mut now = 10.0;
+        settle(&mut app, &mut now, 2.5);
+        app.outputs = vec![
+            Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            Rect::new(1920.0, 0.0, 1920.0, 1080.0),
+        ];
+        app.output_idx = 0;
+        app.hop_ready_at = now + HOP_COOLDOWN_SECS;
+        assert!(!app.start_screen_hop(1.0, now), "пауза не пускает");
+        assert!(
+            app.start_screen_hop(1.0, now + HOP_COOLDOWN_SECS + 0.1),
+            "после паузы можно"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

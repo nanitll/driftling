@@ -124,6 +124,14 @@ pub struct Pet {
     /// Текущая прогулка — «поход к стене» (фаза G): питомец идёт до края
     /// экрана не сворачивая и лезет наверх. Снимается на выходе из Walk.
     wall_trip: bool,
+    /// Питомец только что упёрся в край экрана на ходу: сторона (-1 влево,
+    /// +1 вправо). Внутри `Pet` край экрана — стена, о существовании
+    /// второго монитора он не знает; решение уводить туда принимает демон.
+    edge_bump: Option<f32>,
+    /// Края экрана, за которыми есть соседний монитор: (слева, справа).
+    /// Там питомец не лезет на стену — там не стена, а проход в соседнюю
+    /// комнату; уводит его туда демон (он один знает про мониторы).
+    open_edges: (bool, bool),
     /// Множитель длительности сна (фаза G3): уставший питомец спит дольше.
     /// Ставит демон по энергии (`set_sleep_scale`); 1.0 — обычная дрёма.
     sleep_scale: f32,
@@ -198,6 +206,8 @@ impl Pet {
             action_left: 1.0,
             sleep_on_land: false,
             wall_trip: false,
+            edge_bump: None,
+            open_edges: (false, false),
             sleep_scale: 1.0,
             pending_bounce: None,
             bounced: false,
@@ -370,6 +380,18 @@ impl Pet {
         self.enter(PetState::Falling);
         self.state_left = f32::INFINITY;
         true
+    }
+
+    /// Сказать питомцу, за какими краями экрана есть соседний монитор.
+    pub fn set_open_edges(&mut self, left: bool, right: bool) {
+        self.open_edges = (left, right);
+    }
+
+    /// Забрать сигнал «упёрся в край экрана на ходу»: -1 — левый край,
+    /// +1 — правый. Внутри `Pet` край экрана — стена, о втором мониторе он
+    /// не знает; решение уводить питомца туда принимает демон.
+    pub fn take_edge_bump(&mut self) -> Option<f32> {
+        self.edge_bump.take()
     }
 
     /// Был ли с прошлого вызова потреблённый клик по питомцу (нажатие и
@@ -667,16 +689,21 @@ impl Pet {
         let b = self.bounds();
         let at_edge = if b.x <= world.screen.x {
             self.pos.x = world.screen.x + self.size / 2.0;
-            if self.try_wall_climb(world, Surface::WallLeft) {
+            // За открытым краем — соседний монитор: лезть тут не на что.
+            if !self.open_edges.0 && self.try_wall_climb(world, Surface::WallLeft) {
                 return;
             }
+            // Упёрся в левый край на ходу — сигнал демону: может, там
+            // соседний монитор и разворачиваться не надо.
+            self.edge_bump = Some(-1.0);
             self.facing = Direction::Right;
             true
         } else if b.right() >= world.screen.right() {
             self.pos.x = world.screen.right() - self.size / 2.0;
-            if self.try_wall_climb(world, Surface::WallRight) {
+            if !self.open_edges.1 && self.try_wall_climb(world, Surface::WallRight) {
                 return;
             }
+            self.edge_bump = Some(1.0);
             self.facing = Direction::Left;
             true
         } else {
@@ -1232,6 +1259,39 @@ impl Pet {
 
 #[cfg(test)]
 mod tests {
+
+    /// За открытым краем питомец не лезет на стену: там не стена, а
+    /// соседний монитор — и уводит его туда демон, получив сигнал края.
+    #[test]
+    fn open_edge_never_becomes_a_wall_to_climb() {
+        let world = World::new(Rect::new(0.0, 0.0, 800.0, 600.0));
+        // Стену он выбрал бы наверняка: 100 из 100.
+        let cfg = BehaviorConfig {
+            w_wall_climb: 100,
+            ..Default::default()
+        };
+        let mut pet = Pet::new(Vec2::new(760.0, world.ground_y()), 64.0, cfg.clone(), 5);
+        pet.set_open_edges(false, true);
+        pet.state = PetState::Walk;
+        pet.facing = Direction::Right;
+        pet.state_left = f32::INFINITY;
+        for _ in 0..30 {
+            pet.tick(&world, 1.0 / 60.0);
+        }
+        assert_eq!(pet.surface, Surface::Floor, "на открытый край не полез");
+        assert_eq!(pet.take_edge_bump(), Some(1.0), "и сообщил о крае");
+
+        // А закрытый край — обычная стена.
+        let mut pet = Pet::new(Vec2::new(40.0, world.ground_y()), 64.0, cfg, 5);
+        pet.set_open_edges(false, true);
+        pet.state = PetState::Walk;
+        pet.facing = Direction::Left;
+        pet.state_left = f32::INFINITY;
+        for _ in 0..30 {
+            pet.tick(&world, 1.0 / 60.0);
+        }
+        assert_eq!(pet.surface, Surface::WallLeft, "слева стена — полез");
+    }
     use super::*;
 
     fn world() -> World {

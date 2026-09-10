@@ -52,7 +52,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _, Result};
-use driftling_core::Vec2;
+use driftling_core::{Rect, Vec2};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
@@ -167,29 +167,14 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
     // exclusive_zone(-1) растягивает слой по самому ВЫХОДУ (не рабочей
     // области), чтобы позиция субповерхности совпадала с логическими
     // экранными координатами сцены.
-    // TODO(M3): мультивыход — по одному якорю на каждый wl_output.
-    let surface = compositor.create_surface(&qh);
-    // Namespace слоя = app-id (F1, SHIPPING.md): по нему пишутся правила
-    // окон композитора, и им же подписаны .desktop/иконки.
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Overlay,
-        Some(driftling_core::APP_ID),
-        None,
+    // Выход не задаём: композитор ставит слой туда, где сейчас фокус.
+    // Переезд на соседний монитор пересоздаёт слой уже с явным выходом
+    // (Renderer::move_to_output) — layer-shell не умеет менять выход
+    // существующей поверхности.
+    let layer = setup!(
+        new_layer(&layer_shell, &compositor, &qh, None),
+        "слой оверлея"
     );
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
-    layer.set_size(0, 0);
-    layer.set_exclusive_zone(-1);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    // Якорь никогда не ловит мышь: пустой (не None!) input region.
-    let region = setup!(Region::new(&compositor), "wl_region якоря");
-    layer
-        .wl_surface()
-        .set_input_region(Some(region.wl_region()));
-    drop(region);
-    // Первый commit без буфера — маппинг слоя; композитор ответит configure.
-    layer.commit();
 
     // Поверхности сцены создаются по мере надобности (Renderer::part):
     // desync-субповерхности якоря. Позиция — состояние якоря (применяется
@@ -220,6 +205,8 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
         app: app_slot.take().expect("App передан в попытку"),
         clock,
         current_output: None,
+        outputs: Vec::new(),
+        last_outputs: None,
         last_geometry: None,
         pressed: false,
         leave_pending: None,
@@ -231,6 +218,7 @@ fn attempt_inner(app_slot: &mut Option<Box<dyn App>>, clock: Instant) -> Outcome
             compositor,
             qh,
             layer,
+            layer_shell,
             subcompositor,
             parts: Vec::new(),
             scale: 1,
@@ -281,6 +269,11 @@ struct Backend {
 
     /// Выход, на который композитор посадил якорь (`surface_enter`).
     current_output: Option<wl_output::WlOutput>,
+    /// Выходы слева направо в глобальных логических координатах: питомец
+    /// уходит на соседний монитор именно по этому списку.
+    outputs: Vec<(wl_output::WlOutput, Rect)>,
+    /// Последний отданный приложению список (чтобы не слать одно и то же).
+    last_outputs: Option<(Vec<Rect>, usize)>,
     /// Последняя доставленная геометрия (размер + глобальная позиция
     /// выхода) — дедупликация update_output.
     last_geometry: Option<(f32, f32, i32, i32)>,
@@ -310,6 +303,9 @@ struct Renderer {
     compositor: CompositorState,
     qh: QueueHandle<Backend>,
     layer: LayerSurface,
+    /// Шелл нужен и после старта: переезд на соседний монитор пересоздаёт
+    /// слой — layer-shell не умеет менять выход существующей поверхности.
+    layer_shell: LayerShell,
     subcompositor: SubcompositorState,
     /// Поверхности сцены: по одной на сгусток спрайтов (питомец, домик,
     /// улетевший мяч). Одна поверхность на всю сцену означала бы буфер
@@ -576,6 +572,16 @@ impl Renderer {
         }
     }
 
+    /// Снести все поверхности сцены (переезд на другой монитор): они
+    /// принадлежат старому слою и вместе с ним умрут.
+    fn drop_parts(&mut self) {
+        for part in self.parts.drain(..) {
+            part.subsurface.destroy();
+            part.surface.destroy();
+        }
+        self.visible = false;
+    }
+
     /// Спрятать питомца: null-буфер демапит поверхность, размаппленная
     /// поверхность не ловит ввод — сцена «ничего нет» стоит ноль. Якорь
     /// сжимается до 1x1: выход возвращается к прямому сканауту (D5).
@@ -684,9 +690,97 @@ impl Backend {
         self.renderer.sync(&scene);
         drop(scene);
 
+        // Питомец ушёл за край и просится на соседний монитор.
+        if let Some(idx) = self.app.take_output_request() {
+            self.move_to_output(idx);
+        }
+
         if self.app.wants_exit() {
             self.exit = true;
             self.loop_signal.stop();
+        }
+    }
+
+    /// Пересобрать список выходов (слева направо в глобальных координатах)
+    /// и отдать приложению, если он изменился. Без этого списка питомец не
+    /// знает, есть ли куда уходить с края экрана.
+    fn push_outputs(&mut self) {
+        let mut outs: Vec<(wl_output::WlOutput, Rect)> = Vec::new();
+        for output in self.output_state.outputs() {
+            let Some(info) = self.output_state.info(&output) else {
+                continue;
+            };
+            let mode = info.modes.iter().find(|m| m.current).map(|m| m.dimensions);
+            let swapped = matches!(
+                info.transform,
+                wl_output::Transform::_90
+                    | wl_output::Transform::_270
+                    | wl_output::Transform::Flipped90
+                    | wl_output::Transform::Flipped270
+            );
+            let Some((w, h)) =
+                output_logical_size(info.logical_size, mode, info.scale_factor, swapped)
+            else {
+                continue;
+            };
+            let (x, y) = info.logical_position.unwrap_or((0, 0));
+            outs.push((output, Rect::new(x as f32, y as f32, w, h)));
+        }
+        outs.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+        let rects: Vec<Rect> = outs.iter().map(|(_, r)| *r).collect();
+        let current = self
+            .current_output
+            .as_ref()
+            .and_then(|cur| outs.iter().position(|(o, _)| o == cur))
+            .unwrap_or(0);
+        self.outputs = outs;
+        if self.last_outputs.as_ref() == Some(&(rects.clone(), current)) {
+            return;
+        }
+        log::info!("выходы: {} шт., питомец на #{current}", rects.len());
+        self.last_outputs = Some((rects.clone(), current));
+        self.deliver(Event::Outputs { rects, current });
+    }
+
+    /// Переехать на другой выход: layer-shell не умеет менять выход у
+    /// существующей поверхности, поэтому слой пересоздаётся целиком.
+    /// Сцена соберётся заново с первого же кадра.
+    fn move_to_output(&mut self, index: usize) {
+        let Some((output, rect)) = self.outputs.get(index).cloned() else {
+            log::warn!("переезд: выхода #{index} нет");
+            return;
+        };
+        if self.current_output.as_ref() == Some(&output) {
+            return;
+        }
+        log::info!(
+            "переезд: питомец уходит на выход #{index} ({:.0}x{:.0} @ {:.0})",
+            rect.w,
+            rect.h,
+            rect.x
+        );
+        self.renderer.drop_parts();
+        match new_layer(
+            &self.renderer.layer_shell,
+            &self.renderer.compositor,
+            &self.renderer.qh.clone(),
+            Some(&output),
+        ) {
+            Ok(layer) => {
+                self.renderer.layer = layer;
+                self.renderer.parent_mapped = false;
+                self.renderer.visible = false;
+                self.renderer.anchor_full = true;
+                self.renderer.anchor_input_full = false;
+                self.renderer.frame_done = true;
+                self.current_output = Some(output);
+                // Геометрию отдадим, когда придёт configure нового слоя;
+                // last_geometry сбрасываем, иначе push_geometry сочтёт, что
+                // ничего не изменилось (размеры мониторов бывают равны).
+                self.last_geometry = None;
+                self.last_outputs = None;
+            }
+            Err(e) => log::error!("переезд: слой не создан: {e}"),
         }
     }
 
@@ -728,6 +822,39 @@ impl Backend {
             origin: Vec2::new(ox as f32, oy as f32),
         });
     }
+}
+
+/// Создать слой-якорь (на конкретном выходе или где решит композитор).
+/// Настройки одни и те же при старте и при переезде между мониторами.
+fn new_layer(
+    shell: &LayerShell,
+    compositor: &CompositorState,
+    qh: &QueueHandle<Backend>,
+    output: Option<&wl_output::WlOutput>,
+) -> Result<LayerSurface> {
+    let surface = compositor.create_surface(qh);
+    // Namespace слоя = app-id (F1, SHIPPING.md): по нему пишутся правила
+    // окон композитора, и им же подписаны .desktop/иконки.
+    let layer = shell.create_layer_surface(
+        qh,
+        surface,
+        Layer::Overlay,
+        Some(driftling_core::APP_ID),
+        output,
+    );
+    layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::BOTTOM | Anchor::RIGHT);
+    layer.set_size(0, 0);
+    layer.set_exclusive_zone(-1);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    // Якорь никогда не ловит мышь: пустой (не None!) input region.
+    let region = Region::new(compositor).context("wl_region якоря")?;
+    layer
+        .wl_surface()
+        .set_input_region(Some(region.wl_region()));
+    drop(region);
+    // Первый commit без буфера — маппинг слоя; композитор ответит configure.
+    layer.commit();
+    Ok(layer)
 }
 
 /// Логический размер выхода: приоритет — xdg-output (`logical_size`), фолбэк —
@@ -813,6 +940,7 @@ impl CompositorHandler for Backend {
         // размер отдавать приложению.
         if surface == self.renderer.layer.wl_surface() {
             self.current_output = Some(output.clone());
+            self.push_outputs();
             self.last_geometry = None;
             self.push_geometry();
         }
@@ -836,7 +964,9 @@ impl OutputHandler for Backend {
 
     // TODO(M3): мультивыход — реагировать на new_output, создавая якорь на
     // каждом выходе. Пока якорь один и живёт, где посадил композитор.
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.push_outputs();
+    }
 
     fn update_output(
         &mut self,
@@ -848,6 +978,8 @@ impl OutputHandler for Backend {
         if self.current_output.as_ref() == Some(&output) {
             self.push_geometry();
         }
+        // Мониторы двигают и переключают: карта выходов должна быть свежей.
+        self.push_outputs();
     }
 
     fn output_destroyed(
@@ -862,6 +994,7 @@ impl OutputHandler for Backend {
             self.current_output = None;
             self.last_geometry = None;
         }
+        self.push_outputs();
     }
 }
 
