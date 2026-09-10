@@ -69,6 +69,12 @@ enum CtlAction {
         #[arg(long, help = fl!("cli-about-toy-off"))]
         off: bool,
     },
+    // Отправить питомца на соседний монитор.
+    #[command(about = fl!("cli-about-hop"))]
+    Hop {
+        #[arg(help = fl!("cli-about-hop-dir"))]
+        dir: String,
+    },
     // Запустить незваного гостя (режим войны).
     #[command(about = fl!("cli-about-mob"))]
     Mob {
@@ -149,6 +155,7 @@ fn main() -> Result<()> {
                 CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
                 CtlAction::Ride { kind } => driftling_ipc::Request::Ride { kind },
                 CtlAction::Mob { kind } => driftling_ipc::Request::Mob { kind },
+                CtlAction::Hop { dir } => driftling_ipc::Request::Hop { dir },
                 CtlAction::Config => driftling_ipc::Request::GetConfig,
                 CtlAction::World => driftling_ipc::Request::World,
                 CtlAction::Toy { off } => driftling_ipc::Request::Toy {

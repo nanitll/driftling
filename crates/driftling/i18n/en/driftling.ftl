@@ -16,6 +16,8 @@ cli-about-ride = Take the pet for a ride (random vehicle if omitted)
 cli-about-ride-kind = Vehicle: skate, bike, moped, car, copter, plane
 cli-about-mob = Send in an uninvited guest (war mode)
 cli-about-mob-kind = Which one: dustball, roach, bug
+cli-about-hop = Send the pet to the neighbouring monitor
+cli-about-hop-dir = Where: left or right
 cli-about-config = Show settings as the daemon sees them
 cli-about-world = What is in the pet world right now
 cli-about-toy = Get the ball out (--off to put it away)
@@ -134,6 +136,8 @@ daemon-config-unreadable = config.toml could not be read: { $error }
 daemon-config-unwritable = Could not write settings: { $error }
 daemon-unknown-prop = Unknown thing "{ $value }"
 daemon-prop-not-found = There is no "{ $value }" in the world right now
+daemon-unknown-direction = Unknown direction "{ $value }": left or right
+daemon-no-neighbour = There is no monitor on that side
 
 # --- tray (B7) ---
 tray-tooltip = Driftling

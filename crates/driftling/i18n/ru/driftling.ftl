@@ -15,6 +15,8 @@ cli-about-ride = Прокатить питомца (без вида — случ
 cli-about-ride-kind = Вид транспорта: skate, bike, moped, car, copter, plane
 cli-about-mob = Запустить незваного гостя (режим войны)
 cli-about-mob-kind = Кто именно: dustball, roach, bug
+cli-about-hop = Отправить питомца на соседний монитор
+cli-about-hop-dir = Куда: left или right
 cli-about-config = Показать настройки глазами демона
 cli-about-world = Что сейчас в мире питомца
 cli-about-toy = Достать мяч (--off — убрать)
@@ -135,6 +137,8 @@ daemon-config-unreadable = config.toml не прочитан: { $error }
 daemon-config-unwritable = Настройки не записались: { $error }
 daemon-unknown-prop = Неизвестная вещь «{ $value }»
 daemon-prop-not-found = Вещи «{ $value }» сейчас нет в мире
+daemon-unknown-direction = Неизвестное направление «{ $value }»: left или right
+daemon-no-neighbour = С этой стороны монитора нет
 
 # --- Трей (B7) ---
 tray-tooltip = Дрифтлинг

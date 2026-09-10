@@ -3503,8 +3503,8 @@ impl DaemonApp {
 
     /// Питомец дошёл до края и на той стороне есть монитор — уходим туда.
     /// Возвращает false, если идти некуда (тогда он просто развернётся).
-    fn start_screen_hop(&mut self, dir: f32, now: f64) -> bool {
-        if now < self.hop_ready_at || self.presence_anim.is_some() || self.riding.is_some() {
+    fn start_screen_hop(&mut self, dir: f32, _now: f64) -> bool {
+        if self.presence_anim.is_some() || self.riding.is_some() {
             return false;
         }
         if self.indoors.is_some() || self.grab.is_some() {
@@ -3543,7 +3543,7 @@ impl DaemonApp {
         let Some(dir) = bump else {
             return;
         };
-        if self.outputs.len() < 2 || self.errand.is_some() {
+        if self.outputs.len() < 2 || self.errand.is_some() || now < self.hop_ready_at {
             return;
         }
         if self.start_screen_hop(dir, now) {
@@ -3737,6 +3737,18 @@ impl DaemonApp {
             Request::SetConfig { patch } => self.set_config(*patch),
             Request::World => self.world_info(),
             Request::Toy { show } => self.toy(show, now),
+            Request::Hop { dir } => {
+                let d = match dir.as_str() {
+                    "left" | "влево" => -1.0,
+                    "right" | "вправо" => 1.0,
+                    _ => return Response::Error(fl!("daemon-unknown-direction", value = dir)),
+                };
+                if self.start_screen_hop(d, now) {
+                    Response::Ok
+                } else {
+                    Response::Error(fl!("daemon-no-neighbour"))
+                }
+            }
             Request::StopRide => {
                 self.end_ride(now);
                 Response::Ok
@@ -6304,7 +6316,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// После перехода действует пауза: питомец не мечется между мониторами.
+    /// После перехода действует пауза для САМОСТОЯТЕЛЬНОГО ухода: питомец
+    /// не мечется между мониторами. Просьбу человека пауза не касается.
     #[test]
     fn hop_has_a_cooldown() {
         let (mut app, _tx, dir) = adult_app("hop-cooldown");
@@ -6317,11 +6330,19 @@ mod tests {
         ];
         app.output_idx = 0;
         app.hop_ready_at = now + HOP_COOLDOWN_SECS;
-        assert!(!app.start_screen_hop(1.0, now), "пауза не пускает");
-        assert!(
-            app.start_screen_hop(1.0, now + HOP_COOLDOWN_SECS + 0.1),
-            "после паузы можно"
-        );
+        // Сам он у края никуда не пойдёт...
+        {
+            let world = app.world.as_ref().unwrap().screen;
+            let pet = app.pet.as_mut().unwrap();
+            pet.pos.x = world.right() - 1.0;
+            pet.facing = Direction::Right;
+            pet.state = PetState::Walk;
+            pet.state_left = f32::INFINITY;
+        }
+        settle(&mut app, &mut now, 0.5);
+        assert!(app.presence_anim.is_none(), "пауза не пускает");
+        // ...а по просьбе человека (ctl hop) уходит сразу.
+        assert!(app.start_screen_hop(1.0, now), "команда сильнее паузы");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
