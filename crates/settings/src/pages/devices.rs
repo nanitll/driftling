@@ -214,7 +214,7 @@ fn status(app: &mut SettingsApp, ui: &mut egui::Ui) {
             ui.add_space(4.0);
             ui.label(RichText::new(err).size(12.5).color(DANGER));
         }
-        row_sep(ui);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             if outline_button(ui, &fl!("btn-reload"), MUTED, up && !app.busy()).clicked() {
                 app.command(ui, Request::Reload, fl!("msg-settings-applied"));

@@ -215,7 +215,10 @@ impl SettingsApp {
                 Request::SetConfig {
                     patch: Box::new(patch),
                 },
-                fl!("msg-settings-applied"),
+                // Успех настройки виден в самом переключателе; всплывашка
+                // на каждый щелчок превращает страницу в ленту сообщений.
+                // Говорим только о том, чего по виду контрола не понять.
+                String::new(),
             );
             return;
         }
@@ -301,6 +304,10 @@ impl SettingsApp {
     fn drain_action(&mut self, ui: &egui::Ui) {
         let outcome = self.action.lock().unwrap().take();
         if let Some(o) = outcome {
+            // Молчаливый успех: команда сама сказала, что говорить не о чем.
+            if o.good && o.text.is_empty() {
+                return;
+            }
             let tone = if !o.good {
                 if o.partial {
                     ToastTone::Warn

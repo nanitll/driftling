@@ -165,6 +165,7 @@ nav-world = World
 nav-devices = Devices
 nav-advanced = Advanced
 nav-hotkey = Ctrl+{ $n }
+details = More
 
 # --- Common messages ---
 msg-settings-applied = Settings applied
@@ -204,6 +205,10 @@ attr-sleep-range = Sleep lasts, s
 
 # --- World page ---
 section-peace = Peace
+section-fun = Fun
+unit-secs = s
+unit-mins = min
+unit-days = d
 section-guests = Guests
 section-rides = Rides
 section-things = Things

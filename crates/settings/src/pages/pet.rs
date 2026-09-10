@@ -237,7 +237,6 @@ fn care(app: &mut SettingsApp, ui: &mut egui::Ui, info: Option<&PetSnapshot>) {
                     (fl!("stat-mood"), s.mood),
                 ] {
                     setting_row(ui, &label, None, |ui| {
-                        ui.label(RichText::new(format!("{v:.0}")).size(13.0).color(MUTED));
                         meter(ui, v, stat_bar_color(v));
                     });
                 }
@@ -284,17 +283,6 @@ fn appearance(app: &mut SettingsApp, ui: &mut egui::Ui, info: Option<&PetSnapsho
                     }
                 }
             });
-            ui.add_space(4.0);
-            setting_row(ui, &fl!("color-custom"), None, |ui| {
-                // Кнопка обязательна: у пикера нет «отпустили мышь», а
-                // событие в append-only журнал на каждый кадр недопустимо.
-                if primary_button(ui, &fl!("btn-apply"), !busy, app.accent).clicked() {
-                    let argb = theme::rgb_to_argb(app.custom_rgb);
-                    app.command(ui, Request::Recolor(argb), fl!("msg-recolored"));
-                }
-                ui.color_edit_button_srgb(&mut app.custom_rgb);
-            });
-            row_sep(ui);
             let labels: Vec<String> = SIZES
                 .iter()
                 .map(|(px, name)| format!("{name} · {px}"))
@@ -306,6 +294,17 @@ fn appearance(app: &mut SettingsApp, ui: &mut egui::Ui, info: Option<&PetSnapsho
                     attrs.size = SIZES[i].0;
                     app.command(ui, Request::SetAttributes(attrs), fl!("msg-attrs-applied"));
                 }
+            });
+            theme::details(ui, "pet-color", |ui| {
+                setting_row(ui, &fl!("color-custom"), None, |ui| {
+                    // Кнопка обязательна: у пикера нет «отпустили мышь», а
+                    // событие в append-only журнал на каждый кадр недопустимо.
+                    if primary_button(ui, &fl!("btn-apply"), !busy, app.accent).clicked() {
+                        let argb = theme::rgb_to_argb(app.custom_rgb);
+                        app.command(ui, Request::Recolor(argb), fl!("msg-recolored"));
+                    }
+                    ui.color_edit_button_srgb(&mut app.custom_rgb);
+                });
             });
         });
     });
@@ -346,61 +345,54 @@ fn temperament(app: &mut SettingsApp, ui: &mut egui::Ui, info: Option<&PetSnapsh
                 }
             }
         });
-        row_sep(ui);
-        egui::CollapsingHeader::new(RichText::new(fl!("temper-fine")).size(13.5).color(MUTED))
-            .id_salt("fine-tuning")
-            .show(ui, |ui| {
-                let mut touched = false;
-                setting_row(ui, &fl!("attr-walk-speed"), None, |ui| {
-                    touched |= ui
-                        .add(
-                            egui::Slider::new(&mut app.attrs.walk_speed, 5.0..=160.0)
-                                .suffix(" px/s"),
-                        )
-                        .changed();
-                });
-                setting_row(ui, &fl!("attr-curiosity"), None, |ui| {
-                    touched |= ui
-                        .add(egui::Slider::new(&mut app.attrs.curiosity, 0..=100))
-                        .changed();
-                });
-                let sleep_max = 100u32.saturating_sub(app.attrs.curiosity);
-                setting_row(ui, &fl!("attr-sleepiness"), None, |ui| {
-                    touched |= ui
-                        .add(egui::Slider::new(&mut app.attrs.sleepiness, 0..=sleep_max))
-                        .changed();
-                });
-                setting_row(ui, &fl!("attr-sleep-range"), None, |ui| {
-                    touched |= ui
-                        .add(egui::DragValue::new(&mut app.attrs.sleep_max).range(1.0..=7200.0))
-                        .changed();
-                    ui.label(RichText::new("…").color(MUTED));
-                    touched |= ui
-                        .add(egui::DragValue::new(&mut app.attrs.sleep_min).range(1.0..=3600.0))
-                        .changed();
-                });
-                if touched {
-                    app.attrs_touched = true;
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let dirty = app.attrs_touched;
-                    if primary_button(ui, &fl!("btn-apply"), dirty && !app.busy(), app.accent)
-                        .clicked()
-                    {
-                        let attrs = app.attrs;
-                        app.attrs_touched = false;
-                        app.command(ui, Request::SetAttributes(attrs), fl!("msg-attrs-applied"));
-                    }
-                    // Форма протухает: питомец растёт, и «Применить» без
-                    // пересинка откатывал бы его назад.
-                    if outline_button(ui, &fl!("btn-take-current"), MUTED, dirty).clicked() {
-                        if let Some(a) = live {
-                            app.attrs = a;
-                        }
-                        app.attrs_touched = false;
-                    }
-                });
+        theme::details(ui, "fine-tuning", |ui| {
+            let mut touched = false;
+            setting_row(ui, &fl!("attr-walk-speed"), None, |ui| {
+                touched |= ui
+                    .add(egui::Slider::new(&mut app.attrs.walk_speed, 5.0..=160.0).suffix(" px/s"))
+                    .changed();
             });
+            setting_row(ui, &fl!("attr-curiosity"), None, |ui| {
+                touched |= ui
+                    .add(egui::Slider::new(&mut app.attrs.curiosity, 0..=100))
+                    .changed();
+            });
+            let sleep_max = 100u32.saturating_sub(app.attrs.curiosity);
+            setting_row(ui, &fl!("attr-sleepiness"), None, |ui| {
+                touched |= ui
+                    .add(egui::Slider::new(&mut app.attrs.sleepiness, 0..=sleep_max))
+                    .changed();
+            });
+            setting_row(ui, &fl!("attr-sleep-range"), None, |ui| {
+                touched |= ui
+                    .add(egui::DragValue::new(&mut app.attrs.sleep_max).range(1.0..=7200.0))
+                    .changed();
+                ui.label(RichText::new("…").color(MUTED));
+                touched |= ui
+                    .add(egui::DragValue::new(&mut app.attrs.sleep_min).range(1.0..=3600.0))
+                    .changed();
+            });
+            if touched {
+                app.attrs_touched = true;
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let dirty = app.attrs_touched;
+                if primary_button(ui, &fl!("btn-apply"), dirty && !app.busy(), app.accent).clicked()
+                {
+                    let attrs = app.attrs;
+                    app.attrs_touched = false;
+                    app.command(ui, Request::SetAttributes(attrs), fl!("msg-attrs-applied"));
+                }
+                // Форма протухает: питомец растёт, и «Применить» без
+                // пересинка откатывал бы его назад.
+                if outline_button(ui, &fl!("btn-take-current"), MUTED, dirty).clicked() {
+                    if let Some(a) = live {
+                        app.attrs = a;
+                    }
+                    app.attrs_touched = false;
+                }
+            });
+        });
     });
 }

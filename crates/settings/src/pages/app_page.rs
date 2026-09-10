@@ -109,7 +109,6 @@ fn window(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 }
             },
         );
-        row_sep(ui);
         let pages = app.nav_pages();
         let page_labels: Vec<String> = pages.iter().map(|p| p.title()).collect();
         let selected = pages.iter().position(|p| p.key() == app.prefs.start_page);
@@ -119,7 +118,6 @@ fn window(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 save_prefs(app, ui);
             }
         });
-        row_sep(ui);
         let mut advanced = app.prefs.advanced;
         setting_row(
             ui,
@@ -133,7 +131,6 @@ fn window(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 }
             },
         );
-        row_sep(ui);
         let mut scale = app.cfg.comfort.text_scale;
         setting_row(
             ui,
@@ -168,7 +165,6 @@ fn service(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 crate::system::open_path(&cfg_path);
             }
         });
-        row_sep(ui);
         setting_row(
             ui,
             &fl!("service-doctor"),
@@ -199,7 +195,6 @@ fn service(app: &mut SettingsApp, ui: &mut egui::Ui) {
             ui.add_space(4.0);
             hint(ui, &fl!("service-doctor-running"));
         }
-        row_sep(ui);
         setting_row(ui, &fl!("about-version"), None, |ui| {
             ui.label(
                 RichText::new(format!(

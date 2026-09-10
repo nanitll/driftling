@@ -9,8 +9,7 @@ use crate::app::SettingsApp;
 use crate::i18n::fl;
 use crate::labels::{prop_label, stat_bar_color};
 use crate::theme::{
-    self, card, card_title, hint, meter, outline_button, row_sep, segmented, setting_row, AMBER,
-    MUTED,
+    self, card, card_title, hint, meter, outline_button, segmented, setting_row, AMBER, MUTED,
 };
 
 pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
@@ -74,7 +73,7 @@ fn physics(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 ),
             );
         }
-        row_sep(ui);
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             if outline_button(ui, &fl!("btn-reset-default"), MUTED, true).clicked() {
                 app.cfg.physics = driftling_core::PhysicsConfig::default();
@@ -167,7 +166,6 @@ fn dangerous(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 });
             },
         );
-        row_sep(ui);
         let mobs: Vec<String> = PropKind::MOBS
             .iter()
             .map(|k| prop_label(k.as_str()))

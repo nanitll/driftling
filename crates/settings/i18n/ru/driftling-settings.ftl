@@ -170,6 +170,7 @@ nav-world = Мир
 nav-devices = Устройства
 nav-advanced = Продвинутые
 nav-hotkey = Ctrl+{ $n }
+details = Подробнее
 
 # --- Общие сообщения ---
 msg-settings-applied = Настройки применены
@@ -209,6 +210,10 @@ attr-sleep-range = Сон длится, с
 
 # --- Страница «Мир» ---
 section-peace = Покой
+section-fun = Развлечения
+unit-secs = с
+unit-mins = мин
+unit-days = сут
 section-guests = Гости
 section-rides = Транспорт
 section-things = Вещи

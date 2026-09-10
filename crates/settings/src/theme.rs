@@ -460,36 +460,80 @@ impl Portrait {
 /// Тонкая линия-разделитель между строками внутри карточки.
 pub const HAIRLINE: Color32 = Color32::from_rgb(0x2a, 0x2a, 0x36);
 
-/// Строка настройки: подпись слева, контрол справа, пояснение под подписью.
+/// Строка настройки: подпись слева, контрол справа.
 ///
-/// Настоящий виджет, а не рисование по фиксированным офсетам: длинная
-/// русская подпись усекается многоточием и не наезжает на контрол, а сам
-/// контрол не уезжает за край на узком окне.
+/// Пояснение живёт в подсказке при наведении, а не второй строкой под
+/// каждой подписью: двадцать серых строк подряд превращают страницу
+/// настроек в стену текста, которую перестают читать вовсе. Там, где
+/// пояснение меняет СМЫСЛ настройки, есть [`setting_row_sub`] — но не
+/// больше одного на карточку.
 pub fn setting_row<R>(
     ui: &mut egui::Ui,
     label: &str,
     hint: Option<&str>,
     control: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
+    row_inner(ui, label, hint, None, control)
+}
+
+/// Строка настройки с ВИДИМЫМ пояснением — для редких случаев, когда без
+/// него настройку понимают неправильно.
+pub fn setting_row_sub<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    sub: &str,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    row_inner(ui, label, None, Some(sub), control)
+}
+
+fn row_inner<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    hint: Option<&str>,
+    sub: Option<&str>,
+    control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
     let mut out = None;
-    ui.horizontal(|ui| {
-        let control_w = 210.0_f32.min(ui.available_width() * 0.5);
-        let text_w = (ui.available_width() - control_w - 12.0).max(80.0);
-        ui.vertical(|ui| {
-            ui.set_width(text_w);
-            ui.add(egui::Label::new(RichText::new(label).size(14.5).color(TEXT)).truncate());
-            if let Some(h) = hint {
-                ui.add(
-                    egui::Label::new(RichText::new(h).size(12.0).color(MUTED))
-                        .wrap_mode(egui::TextWrapMode::Wrap),
-                );
-            }
-        });
-        ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            out = Some(control(ui));
-        });
-    });
+    let resp = ui
+        .horizontal(|ui| {
+            let control_w = 210.0_f32.min(ui.available_width() * 0.5);
+            let text_w = (ui.available_width() - control_w - 12.0).max(80.0);
+            ui.vertical(|ui| {
+                ui.set_width(text_w);
+                ui.add(egui::Label::new(RichText::new(label).size(14.5).color(TEXT)).truncate());
+                if let Some(s) = sub {
+                    ui.add(
+                        egui::Label::new(RichText::new(s).size(12.0).color(MUTED))
+                            .wrap_mode(egui::TextWrapMode::Wrap),
+                    );
+                }
+            });
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                out = Some(control(ui));
+            });
+        })
+        .response;
+    if let Some(h) = hint {
+        resp.on_hover_text(h);
+    }
     out.expect("контрол строки настройки отрисован")
+}
+
+/// Свёрнутая группа «Подробнее» внутри карточки: там живёт всё, что нужно
+/// раз в жизни. Открытое состояние egui помнит само.
+pub fn details<R>(ui: &mut egui::Ui, id: &str, add: impl FnOnce(&mut egui::Ui) -> R) {
+    ui.add_space(2.0);
+    egui::CollapsingHeader::new(
+        RichText::new(crate::i18n::fl!("details"))
+            .size(13.0)
+            .color(MUTED),
+    )
+    .id_salt(id)
+    .show(ui, |ui| {
+        ui.add_space(2.0);
+        add(ui);
+    });
 }
 
 /// Разделитель между строками настроек внутри одной карточки.
