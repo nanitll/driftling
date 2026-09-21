@@ -109,44 +109,6 @@ pub fn mop_frame(h: u32, handle: u32, head: u32) -> Frame {
     frame
 }
 
-/// Миска: половина эллипса с ободком и едой внутри, если `filled`.
-pub fn bowl_frame(w: u32, body: u32, food: u32, filled: bool) -> Frame {
-    let w = w.max(10);
-    let h = (w * 2 / 3).max(6);
-    let mut frame = blank(w, h);
-    let (fw, fh) = (w as f32, h as f32);
-    let rim = crate::palette::darken(body, 0.7);
-    // Чаша: нижняя половина эллипса.
-    for y in 0..h {
-        for x in 0..w {
-            let nx = (x as f32 + 0.5 - fw / 2.0) / (fw / 2.0);
-            let ny = (y as f32 + 0.5 - fh * 0.35) / (fh * 0.65);
-            if ny < 0.0 {
-                continue;
-            }
-            let d = (nx * nx + ny * ny).sqrt();
-            if d < 1.0 {
-                let color = if d > 0.82 { rim } else { body };
-                put(&mut frame, x, y, color, 1.0);
-            }
-        }
-    }
-    // Ободок и еда горкой.
-    for x in 0..w {
-        put(&mut frame, x, (fh * 0.33) as u32, rim, 0.9);
-    }
-    if filled {
-        for y in (fh * 0.16) as u32..(fh * 0.4) as u32 {
-            let t = (y as f32 - fh * 0.16) / (fh * 0.24);
-            let half = fw * 0.36 * t.max(0.15);
-            for x in ((fw / 2.0 - half) as u32)..=((fw / 2.0 + half) as u32).min(w - 1) {
-                put(&mut frame, x, y, food, 1.0);
-            }
-        }
-    }
-    frame
-}
-
 /// Лежанка: мягкий валик с углублением — на неё можно забраться.
 ///
 /// Рисуется в два слоя: сама лежанка позади питомца и передний валик
@@ -190,59 +152,6 @@ fn bed_layer(w: u32, body: u32, front_only: bool) -> Frame {
     frame
 }
 
-/// Домик: коробка со скатной крышей, дверью и окошком. Дверь — тёмный
-/// проём: в него питомец и уходит, когда прячется (фаза H3).
-pub fn house_frame(w: u32, body: u32, roof: u32) -> Frame {
-    let w = w.max(24);
-    let h = (w * 19 / 20).max(20);
-    let mut frame = blank(w, h);
-    let (fw, fh) = (w as f32, h as f32);
-    let wall = body;
-    let shade = crate::palette::darken(body, 0.82);
-    let dark = crate::palette::darken(body, 0.35);
-    let glass = crate::palette::lighten(body, 1.55);
-    let roof_lo = crate::palette::darken(roof, 0.8);
-    let wall_top = fh * 0.42;
-    // Стены: прямоугольник с чуть более тёмной правой половиной — объём.
-    for y in (wall_top as u32)..h {
-        for x in 0..w {
-            let inset = fw * 0.08;
-            if (x as f32) < inset || (x as f32) > fw - inset {
-                continue;
-            }
-            let right = (x as f32) > fw * 0.62;
-            put(&mut frame, x, y, if right { shade } else { wall }, 1.0);
-        }
-    }
-    // Крыша: треугольник с выносом за стены.
-    for y in 0..(wall_top as u32) {
-        let t = y as f32 / wall_top;
-        let half = fw * 0.5 * (0.12 + 0.88 * t);
-        let lo = (fw / 2.0 - half).max(0.0) as u32;
-        let hi = (fw / 2.0 + half).min(fw - 1.0) as u32;
-        for x in lo..=hi {
-            let edge = y as f32 > wall_top - 3.0;
-            put(&mut frame, x, y, if edge { roof_lo } else { roof }, 1.0);
-        }
-    }
-    // Дверь по центру и окошко сбоку.
-    let door_w = fw * 0.46;
-    let door_top = fh * 0.52;
-    for y in (door_top as u32)..h {
-        for x in ((fw / 2.0 - door_w / 2.0) as u32)..=((fw / 2.0 + door_w / 2.0) as u32).min(w - 1)
-        {
-            put(&mut frame, x, y, dark, 1.0);
-        }
-    }
-    let win = fw * 0.11;
-    for y in ((fh * 0.52) as u32)..=((fh * 0.52 + win) as u32) {
-        for x in ((fw * 0.17) as u32)..=((fw * 0.17 + win) as u32) {
-            put(&mut frame, x, y, glass, 1.0);
-        }
-    }
-    frame
-}
-
 /// Мячик: шар с бликом и полосой.
 pub fn ball_frame(d: u32, body: u32, stripe: u32) -> Frame {
     let d = d.max(6);
@@ -268,148 +177,6 @@ pub fn ball_frame(d: u32, body: u32, stripe: u32) -> Frame {
         0xff_ff_ff_ff,
         0.5,
     );
-    frame
-}
-
-/// Транспорт (фаза H5): вид сбоку, смотрит вправо. Кадр рисуется под
-/// класс предмета (ширина и пропорции — в [`crate::prop::PropKind::class`]),
-/// поэтому здесь только силуэт.
-///
-/// Арт процедурный: транспорт должен появиться на любом цвете питомца и в
-/// любом размере, а рисованных семейств в паке под каждую машинку нет.
-pub fn vehicle_frame(kind: crate::prop::PropKind, w: u32, body: u32, accent: u32) -> Frame {
-    use crate::prop::PropKind as K;
-    let class = kind.class();
-    let w = w.max(16);
-    let h = ((w as f32 * class.aspect) as u32).max(6);
-    let mut frame = blank(w, h);
-    let (fw, fh) = (w as f32, h as f32);
-    let dark = crate::palette::darken(body, 0.45);
-    let light = crate::palette::lighten(body, 1.3);
-    let glass = crate::palette::lighten(accent, 1.5);
-
-    let rect = |f: &mut Frame, x0: f32, y0: f32, x1: f32, y1: f32, c: u32| {
-        for y in (y0.max(0.0) as u32)..=((y1.min(fh - 1.0)) as u32) {
-            for x in (x0.max(0.0) as u32)..=((x1.min(fw - 1.0)) as u32) {
-                put(f, x, y, c, 1.0);
-            }
-        }
-    };
-    let wheel = |f: &mut Frame, cx: f32, cy: f32, r: f32| {
-        disc(f, Vec2::new(cx, cy), r, dark, 1.0);
-        disc(f, Vec2::new(cx, cy), r * 0.38, light, 1.0);
-    };
-    match kind {
-        K::Skate => {
-            rect(&mut frame, 0.0, fh * 0.1, fw - 1.0, fh * 0.45, body);
-            wheel(&mut frame, fw * 0.22, fh * 0.72, fh * 0.26);
-            wheel(&mut frame, fw * 0.78, fh * 0.72, fh * 0.26);
-        }
-        K::Bike => {
-            let r = fh * 0.34;
-            wheel(&mut frame, fw * 0.2, fh - r - 1.0, r);
-            wheel(&mut frame, fw * 0.8, fh - r - 1.0, r);
-            // Рама и руль.
-            rect(&mut frame, fw * 0.2, fh * 0.42, fw * 0.8, fh * 0.52, accent);
-            rect(&mut frame, fw * 0.42, fh * 0.2, fw * 0.5, fh * 0.5, accent);
-            rect(&mut frame, fw * 0.74, fh * 0.14, fw * 0.86, fh * 0.24, dark);
-            rect(&mut frame, fw * 0.36, fh * 0.16, fw * 0.52, fh * 0.24, body);
-        }
-        K::Moped => {
-            let r = fh * 0.28;
-            wheel(&mut frame, fw * 0.22, fh - r - 1.0, r);
-            wheel(&mut frame, fw * 0.8, fh - r - 1.0, r);
-            rect(
-                &mut frame,
-                fw * 0.16,
-                fh * 0.44,
-                fw * 0.86,
-                fh * 0.68,
-                accent,
-            );
-            rect(&mut frame, fw * 0.3, fh * 0.28, fw * 0.6, fh * 0.46, body);
-            rect(&mut frame, fw * 0.74, fh * 0.16, fw * 0.9, fh * 0.28, dark);
-        }
-        K::Car => {
-            // Кабриолет: крыши нет — питомца видно целиком, а кузов
-            // закрывает ему ноги (он рисуется ЗА кузовом).
-            let r = fh * 0.26;
-            rect(&mut frame, 0.0, fh * 0.52, fw - 1.0, fh - r * 0.9, body);
-            // Капот и багажник чуть ниже линии борта.
-            rect(&mut frame, fw * 0.72, fh * 0.44, fw - 1.0, fh * 0.56, body);
-            rect(&mut frame, 0.0, fh * 0.46, fw * 0.24, fh * 0.56, body);
-            // Лобовое стекло и фара.
-            rect(&mut frame, fw * 0.62, fh * 0.2, fw * 0.68, fh * 0.52, glass);
-            rect(&mut frame, fw * 0.94, fh * 0.5, fw - 1.0, fh * 0.58, light);
-            wheel(&mut frame, fw * 0.24, fh - r - 1.0, r);
-            wheel(&mut frame, fw * 0.76, fh - r - 1.0, r);
-        }
-        K::Copter => {
-            // Кабина внизу, хвост назад, мачта и лопасти над головой седока.
-            disc(
-                &mut frame,
-                Vec2::new(fw * 0.38, fh * 0.72),
-                fh * 0.26,
-                body,
-                1.0,
-            );
-            rect(&mut frame, fw * 0.38, fh * 0.66, fw * 0.92, fh * 0.76, body);
-            rect(
-                &mut frame,
-                fw * 0.86,
-                fh * 0.44,
-                fw * 0.94,
-                fh * 0.74,
-                accent,
-            );
-            // Лыжи.
-            rect(&mut frame, fw * 0.18, fh * 0.94, fw * 0.62, fh - 1.0, dark);
-            // Мачта и лопасти — над питомцем, поэтому у самой верхней кромки.
-            rect(&mut frame, fw * 0.36, fh * 0.08, fw * 0.42, fh * 0.62, dark);
-            rect(&mut frame, fw * 0.02, fh * 0.02, fw * 0.8, fh * 0.08, dark);
-            let _ = glass;
-        }
-        K::Plane => {
-            // Фюзеляж с носом, крыло под ним, киль сзади и винт спереди.
-            rect(&mut frame, fw * 0.1, fh * 0.5, fw * 0.9, fh * 0.72, body);
-            disc(
-                &mut frame,
-                Vec2::new(fw * 0.9, fh * 0.61),
-                fh * 0.11,
-                body,
-                1.0,
-            );
-            rect(
-                &mut frame,
-                fw * 0.28,
-                fh * 0.72,
-                fw * 0.72,
-                fh * 0.86,
-                accent,
-            );
-            // Киль и стабилизатор — сзади (самолёт смотрит вправо).
-            rect(
-                &mut frame,
-                fw * 0.08,
-                fh * 0.28,
-                fw * 0.2,
-                fh * 0.54,
-                accent,
-            );
-            rect(
-                &mut frame,
-                fw * 0.04,
-                fh * 0.5,
-                fw * 0.24,
-                fh * 0.58,
-                accent,
-            );
-            // Винт.
-            rect(&mut frame, fw * 0.95, fh * 0.36, fw * 0.99, fh * 0.86, dark);
-        }
-        // Не транспорт — пустой кадр вместо паники: вызывающий сам решил.
-        _ => {}
-    }
     frame
 }
 
@@ -592,10 +359,6 @@ mod tests {
     /// Предметы рисуются, не пустые и в своих пропорциях.
     #[test]
     fn props_have_shape() {
-        let bowl = bowl_frame(40, 0xff_b0_a2_94, 0xff_d9_a0_66, true);
-        let empty = bowl_frame(40, 0xff_b0_a2_94, 0xff_d9_a0_66, false);
-        assert!(ink(&bowl) > ink(&empty), "в полной миске видно еду");
-        assert!(bowl.w > bowl.h, "миска шире, чем выше");
         let bed = bed_frame(60, 0xff_b0_a2_94);
         assert!(ink(&bed) > 100 && bed.w > bed.h);
         // Передний валик — часть той же формы: он меньше целой лежанки,
@@ -606,9 +369,6 @@ mod tests {
             ink(&lip) > 20 && ink(&lip) < ink(&bed),
             "валик — часть лежанки"
         );
-        let house = house_frame(80, 0xff_b0_a2_94, 0xff_8a_5a_46);
-        assert!(ink(&house) > 2000, "домик — крупная вещь");
-        assert!(house.h < house.w, "домик шире, чем выше");
         let ball = ball_frame(30, 0xff_e8_94_4a, 0xff_f4_f4_f8);
         assert!(ink(&ball) > 300, "мяч круглый и плотный");
         assert_eq!(ball.w, ball.h);

@@ -30,10 +30,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let (mode, out) = match args.as_slice() {
         [_, m, o]
-            if [
-                "sheets", "icons", "surfaces", "radial", "body", "props", "rides",
-            ]
-            .contains(&m.as_str()) =>
+            if ["sheets", "icons", "surfaces", "radial", "body", "props"].contains(&m.as_str()) =>
         {
             (m.as_str(), Path::new(o))
         }
@@ -58,7 +55,6 @@ fn main() {
         "radial" => radial(pack, out),
         "body" => body(pack, out),
         "props" => props(pack, out),
-        "rides" => rides(pack, out),
         _ => icons(pack, out),
     }
 }
@@ -307,40 +303,24 @@ fn body(pack: &Pack, out: &Path) {
     println!("пруф мягкого тела записан в {}", out.display());
 }
 
-/// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
-/// наведённой кнопкой и мини-шкалами, плюс фаза появления.
-/// Дев-пруф фаз H1/H2/H4: комната с вещами — миска, лежанка (питомец спит
-/// в ней), мяч в лапках и брошенный мяч со своей тенью.
+/// Дев-пруф фаз H1/H2/H4: комната с вещами — лежанка (питомец спит в ней)
+/// и мяч в полёте со своей тенью.
 fn props(pack: &Pack, out: &Path) {
-    use driftling_core::effects::{
-        ball_frame, bed_frame, bed_front_frame, bowl_frame, house_frame, shadow_frame,
-    };
+    use driftling_core::effects::{ball_frame, bed_frame, bed_front_frame, shadow_frame};
     use driftling_core::palette::{darken, lighten};
     use driftling_core::prop::{Prop, PropKind};
     use driftling_core::{Deform, Vec2};
     const PET: u32 = 96;
     let color = DEFAULT_PET_COLOR;
-    let idle = pack.frames(Stage::Adult, "idle", PET, color);
     let sleep = pack.frames(Stage::Adult, "sleep", PET, color);
     let walk = pack.frames(Stage::Adult, "walk", PET, color);
     let shadow = shadow_frame((PET as f32 * 0.78) as u32);
     let width = |k: PropKind| (PET as f32 * k.class().size_scale) as u32;
-    let bowl = bowl_frame(
-        width(PropKind::Bowl),
-        darken(color, 0.62),
-        lighten(color, 1.25),
-        true,
-    );
     let bed = bed_frame(width(PropKind::Bed), darken(color, 0.78));
     let bed_front = bed_front_frame(width(PropKind::Bed), darken(color, 0.78));
     let ball = ball_frame(
         width(PropKind::Ball),
         lighten(color, 1.4),
-        darken(color, 0.5),
-    );
-    let house = house_frame(
-        width(PropKind::House),
-        darken(color, 0.85),
         darken(color, 0.5),
     );
 
@@ -372,14 +352,7 @@ fn props(pack: &Pack, out: &Path) {
             };
         }
     }
-    // 1. Питомец ест у миски, подойдя сбоку.
-    let bowl_b = put(&mut c, &bowl, PropKind::Bowl, 120.0);
-    c.blit(
-        &idle[0],
-        (bowl_b.x + bowl_b.w + 8.0) as u32,
-        (ground - PET as f32) as u32,
-    );
-    // 2. Спит в лежанке: лежанка — рельеф, он стоит на её кромке.
+    // 1. Спит в лежанке: лежанка — рельеф, он стоит на её кромке.
     let bed_b = put(&mut c, &bed, PropKind::Bed, 330.0);
     c.blit(
         &sleep[0],
@@ -396,15 +369,7 @@ fn props(pack: &Pack, out: &Path) {
         },
         1.0,
     );
-    // 3. Домик в углу — питомец выходит из двери.
-    let house_b = put(&mut c, &house, PropKind::House, 470.0);
-    c.blit(
-        &idle[0],
-        (house_b.x + house_b.w / 2.0 - PET as f32 / 2.0) as u32,
-        (ground - PET as f32) as u32,
-    );
-
-    // 4. Мяч в полёте со своей тенью и питомец, бегущий за ним.
+    // 2. Мяч в полёте со своей тенью и питомец, бегущий за ним.
     let bx = 690.0;
     c.blit_deformed(
         &shadow,
@@ -422,89 +387,8 @@ fn props(pack: &Pack, out: &Path) {
     println!("пруф вещей записан в {}", out.display());
 }
 
-/// Дев-пруф фазы H5: весь транспорт с питомцем в седле.
-fn rides(pack: &Pack, out: &Path) {
-    use driftling_core::effects::vehicle_frame;
-    use driftling_core::palette::{darken, lighten};
-    use driftling_core::prop::{Prop, PropKind};
-    use driftling_core::{Deform, Vec2};
-    const PET: u32 = 96;
-    let color = DEFAULT_PET_COLOR;
-    let idle = pack.frames(Stage::Adult, "idle", PET, color);
-    let (cols, rows) = (3u32, 2u32);
-    let (cw, ch) = (300u32, 190u32);
-    let mut c = Canvas::new(cols * cw, rows * ch, DARK_BG);
-    for (i, kind) in PropKind::VEHICLES.iter().enumerate() {
-        let v = kind.vehicle().unwrap();
-        let (col, row) = (i as u32 % cols, i as u32 / cols);
-        let (ox, oy) = ((col * cw) as f32, (row * ch) as f32);
-        let ground = oy + ch as f32 - 30.0;
-        let width = (PET as f32 * kind.class().size_scale) as u32;
-        let frame = vehicle_frame(*kind, width, darken(color, 0.8), lighten(color, 1.2));
-        let prop = Prop::new(
-            1,
-            *kind,
-            Vec2::new(ox + cw as f32 / 2.0, ground),
-            PET as f32,
-        );
-        let b = prop.bounds();
-        let pet_y = b.y + b.h * v.seat - PET as f32;
-        let draw_pet = |c: &mut Canvas| {
-            c.blit(
-                &idle[0],
-                (b.x + b.w / 2.0 - PET as f32 / 2.0) as u32,
-                pet_y.max(oy) as u32,
-            );
-        };
-        let draw_ride = |c: &mut Canvas| {
-            c.blit_deformed(
-                &frame,
-                Vec2::new(b.x, b.y),
-                Deform {
-                    scale_x: b.w / frame.w as f32,
-                    scale_y: b.h / frame.h as f32,
-                    ..Deform::NONE
-                },
-                1.0,
-            );
-        };
-        // В автомобиле и в кабине питомца видно ЗА кузовом.
-        if v.rider_behind {
-            draw_pet(&mut c);
-            draw_ride(&mut c);
-        } else {
-            draw_ride(&mut c);
-            draw_pet(&mut c);
-        }
-    }
-    c.save(&out.join("rides.png"));
-
-    // Незваные гости (H6): каждый со своим силуэтом рядом с питомцем.
-    use driftling_core::effects::mob_frame;
-    let mut m = Canvas::new(560, 200, DARK_BG);
-    let ground = 150.0f32;
-    m.blit(&idle[0], 30, (ground - PET as f32) as u32);
-    for (i, kind) in PropKind::MOBS.iter().enumerate() {
-        let width = (PET as f32 * kind.class().size_scale) as u32;
-        let frame = mob_frame(*kind, width, darken(color, 0.7));
-        let x = 200.0 + i as f32 * 120.0;
-        let prop = Prop::new(1, *kind, Vec2::new(x, ground), PET as f32);
-        let b = prop.bounds();
-        m.blit_deformed(
-            &frame,
-            Vec2::new(b.x, b.y),
-            Deform {
-                scale_x: b.w / frame.w as f32,
-                scale_y: b.h / frame.h as f32,
-                ..Deform::NONE
-            },
-            1.0,
-        );
-    }
-    m.save(&out.join("mobs.png"));
-    println!("пруф транспорта и гостей записан в {}", out.display());
-}
-
+/// Дев-пруф фазы G4: радиальное меню ПКМ вокруг питомца — раскрытое, с
+/// наведённой кнопкой и мини-шкалами, плюс фаза появления.
 fn radial(pack: &Pack, out: &Path) {
     use driftling_core::radial::{radial_frame, Icon, RadialItem};
     const PET: u32 = 96;
@@ -513,7 +397,6 @@ fn radial(pack: &Pack, out: &Path) {
         (Icon::Candy, "Вкусняшка"),
         (Icon::Paw, "Поиграть"),
         (Icon::Ball, "Мяч"),
-        (Icon::Wheel, "Прокатиться"),
         (Icon::Moon, "Уложить спать"),
         (Icon::Gear, "Настройки"),
         (Icon::Cross, "Убрать с экрана"),
@@ -521,12 +404,11 @@ fn radial(pack: &Pack, out: &Path) {
     .into_iter()
     .map(|(icon, l)| RadialItem::action(icon, l))
     .collect();
-    const INNER: usize = 8;
+    const INNER: usize = 7;
     // Внешнее кольцо — переключатели правил мира.
     items.extend(
         [
             (Icon::Bug, "Гости", true),
-            (Icon::Wheel, "Транспорт сам", true),
             (Icon::Hush, "Тихий час", false),
             (Icon::Eye, "Прятаться", true),
         ]
@@ -589,7 +471,6 @@ fn radial(pack: &Pack, out: &Path) {
     }
     println!("пруф радиального меню записан в {}", out.display());
 }
-
 /// Дев-пруф фазы G: «комната» с питомцем на всех поверхностях —
 /// пол, обе стены и потолок, каждый со своим кадром и ориентацией.
 fn surfaces(pack: &Pack, out: &Path) {

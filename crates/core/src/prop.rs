@@ -1,7 +1,7 @@
 //! Предметы мира питомца (фаза H1, ТЗ — `docs/WORLD.md`).
 //!
-//! Швабра, миска, лежанка, мяч, домик, велосипед и вражеский моб — это одна
-//! сущность: у неё есть место в мире, вид, физика и способ взаимодействия.
+//! Швабра, лежанка, мяч и вражеский моб — это одна сущность: у неё есть
+//! место в мире, вид, физика и способ взаимодействия.
 //! Здесь живут данные и физика этой сущности; как она выглядит — решает
 //! демон (процедурные кадры или арт-пак), что с ней делает питомец —
 //! [`crate::task`].
@@ -29,26 +29,16 @@ use serde::{Deserialize, Serialize};
 pub enum PropKind {
     /// Швабра: питомец достаёт её, чтобы убрать лужу (фаза H0).
     Mop,
-    /// Миска: голодный сам идёт к ней есть.
+    /// Миска: НАСЛЕДИЕ. В мире больше не появляется — вид оставлен, чтобы
+    /// старые журналы (и журналы с других устройств) читались без потерь;
+    /// демон убирает такую вещь со сцены при первом же запуске.
     Bowl,
     /// Лежанка: спит в ней, а не на голом полу.
     Bed,
     /// Мячик: бросишь — догонит и принесёт.
     Ball,
-    /// Домик: свой угол. В нём прячутся, спят и из него выходят здороваться.
+    /// Домик: НАСЛЕДИЕ, как и [`PropKind::Bowl`].
     House,
-    /// Скейт: самый простой транспорт, катится по полу.
-    Skate,
-    /// Велосипед: быстрее скейта, у края тормозит.
-    Bike,
-    /// Мопед: ещё быстрее, с дымком.
-    Moped,
-    /// Автомобиль: питомца видно в окне.
-    Car,
-    /// Вертолёт: свободный полёт с зависанием.
-    Copter,
-    /// Самолёт: полёт по дуге через весь экран.
-    Plane,
     /// Пылевой комок: катается по полу и сорит (режим войны, H6).
     DustBall,
     /// Таракан: быстро бегает и удирает.
@@ -73,29 +63,6 @@ pub struct Mob {
     pub flee_boost: f32,
     /// Сидит на кромке окна, а не бегает по полу.
     pub on_ledge: bool,
-}
-
-/// Профиль транспорта (фаза H5): чем он отличается от остальных.
-/// Управление питомцу не нужно — он катается сам; транспорт это зрелище,
-/// а не способ быстрее двигаться по экрану.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Vehicle {
-    /// Скорость хода как кратность ДЕЛОВОГО шага питомца (того, которым он
-    /// идёт к миске). В «настоящих» м/с транспорт получался бы в разы
-    /// быстрее всего, что питомец делает на экране, — и смотрелся бы не
-    /// зрелищем, а телепортацией.
-    pub speed_x: f32,
-    /// Летает (иначе катится по полу).
-    pub air: bool,
-    /// Сколько катается, сек (от и до).
-    pub ride_secs: (f32, f32),
-    /// Где сидит питомец: доля высоты транспорта от его верхней кромки
-    /// (0 — на самом верху, 1 — у земли).
-    pub seat: f32,
-    /// Амплитуда покачивания на ходу, доля высоты питомца.
-    pub bob: f32,
-    /// Питомца видно ЗА кузовом (автомобиль: он в окне).
-    pub rider_behind: bool,
 }
 
 /// Неизменные свойства вида предмета.
@@ -171,8 +138,6 @@ impl PropKind {
                 restitution: 0.02,
                 throwable: false,
             },
-            // Транспорт: не хранится в журнале (это событие, а не быт),
-            // мышью не таскается — питомец сам на него садится.
             // Мобы: лёгкие, мышью не ловятся, в журнале их нет.
             PropKind::DustBall | PropKind::Roach | PropKind::Bug => PropClass {
                 anchor: Surface::Floor,
@@ -192,35 +157,6 @@ impl PropKind {
                 restitution: 0.2,
                 throwable: false,
             },
-            PropKind::Skate
-            | PropKind::Bike
-            | PropKind::Moped
-            | PropKind::Car
-            | PropKind::Copter
-            | PropKind::Plane => PropClass {
-                anchor: Surface::Floor,
-                size_scale: match self {
-                    PropKind::Car => 1.9,
-                    PropKind::Plane => 2.5,
-                    PropKind::Copter => 2.0,
-                    PropKind::Moped => 1.4,
-                    PropKind::Bike => 1.3,
-                    _ => 1.1,
-                },
-                aspect: match self {
-                    PropKind::Skate => 0.28,
-                    PropKind::Plane => 0.5,
-                    PropKind::Copter => 0.62,
-                    PropKind::Car => 0.55,
-                    _ => 0.6,
-                },
-                density_scale: 1.2,
-                draggable: false,
-                solid: false,
-                persist: false,
-                restitution: 0.05,
-                throwable: false,
-            },
             PropKind::Ball => PropClass {
                 anchor: Surface::Floor,
                 size_scale: 0.38,
@@ -234,69 +170,6 @@ impl PropKind {
                 throwable: true,
             },
         }
-    }
-
-    /// Профиль транспорта; None — это не транспорт.
-    pub fn vehicle(self) -> Option<Vehicle> {
-        let v = match self {
-            PropKind::Mop
-            | PropKind::Bowl
-            | PropKind::Bed
-            | PropKind::Ball
-            | PropKind::House
-            | PropKind::DustBall
-            | PropKind::Roach
-            | PropKind::Bug => return None,
-            PropKind::Skate => Vehicle {
-                speed_x: 1.6,
-                air: false,
-                ride_secs: (14.0, 24.0),
-                seat: 0.22,
-                bob: 0.04,
-                rider_behind: false,
-            },
-            PropKind::Bike => Vehicle {
-                speed_x: 2.0,
-                air: false,
-                ride_secs: (16.0, 28.0),
-                seat: 0.36,
-                bob: 0.05,
-                rider_behind: false,
-            },
-            PropKind::Moped => Vehicle {
-                speed_x: 3.0,
-                air: false,
-                ride_secs: (16.0, 26.0),
-                seat: 0.42,
-                bob: 0.03,
-                rider_behind: false,
-            },
-            PropKind::Car => Vehicle {
-                speed_x: 2.4,
-                air: false,
-                ride_secs: (18.0, 30.0),
-                seat: 0.86,
-                bob: 0.02,
-                rider_behind: true,
-            },
-            PropKind::Copter => Vehicle {
-                speed_x: 2.0,
-                air: true,
-                ride_secs: (20.0, 34.0),
-                seat: 0.62,
-                bob: 0.06,
-                rider_behind: false,
-            },
-            PropKind::Plane => Vehicle {
-                speed_x: 3.5,
-                air: true,
-                ride_secs: (14.0, 22.0),
-                seat: 0.58,
-                bob: 0.03,
-                rider_behind: false,
-            },
-        };
-        Some(v)
     }
 
     /// Профиль моба; None — это не моб.
@@ -330,16 +203,6 @@ impl PropKind {
     /// Все виды мобов.
     pub const MOBS: [PropKind; 3] = [PropKind::DustBall, PropKind::Roach, PropKind::Bug];
 
-    /// Все виды транспорта — по этому списку он и выбирается случайно.
-    pub const VEHICLES: [PropKind; 6] = [
-        PropKind::Skate,
-        PropKind::Bike,
-        PropKind::Moped,
-        PropKind::Car,
-        PropKind::Copter,
-        PropKind::Plane,
-    ];
-
     /// Машинное имя (журнал, логи, тесты).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -348,12 +211,6 @@ impl PropKind {
             PropKind::Bed => "bed",
             PropKind::Ball => "ball",
             PropKind::House => "house",
-            PropKind::Skate => "skate",
-            PropKind::Bike => "bike",
-            PropKind::Moped => "moped",
-            PropKind::Car => "car",
-            PropKind::Copter => "copter",
-            PropKind::Plane => "plane",
             PropKind::DustBall => "dustball",
             PropKind::Roach => "roach",
             PropKind::Bug => "bug",
@@ -372,8 +229,6 @@ pub enum PropState {
     Held,
     /// В лапках питомца (швабра во время уборки).
     Carried,
-    /// На нём едут: позицию ведёт поездка, своей физики нет (H5).
-    Ridden,
 }
 
 /// Предмет в мире.
@@ -427,10 +282,7 @@ impl Prop {
     /// кромка окна или другой твёрдый предмет), отскок и затухание.
     /// В руке (`Held`/`Carried`) физика выключена — позицию ведёт хозяин.
     pub fn tick(&mut self, world: &World, cfg: &BehaviorConfig, dt: f32) {
-        if matches!(
-            self.state,
-            PropState::Held | PropState::Carried | PropState::Ridden
-        ) {
+        if matches!(self.state, PropState::Held | PropState::Carried) {
             return;
         }
         let class = self.kind.class();

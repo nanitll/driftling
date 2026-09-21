@@ -51,16 +51,10 @@ enum CtlAction {
         #[arg(long, help = fl!("cli-about-feed-treat"))]
         treat: bool,
     },
-    // Прокатить питомца на транспорте.
-    #[command(about = fl!("cli-about-ride"))]
-    Ride {
-        #[arg(help = fl!("cli-about-ride-kind"))]
-        kind: Option<String>,
-    },
     // Показать настройки глазами демона.
     #[command(about = fl!("cli-about-config"))]
     Config,
-    // Что сейчас на экране: вещи, транспорт, вежливость.
+    // Что сейчас на экране: вещи и вежливость.
     #[command(about = fl!("cli-about-world"))]
     World,
     // Достать или убрать мяч.
@@ -153,7 +147,6 @@ fn main() -> Result<()> {
                 CtlAction::Feed { treat } => driftling_ipc::Request::Feed { treat },
                 CtlAction::Play => driftling_ipc::Request::Play,
                 CtlAction::Sleep => driftling_ipc::Request::PutToSleep,
-                CtlAction::Ride { kind } => driftling_ipc::Request::Ride { kind },
                 CtlAction::Mob { kind } => driftling_ipc::Request::Mob { kind },
                 CtlAction::Hop { dir } => driftling_ipc::Request::Hop { dir },
                 CtlAction::Config => driftling_ipc::Request::GetConfig,
@@ -221,7 +214,6 @@ fn main() -> Result<()> {
                     screen,
                     ground_y,
                     fullscreen_hidden,
-                    ride,
                     props,
                 } => {
                     match screen {
@@ -237,9 +229,6 @@ fn main() -> Result<()> {
                     }
                     if fullscreen_hidden {
                         println!("{}", fl!("ctl-world-hidden"));
-                    }
-                    if let Some(kind) = ride {
-                        println!("{}", fl!("ctl-world-ride", kind = kind));
                     }
                     if props.is_empty() {
                         println!("{}", fl!("ctl-world-empty"));

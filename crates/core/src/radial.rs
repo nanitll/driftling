@@ -32,8 +32,6 @@ pub enum Icon {
     Ball,
     /// Лапка — поиграть с питомцем.
     Paw,
-    /// Колесо — прокатиться на транспорте.
-    Wheel,
     /// Жучок — незваные гости (режим войны).
     Bug,
     /// «Тсс» — тихий режим.
@@ -667,20 +665,6 @@ fn draw_icon(frame: &mut Frame, icon: Icon, c: Vec2, s: f32, accent: u32) {
                 );
             }
         }
-        Icon::Wheel => {
-            ring(frame, c, s, s * 0.26, accent, 1.0);
-            for i in 0..4 {
-                let a = i as f32 * core::f32::consts::TAU / 4.0 + 0.4;
-                line(
-                    frame,
-                    c,
-                    Vec2::new(c.x + a.cos() * s * 0.9, c.y + a.sin() * s * 0.9),
-                    s * 0.18,
-                    accent,
-                );
-            }
-            disc(frame, c, s * 0.26, accent, 1.0);
-        }
         Icon::Bug => {
             // Тельце со швом, усики и лапки — тот же силуэт, что у гостя.
             disc(frame, Vec2::new(c.x, c.y + s * 0.1), s * 0.72, accent, 1.0);
@@ -1097,7 +1081,7 @@ mod tests {
                     label: "гости".into(),
                     state,
                 },
-                RadialItem::action(Icon::Wheel, "транспорт"),
+                RadialItem::action(Icon::Ball, "мяч"),
             ];
             radial_frame(&l, &items, None, 1.0, None, 13.0, 0xff_e8_94_4a)
         };
@@ -1117,7 +1101,6 @@ mod tests {
             (Icon::Candy, "Вкусняшка"),
             (Icon::Paw, "Поиграть"),
             (Icon::Ball, "Мяч"),
-            (Icon::Wheel, "Прокатиться"),
             (Icon::Moon, "Уложить спать"),
             (Icon::Gear, "Настройки"),
             (Icon::Cross, "Убрать"),

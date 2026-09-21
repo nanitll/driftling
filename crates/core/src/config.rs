@@ -101,14 +101,13 @@ impl ConfigPatch {
     }
 }
 
-/// Секция `[game]`: развлечения — транспорт и незваные гости.
+/// Секция `[game]`: развлечения — незваные гости.
 ///
 /// ```toml
 /// [game]
 /// war_mode = true        # к питомцу изредка заходят незваные гости
-/// rides = true           # транспорт иногда приезжает сам
-/// ride_every_mins = 15   # как часто демон думает подать транспорт
-/// ride_kinds = ["bike", "copter"]   # пусто = все
+/// mob_every_mins = 10    # как часто демон думает позвать гостя
+/// mob_kinds = ["roach", "bug"]   # пусто = все
 /// ```
 ///
 /// Режим войны — зрелище, а не бой: питомец гоняет мобов по экрану, никто
@@ -126,12 +125,6 @@ pub struct GameConfig {
     pub mob_every_mins: f64,
     /// Какие гости допущены (машинные имена); пусто — все.
     pub mob_kinds: Vec<String>,
-    /// Приезжает ли транспорт сам.
-    pub rides: bool,
-    /// Как часто демон думает подать транспорт, мин.
-    pub ride_every_mins: f64,
-    /// Какой транспорт допущен (машинные имена); пусто — весь.
-    pub ride_kinds: Vec<String>,
 }
 
 impl Default for GameConfig {
@@ -140,9 +133,6 @@ impl Default for GameConfig {
             war_mode: false,
             mob_every_mins: 10.0,
             mob_kinds: Vec::new(),
-            rides: true,
-            ride_every_mins: 15.0,
-            ride_kinds: Vec::new(),
         }
     }
 }
@@ -151,10 +141,7 @@ impl Default for GameConfig {
 ///
 /// ```toml
 /// [world]
-/// auto_bowl = true          # первая кормёжка ставит миску
 /// auto_bed = true           # первое «уложить спать» ставит лежанку
-/// auto_house = true         # на третьи сутки появляется домик
-/// house_age_days = 3.0
 /// puddles = true            # тошнота оставляет лужу, питомец её моет
 /// ```
 ///
@@ -164,16 +151,8 @@ impl Default for GameConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WorldConfig {
-    /// Первая кормёжка ставит миску.
-    pub auto_bowl: bool,
     /// Первое «уложить спать» ставит лежанку.
     pub auto_bed: bool,
-    /// Домик появляется сам по возрасту.
-    pub auto_house: bool,
-    /// С какого возраста появляется домик, суток.
-    pub house_age_days: f64,
-    /// Как часто питомец думает зайти домой посидеть, мин.
-    pub house_visit_every_mins: f64,
     /// Оставляет ли тошнота лужу (и есть ли что убирать шваброй).
     pub puddles: bool,
     /// Сколько питомца не трогают, прежде чем он берётся за уборку, сек.
@@ -189,11 +168,7 @@ pub struct WorldConfig {
 impl Default for WorldConfig {
     fn default() -> Self {
         Self {
-            auto_bowl: true,
             auto_bed: true,
-            auto_house: true,
-            house_age_days: 3.0,
-            house_visit_every_mins: 0.75,
             puddles: true,
             chore_delay_secs: 6.0,
             litter: true,
@@ -486,16 +461,15 @@ mod tests {
     #[test]
     fn world_and_comfort_default_to_previous_behaviour() {
         let cfg = Config::default();
-        assert!(cfg.world.auto_bowl && cfg.world.auto_bed && cfg.world.auto_house);
-        assert_eq!(cfg.world.house_age_days, 3.0);
+        assert!(cfg.world.auto_bed);
         assert!(cfg.world.puddles && cfg.world.sneezes && cfg.world.shadow);
         assert!(cfg.comfort.hide_on_fullscreen && cfg.comfort.motion_sickness);
         assert_eq!(cfg.comfort.fullscreen_grace_secs, 0.9);
         assert!(!cfg.comfort.quiet && cfg.comfort.surprises == 1.0);
         assert_eq!(cfg.comfort.text_scale, 1.0);
-        // Транспорт ездит сам, война выключена — ровно как было в коде.
-        assert!(cfg.game.rides && !cfg.game.war_mode);
-        assert!(cfg.game.ride_kinds.is_empty() && cfg.game.mob_kinds.is_empty());
+        // Война выключена — ровно как было в коде.
+        assert!(!cfg.game.war_mode);
+        assert!(cfg.game.mob_kinds.is_empty());
 
         let old: Config = toml::from_str("[physics]\npet_height_cm = 25\n").unwrap();
         assert_eq!(old.physics.pet_height_cm, 25.0);
@@ -507,14 +481,14 @@ mod tests {
     #[test]
     fn partial_sections_keep_other_defaults() {
         let cfg: Config = toml::from_str(
-            "[world]\nauto_house = false\n[comfort]\nquiet = true\n[game]\nride_kinds = [\"bike\"]\n",
+            "[world]\nauto_bed = false\n[comfort]\nquiet = true\n[game]\nmob_kinds = [\"bug\"]\n",
         )
         .unwrap();
-        assert!(!cfg.world.auto_house);
-        assert!(cfg.world.auto_bowl, "остальные вещи остались как были");
+        assert!(!cfg.world.auto_bed);
+        assert!(cfg.world.puddles, "остальные вещи остались как были");
         assert!(cfg.comfort.quiet && cfg.comfort.motion_sickness);
-        assert_eq!(cfg.game.ride_kinds, vec!["bike".to_string()]);
-        assert!(cfg.game.rides, "флаг самоподачи не сбросился");
+        assert_eq!(cfg.game.mob_kinds, vec!["bug".to_string()]);
+        assert!(!cfg.game.war_mode, "флаг войны не сбросился");
     }
 
     #[test]
@@ -522,6 +496,15 @@ mod tests {
         let cfg: Config = toml::from_str("[pet]\nsize = 90\n[behavior]\nwalk_speed = 400.0\n")
             .unwrap_or_default();
         assert_eq!(cfg, Config::default());
+        // Ключи миски, домика и транспорта из старых версий: их больше нет
+        // в схеме, и конфиг с ними обязан читаться как обычный.
+        let legacy: Config = toml::from_str(
+            "[world]\nauto_bowl = true\nauto_house = true\nhouse_age_days = 3.0\n\
+             [game]\nrides = true\nride_every_mins = 15\nride_kinds = [\"bike\"]\n",
+        )
+        .unwrap();
+        assert_eq!(legacy.world, Config::default().world);
+        assert_eq!(legacy.game, Config::default().game);
         assert_eq!(
             cfg.sync.mode,
             SyncMode::Off,

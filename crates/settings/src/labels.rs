@@ -110,22 +110,14 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
-/// Человеческое имя вещи мира по машинному (миска, лежанка, вертолёт…).
+/// Человеческое имя вещи мира по машинному (швабра, лежанка, таракан…).
 /// Неизвестное имя (демон новее окна) показывается как есть — это лучше,
 /// чем «нет перевода».
 pub fn prop_label(kind: &str) -> String {
     match kind {
         "mop" => fl!("prop-mop"),
-        "bowl" => fl!("prop-bowl"),
         "bed" => fl!("prop-bed"),
         "ball" => fl!("prop-ball"),
-        "house" => fl!("prop-house"),
-        "skate" => fl!("prop-skate"),
-        "bike" => fl!("prop-bike"),
-        "moped" => fl!("prop-moped"),
-        "car" => fl!("prop-car"),
-        "copter" => fl!("prop-copter"),
-        "plane" => fl!("prop-plane"),
         "dustball" => fl!("prop-dustball"),
         "roach" => fl!("prop-roach"),
         "bug" => fl!("prop-bug"),

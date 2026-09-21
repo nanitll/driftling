@@ -52,7 +52,6 @@ pub struct WorldSnapshot {
     #[allow(dead_code)]
     pub ground_y: Option<f32>,
     pub fullscreen_hidden: bool,
-    pub ride: Option<String>,
     pub props: Vec<PropInfo>,
 }
 
@@ -168,7 +167,6 @@ pub fn poll_once(slot: &Arc<Mutex<PollState>>, want: u8) {
                 screen,
                 ground_y,
                 fullscreen_hidden,
-                ride,
                 props,
             }) = call(&Request::World)
             {
@@ -176,7 +174,6 @@ pub fn poll_once(slot: &Arc<Mutex<PollState>>, want: u8) {
                     screen,
                     ground_y,
                     fullscreen_hidden,
-                    ride,
                     props,
                 });
             }

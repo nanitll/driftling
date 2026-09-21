@@ -25,10 +25,12 @@ use std::time::Duration;
 /// добавлены статы и стадия роста.
 /// v3: пользовательский цвет питомца — Recolor, в PetInfo добавлен color.
 /// v4 (фаза E): SyncStatus — статус синхронизации для ctl и настроек.
-/// v5 (фаза H): мир вещей — Ride/Mob/Toy/StopRide/PlaceProp/TakeProp,
-/// картина мира (World), конфиг через демона (GetConfig/SetConfig) и
-/// честный ответ на Reload (Reloaded вместо голого Ok).
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v5 (фаза H): мир вещей — Mob/Toy/PlaceProp/TakeProp, картина мира
+/// (World), конфиг через демона (GetConfig/SetConfig) и честный ответ на
+/// Reload (Reloaded вместо голого Ok).
+/// v6: из мира убраны миска, домик и транспорт (нечем было рисовать) —
+/// вместе с ними ушли Ride/StopRide и поле `ride` в World.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Сколько сервер ждёт строку запроса от подключившегося клиента,
 /// прежде чем молча бросить соединение (ТД-12: защита от зависших клиентов).
@@ -72,12 +74,6 @@ pub enum Request {
     Mob {
         kind: Option<String>,
     },
-    /// Прокатить питомца (фаза H5). `kind` — вид транспорта (skate, bike,
-    /// moped, car, copter, plane); None — случайный. Повторный вызов во
-    /// время поездки высаживает питомца.
-    Ride {
-        kind: Option<String>,
-    },
     /// Переименовать питомца (= событие журнала).
     Rename(String),
     /// Перекрасить питомца: базовый цвет тела ARGB8888 (альфу демон
@@ -103,8 +99,6 @@ pub enum Request {
     Toy {
         show: Option<bool>,
     },
-    /// Высадить питомца из транспорта (идемпотентно).
-    StopRide,
     /// Отправить питомца на соседний монитор: "left" | "right".
     Hop {
         dir: String,
@@ -155,8 +149,6 @@ pub enum Response {
         ground_y: Option<f32>,
         /// Питомец спрятан вежливостью к полноэкранному окну.
         fullscreen_hidden: bool,
-        /// Питомец сейчас катается на этом транспорте.
-        ride: Option<String>,
         props: Vec<PropInfo>,
     },
     /// Поставленная вещь (ответ на PlaceProp).

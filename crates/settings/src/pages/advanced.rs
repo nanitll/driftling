@@ -145,27 +145,6 @@ fn dangerous(app: &mut SettingsApp, ui: &mut egui::Ui) {
     card(ui, |ui| {
         card_title(ui, &fl!("section-dangerous"));
         let alive = app.daemon_up() && !app.busy();
-        let rides: Vec<String> = PropKind::VEHICLES
-            .iter()
-            .map(|k| prop_label(k.as_str()))
-            .collect();
-        setting_row(
-            ui,
-            &fl!("dangerous-ride"),
-            Some(&fl!("dangerous-ride-hint")),
-            |ui| {
-                ui.add_enabled_ui(alive, |ui| {
-                    if let Some(i) = segmented(ui, &rides, None, app.accent) {
-                        let kind = PropKind::VEHICLES[i].as_str().to_string();
-                        app.command(
-                            ui,
-                            Request::Ride { kind: Some(kind) },
-                            fl!("msg-ride-called"),
-                        );
-                    }
-                });
-            },
-        );
         let mobs: Vec<String> = PropKind::MOBS
             .iter()
             .map(|k| prop_label(k.as_str()))

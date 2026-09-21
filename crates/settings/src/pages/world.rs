@@ -4,7 +4,7 @@
 //! `[comfort]`): они НЕ уезжают на другие устройства. Каждая ручка
 //! применяется сразу — «Сохранить» нет.
 //!
-//! На виду — то, что человек трогает: шесть переключателей и три кнопки.
+//! На виду — то, что человек трогает: переключатели и кнопка «позвать».
 //! Частоты, списки видов и мелкая уборка — под «Подробнее»: настройка,
 //! которую крутят раз в жизни, не должна занимать место каждый день.
 
@@ -16,8 +16,8 @@ use crate::app::SettingsApp;
 use crate::i18n::fl;
 use crate::labels::prop_label;
 use crate::theme::{
-    self, card, card_title, chip, details, hint, outline_button, primary_button, row_sep,
-    setting_row, setting_row_sub, toggle_switch, MUTED,
+    self, card, card_title, chip, details, hint, outline_button, row_sep, setting_row,
+    setting_row_sub, toggle_switch, MUTED,
 };
 
 pub fn show(app: &mut SettingsApp, ui: &mut egui::Ui) {
@@ -105,12 +105,8 @@ fn peace(app: &mut SettingsApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Развлечения: гости и транспорт — два тумблера и кнопки «сейчас».
+/// Развлечения: незваные гости — тумблер и кнопка «сейчас».
 fn fun(app: &mut SettingsApp, ui: &mut egui::Ui) {
-    let riding = {
-        let st = app.poll.lock().unwrap();
-        st.world.as_ref().and_then(|w| w.ride.clone())
-    };
     card(ui, |ui| {
         card_title(ui, &fl!("section-fun"));
         let mut changed = false;
@@ -123,73 +119,23 @@ fn fun(app: &mut SettingsApp, ui: &mut egui::Ui) {
                 changed = true;
             }
         });
-        let mut auto = app.cfg.game.rides;
-        setting_row(
-            ui,
-            &fl!("world-rides"),
-            Some(&fl!("world-rides-hint")),
-            |ui| {
-                if toggle_switch(ui, &mut auto, app.accent).changed() {
-                    app.cfg.game.rides = auto;
-                    changed = true;
-                }
-            },
-        );
-        if quiet && (war || auto) {
+        if quiet && war {
             hint(ui, &fl!("world-muted-by-quiet"));
         }
 
         row_sep(ui);
         let alive = app.daemon_up() && !app.busy();
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-            if primary_button(
-                ui,
-                &fl!("btn-ride-now"),
-                alive && riding.is_none(),
-                app.accent,
-            )
-            .clicked()
-            {
-                app.command(ui, Request::Ride { kind: None }, fl!("msg-ride-called"));
-            }
-            if outline_button(ui, &fl!("btn-stop-ride"), MUTED, alive && riding.is_some()).clicked()
-            {
-                app.command(ui, Request::StopRide, fl!("msg-ride-stopped"));
-            }
-            if outline_button(ui, &fl!("btn-summon-guest"), app.accent_light, alive).clicked() {
-                app.command(ui, Request::Mob { kind: None }, fl!("msg-guest-called"));
-            }
-        });
-        if let Some(kind) = &riding {
-            hint(ui, &fl!("world-riding-now", kind = prop_label(kind)));
+        if outline_button(ui, &fl!("btn-summon-guest"), app.accent_light, alive).clicked() {
+            app.command(ui, Request::Mob { kind: None }, fl!("msg-guest-called"));
         }
 
         details(ui, "fun-more", |ui| {
-            let mut every = app.cfg.game.ride_every_mins;
-            setting_row(ui, &fl!("world-ride-every"), None, |ui| {
-                changed |= slider(ui, &mut every, 2.0..=120.0, 0.0, &fl!("unit-mins"));
-                app.cfg.game.ride_every_mins = every;
-            });
-            changed |= kinds_row(
-                app,
-                ui,
-                &fl!("world-ride-kinds"),
-                &PropKind::VEHICLES,
-                Kind::Rides,
-            );
             let mut mob_every = app.cfg.game.mob_every_mins;
             setting_row(ui, &fl!("world-mob-every"), None, |ui| {
                 changed |= slider(ui, &mut mob_every, 2.0..=120.0, 0.0, &fl!("unit-mins"));
                 app.cfg.game.mob_every_mins = mob_every;
             });
-            changed |= kinds_row(
-                app,
-                ui,
-                &fl!("world-mob-kinds"),
-                &PropKind::MOBS,
-                Kind::Mobs,
-            );
+            changed |= kinds_row(app, ui, &fl!("world-mob-kinds"), &PropKind::MOBS);
         });
 
         if changed {
@@ -199,9 +145,9 @@ fn fun(app: &mut SettingsApp, ui: &mut egui::Ui) {
     });
 }
 
-/// Вещи: домик и мяч на виду, остальное — под «Подробнее».
+/// Вещи: мяч на виду, остальное — под «Подробнее».
 fn things(app: &mut SettingsApp, ui: &mut egui::Ui) {
-    let (props, has_ball, has_house) = {
+    let (props, has_ball) = {
         let st = app.poll.lock().unwrap();
         let props = st
             .world
@@ -209,37 +155,12 @@ fn things(app: &mut SettingsApp, ui: &mut egui::Ui) {
             .map(|w| w.props.clone())
             .unwrap_or_default();
         let ball = props.iter().any(|p| p.kind == "ball");
-        let house = props.iter().any(|p| p.kind == "house");
-        (props, ball, house)
+        (props, ball)
     };
     card(ui, |ui| {
         card_title(ui, &fl!("section-things"));
         let mut changed = false;
 
-        let mut house = app.cfg.world.auto_house;
-        setting_row(
-            ui,
-            &fl!("world-house"),
-            Some(&fl!("world-house-hint")),
-            |ui| {
-                if toggle_switch(ui, &mut house, app.accent).changed() {
-                    app.cfg.world.auto_house = house;
-                    changed = true;
-                    // Флаг и вещь — разные вещи: выключенный флаг не даёт домику
-                    // вернуться при свёртке журнала, а со сцены его убирает
-                    // отдельная команда.
-                    if app.daemon_up() && (house || has_house) {
-                        let kind = "house".to_string();
-                        let req = if house {
-                            Request::PlaceProp { kind }
-                        } else {
-                            Request::TakeProp { kind }
-                        };
-                        app.command(ui, req, fl!("msg-settings-applied"));
-                    }
-                }
-            },
-        );
         let mut ball = has_ball;
         setting_row_sub(ui, &fl!("world-ball"), &fl!("world-ball-hint"), |ui| {
             let alive = app.daemon_up() && !app.busy();
@@ -259,18 +180,6 @@ fn things(app: &mut SettingsApp, ui: &mut egui::Ui) {
         });
 
         details(ui, "things-more", |ui| {
-            let mut bowl = app.cfg.world.auto_bowl;
-            setting_row(
-                ui,
-                &fl!("world-bowl"),
-                Some(&fl!("world-bowl-hint")),
-                |ui| {
-                    if toggle_switch(ui, &mut bowl, app.accent).changed() {
-                        app.cfg.world.auto_bowl = bowl;
-                        changed = true;
-                    }
-                },
-            );
             let mut bed = app.cfg.world.auto_bed;
             setting_row(ui, &fl!("world-bed"), Some(&fl!("world-bed-hint")), |ui| {
                 if toggle_switch(ui, &mut bed, app.accent).changed() {
@@ -278,13 +187,6 @@ fn things(app: &mut SettingsApp, ui: &mut egui::Ui) {
                     changed = true;
                 }
             });
-            if house {
-                let mut days = app.cfg.world.house_age_days;
-                setting_row(ui, &fl!("world-house-age"), None, |ui| {
-                    changed |= slider(ui, &mut days, 0.0..=14.0, 0.5, &fl!("unit-days"));
-                    app.cfg.world.house_age_days = days;
-                });
-            }
             row_sep(ui);
             for (label, hint_key, which) in [
                 (fl!("world-puddles"), fl!("world-puddles-hint"), 0),
@@ -369,26 +271,10 @@ fn slider(
     r.drag_stopped() || r.lost_focus()
 }
 
-/// Какой список видов правим.
-#[derive(Clone, Copy)]
-enum Kind {
-    Rides,
-    Mobs,
-}
-
 /// Строка чипов «какие виды допущены»: пустой список = все.
-fn kinds_row(
-    app: &mut SettingsApp,
-    ui: &mut egui::Ui,
-    label: &str,
-    all: &[PropKind],
-    which: Kind,
-) -> bool {
+fn kinds_row(app: &mut SettingsApp, ui: &mut egui::Ui, label: &str, all: &[PropKind]) -> bool {
     let mut changed = false;
-    let list = match which {
-        Kind::Rides => app.cfg.game.ride_kinds.clone(),
-        Kind::Mobs => app.cfg.game.mob_kinds.clone(),
-    };
+    let list = app.cfg.game.mob_kinds.clone();
     let empty = list.is_empty();
     setting_row(ui, label, Some(&fl!("world-kinds-hint")), |ui| {
         ui.horizontal_wrapped(|ui| {
@@ -413,10 +299,7 @@ fn kinds_row(
                     if next.len() == all.len() || next.is_empty() {
                         next.clear();
                     }
-                    match which {
-                        Kind::Rides => app.cfg.game.ride_kinds = next,
-                        Kind::Mobs => app.cfg.game.mob_kinds = next,
-                    }
+                    app.cfg.game.mob_kinds = next;
                     changed = true;
                 }
             }
